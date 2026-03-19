@@ -1021,7 +1021,7 @@ class MapCanvasWidget(QWidget):
 # ─────────────────────────────────────────────
 
 class MapArmySendDialog(QDialog):
-    def __init__(self, parent, queue, game_data, unit_defs):
+    def __init__(self, parent, queue, game_data, unit_defs, server_time_text=""):
         super().__init__(parent)
         self.setWindowTitle("⚔️ Ordu Gönder — Harita Kuyruğu")
         self.setMinimumSize(880, 520)
@@ -1029,6 +1029,7 @@ class MapArmySendDialog(QDialog):
         self._queue = queue
         self._game_data = game_data
         self._unit_defs = unit_defs
+        self._server_time_text = server_time_text
         self._results = []
         self._build_ui()
 
@@ -1248,7 +1249,52 @@ class MapArmySendDialog(QDialog):
             self.btn_arrive.setChecked(False)
             self.time_label.setText("Gönderim zamanı:")
             self._time_mode = "send"
+        self._fill_default_time()
         self.time_widget.setVisible(True)
+
+    def _fill_default_time(self):
+        """Her butona basıldığında güncel sunucu saatini (varsa) veya yerel saati doldur."""
+        # Parent'tan (bot) güncel sunucu saatini al
+        bot = self.parent()
+        if bot and hasattr(bot, '_server_time_synced') and bot._server_time_synced and hasattr(bot, '_server_time_text') and bot._server_time_text:
+            self._server_time_text = bot._server_time_text
+            self._fill_from_server_time()
+        elif self._server_time_text:
+            self._fill_from_server_time()
+        else:
+            now = datetime.datetime.now()
+            self.time_date.setText(now.strftime("%d.%m"))
+            ms = now.microsecond // 1000
+            self.time_clock.setText(now.strftime("%H:%M:%S:") + f"{ms:03d}")
+
+    def _fill_from_server_time(self):
+        """Sunucu saati text'ini parse edip form alanlarına yaz.
+        Format: '18/03/2026 4:00:01.234'"""
+        text = self._server_time_text
+        if not text:
+            return
+        try:
+            parts = text.split(" ", 1)
+            if len(parts) != 2:
+                return
+            date_part = parts[0].strip()
+            time_part = parts[1].strip()
+
+            date_match = re.match(r'(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{2,4})', date_part)
+            if date_match:
+                day = date_match.group(1).zfill(2)
+                month = date_match.group(2).zfill(2)
+                self.time_date.setText(f"{day}.{month}")
+
+            time_match = re.match(r'(\d{1,2}):(\d{2}):(\d{2})\.?(\d{0,3})', time_part)
+            if time_match:
+                hour = time_match.group(1).zfill(2)
+                minute = time_match.group(2)
+                second = time_match.group(3)
+                ms = time_match.group(4).ljust(3, '0') if time_match.group(4) else "000"
+                self.time_clock.setText(f"{hour}:{minute}:{second}:{ms}")
+        except Exception:
+            pass
 
     def _on_add(self):
         has_troops = any(spin.value() > 0 for spin in self.troop_inputs.values())
@@ -1303,9 +1349,9 @@ class MapArmySendDialog(QDialog):
                         arrive_dt = input_dt
                         send_dt = arrive_dt - travel_delta
                     return_dt = arrive_dt + travel_delta
-                    send_str = send_dt.strftime("%d.%m %H:%M:%S")
-                    arrive_str = arrive_dt.strftime("%d.%m %H:%M:%S")
-                    return_str = return_dt.strftime("%d.%m %H:%M:%S")
+                    send_str = self._format_dt(send_dt)
+                    arrive_str = self._format_dt(arrive_dt)
+                    return_str = self._format_dt(return_dt, ms_zero=True)
 
             self._results.append({
                 "source": src_text,
@@ -1316,9 +1362,16 @@ class MapArmySendDialog(QDialog):
                 "send_time": send_str,
                 "arrive_time": arrive_str,
                 "return_time": return_str,
+                "time_mode": self._time_mode,
             })
 
         self.accept()
+
+    @staticmethod
+    def _format_dt(dt, ms_zero=False):
+        """datetime → dispatch'in beklediği "GG.AA'de SS:DD:SS:ms" formatı."""
+        ms = 0 if ms_zero else dt.microsecond // 1000
+        return f"{dt.day:02d}.{dt.month:02d}'de {dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}:{ms:03d}"
 
     def _parse_time(self, date_str, clock_str):
         try:
@@ -1357,6 +1410,7 @@ class TribalWarsBot(QMainWindow):
         self._login_state = "idle"
         self._detected_worlds = []
         self._game_data = {}
+        self._world_settings_fetched = False
         self.villages = generate_villages()
         self.selected_villages_list = []
         self.browser = None
@@ -1590,6 +1644,11 @@ class TribalWarsBot(QMainWindow):
         self.player_info_label = QLabel("Oyuncu bilgisi yükleniyor...")
         self.player_info_label.setStyleSheet("font-size: 12px; padding: 4px; background: #e8e8e8; border-radius: 3px;")
         layout.addWidget(self.player_info_label)
+
+        # Dünya hız bilgisi
+        self.world_speed_label = QLabel("⚙️ Dünya Hızı: — | Birim Hızı: —")
+        self.world_speed_label.setStyleSheet("font-size: 11px; padding: 3px 4px; background: #fff3cd; border-radius: 3px; color: #856404;")
+        layout.addWidget(self.world_speed_label)
 
         # Kaynak bilgisi
         res_group = QGroupBox("Köy Kaynakları")
@@ -2302,6 +2361,7 @@ class TribalWarsBot(QMainWindow):
         self._dispatch_timer.timeout.connect(self._dispatch_check)
         self._dispatch_timer.start(10)  # 10ms — hassas zamanlama
 
+
     def _dispatch_check(self):
         """Tablodaki komutları tara:
         - 5sn kala: rally point token'ını önceden cache'le (pre-fetch)
@@ -2342,13 +2402,19 @@ class TribalWarsBot(QMainWindow):
             adjusted_send_dt = send_dt + datetime.timedelta(milliseconds=offset_ms)
             diff_ms = (adjusted_send_dt - server_dt).total_seconds() * 1000
 
-            # 5 saniye kala: token'ı önceden cache'le
-            if 0 < diff_ms <= 5000 and state != "cached":
+            # 5 saniye kala: rally point token'ını önceden cache'le
+            if 0 < diff_ms <= 5000 and state not in ("cached", "confirmed", "confirming"):
                 item.setData(0, Qt.UserRole, "caching")
                 self._dispatch_precache(item, i)
 
+            # 1.5 saniye kala: try=confirm POST'unu önceden yap + JS timer kur
+            # (precache'in tamamlanması için en az 3.5sn beklenmiş olur)
+            elif 0 < diff_ms <= 1500 and state == "cached":
+                item.setData(0, Qt.UserRole, "confirming")
+                self._dispatch_preconfirm(item, i)
+
             # Zaman geldi: gönder
-            elif diff_ms <= 0 and state not in ("caching",):
+            elif diff_ms <= 0 and state not in ("caching", "confirming"):
                 item.setData(0, Qt.UserRole, "sending")
                 for col in range(item.columnCount()):
                     item.setBackground(col, QColor("#fff8e0"))
@@ -2459,6 +2525,156 @@ class TribalWarsBot(QMainWindow):
         item.setData(1, Qt.UserRole, cache_key)  # cache key'i sakla
         self._add_log("GÖNDERİM", "info", f"Token cache'leniyor: {src_text} (5sn kala)")
 
+    def _dispatch_preconfirm(self, item, row_idx):
+        """Gönderimden ~2sn önce try=confirm POST'unu yap, ch token'ı cache'le.
+        Ardından JS tarafında setTimeout ile tam gönderim anında tek POST ateşle.
+        Python IPC gecikmesi sıfırlanır — sadece polling kalır."""
+        src_text = item.text(0)
+        tgt_text = item.text(1)
+        cmd_type = item.text(14)
+
+        src_match = re.search(r'\((\d+)\|(\d+)\)', src_text)
+        village_id = None
+        if src_match:
+            src_x, src_y = int(src_match.group(1)), int(src_match.group(2))
+            all_v = self._game_data.get("all_villages", [])
+            for v in all_v:
+                if v.get("x") == src_x and v.get("y") == src_y:
+                    village_id = v.get("id")
+                    break
+            if village_id is None:
+                v = self._game_data.get("village", {})
+                if v.get("x") == src_x and v.get("y") == src_y:
+                    village_id = v.get("id")
+        if village_id is None:
+            village_id = self._game_data.get("village", {}).get("id", "")
+
+        tgt_match = re.search(r'(\d+)\|(\d+)', tgt_text)
+        if not tgt_match:
+            item.setData(0, Qt.UserRole, "cached")
+            return
+        target_x, target_y = tgt_match.group(1), tgt_match.group(2)
+
+        troops_js_parts = []
+        for col_idx, (key, _) in enumerate(self.SA_UNIT_DEFS):
+            val = item.text(col_idx + 2)
+            if val and val != "0":
+                troops_js_parts.append(f"'{key}': '{val}'")
+        troops_js_obj = "{" + ", ".join(troops_js_parts) + "}"
+
+        attack_type = "attack" if cmd_type == "Sld" else "support"
+        cache_key = item.data(1, Qt.UserRole) or ""
+        cmd_id = f"cmd_{row_idx}_{id(item)}"
+
+        # Gönderime kalan süreyi hesapla (setTimeout için göreli gecikme)
+        send_str = item.text(15)
+        send_dt = self._dispatch_parse_time_str(send_str)
+        offset_ms = self.sa_offset_input.value() if hasattr(self, 'sa_offset_input') else 0
+        if send_dt is None:
+            item.setData(0, Qt.UserRole, "cached")
+            return
+        server_dt = self._dispatch_parse_server_time()
+        if server_dt is None:
+            item.setData(0, Qt.UserRole, "cached")
+            return
+        adjusted_send_dt = send_dt + datetime.timedelta(milliseconds=offset_ms)
+        remaining_ms = int((adjusted_send_dt - server_dt).total_seconds() * 1000)
+
+        preconfirm_js = f"""
+        (function() {{
+            var startMs = Date.now();
+            var remainingMs = {remaining_ms};
+            var cacheKey = '{cache_key}';
+            var cmdId = '{cmd_id}';
+            var villageId = {village_id};
+            var targetX = '{target_x}';
+            var targetY = '{target_y}';
+            var troops = {troops_js_obj};
+            var attackType = '{attack_type}';
+
+            if (!window.__tw_bot_results) window.__tw_bot_results = {{}};
+            if (!window.__tw_bot_fire) window.__tw_bot_fire = {{}};
+
+            var cached = window.__tw_bot_cache && window.__tw_bot_cache[cacheKey];
+            if (!cached) return;
+
+            delete window.__tw_bot_cache[cacheKey];
+            var tokenData = JSON.parse(cached);
+
+            var fd = new URLSearchParams();
+            for (var key in tokenData) {{
+                if (key !== '__form_action') fd.append(key, tokenData[key]);
+            }}
+            for (var unit in troops) {{ fd.append(unit, troops[unit]); }}
+            fd.set('x', targetX);
+            fd.set('y', targetY);
+            if (attackType === 'attack') {{ fd.append('attack', 'true'); }}
+            else {{ fd.append('support', 'true'); }}
+
+            var formAction = tokenData.__form_action || '/game.php?village=' + villageId + '&screen=place&try=confirm';
+
+            fetch(formAction, {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+                body: fd.toString(),
+                credentials: 'same-origin'
+            }})
+            .then(function(r) {{ return r.text(); }})
+            .then(function(confirmHtml) {{
+                if (!confirmHtml) return;
+
+                var doc2 = new DOMParser().parseFromString(confirmHtml, 'text/html');
+                var cf = doc2.getElementById('command-data-form');
+                if (!cf || !cf.querySelector('input[name="ch"]')) return;
+
+                var cd = new URLSearchParams();
+                cf.querySelectorAll('input[type="hidden"]').forEach(function(h) {{
+                    if (h.name) cd.append(h.name, h.value);
+                }});
+                cd.append('submit_confirm', 'true');
+                var bodyStr = cd.toString();
+                var actionUrl = cf.getAttribute('action');
+
+                window.__tw_bot_fire[cmdId] = function() {{
+                    window.__tw_bot_results[cmdId] = 'SENDING';
+                    fetch(actionUrl, {{
+                        method: 'POST',
+                        headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+                        body: bodyStr,
+                        credentials: 'same-origin'
+                    }})
+                    .then(function(r) {{ return r.text(); }})
+                    .then(function() {{
+                        window.__tw_bot_results[cmdId] = 'SENT_OK';
+                    }})
+                    .catch(function(e) {{
+                        window.__tw_bot_results[cmdId] = 'ERROR|' + String(e);
+                    }});
+                }};
+
+                var elapsed = Date.now() - startMs;
+                var delay = remainingMs - elapsed;
+                if (delay > 0 && delay < 30000) {{
+                    setTimeout(function() {{
+                        if (!window.__tw_bot_results[cmdId] ||
+                            (window.__tw_bot_results[cmdId] !== 'SENT_OK' &&
+                             window.__tw_bot_results[cmdId] !== 'SENDING')) {{
+                            window.__tw_bot_fire[cmdId]();
+                        }}
+                    }}, delay);
+                }}
+            }})
+            .catch(function(e) {{
+                // Sessizce başarısız ol — Python fallback devreye girecek
+            }});
+        }})();
+        """
+
+        self.browser.page().runJavaScript(preconfirm_js)
+        item.setData(0, Qt.UserRole, "confirmed")
+        item.setData(2, Qt.UserRole, cmd_id)
+        self._add_log("GÖNDERİM", "info", f"Onay formu + zamanlayıcı hazırlanıyor: {src_text} (2sn kala)")
+
     def _dispatch_send_command(self, item, row_idx):
         """Tek bir komutu AJAX ile gönder (sayfa değişmeden)."""
 
@@ -2516,10 +2732,10 @@ class TribalWarsBot(QMainWindow):
             troops_js_parts.append(f"'{unit}': '{count}'")
         troops_js_obj = "{" + ", ".join(troops_js_parts) + "}"
 
-        # Unique ID for this command's result
-        cmd_id = f"cmd_{row_idx}_{id(item)}"
+        # Preconfirm'dan gelen cmd_id varsa kullan, yoksa yeni oluştur
+        preconfirm_cmd_id = item.data(2, Qt.UserRole) or ""
+        cmd_id = preconfirm_cmd_id or f"cmd_{row_idx}_{id(item)}"
 
-        # Cache key (precache'den)
         cache_key = item.data(1, Qt.UserRole) or ""
 
         send_js = f"""
@@ -2533,9 +2749,22 @@ class TribalWarsBot(QMainWindow):
             var cacheKey = '{cache_key}';
 
             if (!window.__tw_bot_results) window.__tw_bot_results = {{}};
+
+            // Preconfirm fire fonksiyonu varsa → tek POST (hızlı yol)
+            if (window.__tw_bot_fire && window.__tw_bot_fire[cmdId]) {{
+                window.__tw_bot_fire[cmdId]();
+                return 'DISPATCHED';
+            }}
+
+            // JS timer zaten ateşlediyse → sadece bekle
+            var existing = window.__tw_bot_results[cmdId];
+            if (existing === 'SENT_OK' || existing === 'SENDING') {{
+                return 'DISPATCHED';
+            }}
+
             window.__tw_bot_results[cmdId] = 'SENDING';
 
-            // Cache'den token'ları al veya yoksa GET yap
+            // Preconfirm yoksa → 2 adımlı gönderim (güvenilir fallback)
             var getTokens;
             var cached = window.__tw_bot_cache && window.__tw_bot_cache[cacheKey];
             if (cached) {{
@@ -2563,7 +2792,6 @@ class TribalWarsBot(QMainWindow):
                     return;
                 }}
 
-                // ADIM 1: POST -> try=confirm (askerler + koordinat + token)
                 var fd = new URLSearchParams();
                 for (var key in tokenData) {{
                     if (key !== '__form_action') fd.append(key, tokenData[key]);
@@ -2587,7 +2815,6 @@ class TribalWarsBot(QMainWindow):
             .then(function(confirmHtml) {{
                 if (!confirmHtml) return;
 
-                // ADIM 2: Onay -> ch token + POST action=command
                 var doc2 = new DOMParser().parseFromString(confirmHtml, 'text/html');
                 var cf = doc2.getElementById('command-data-form');
                 if (!cf) {{
@@ -2626,7 +2853,6 @@ class TribalWarsBot(QMainWindow):
         self._add_log("GÖNDERİM", "info",
             f"Komut gönderiliyor: {src_text} → ({tgt_text}) | {cmd_type}")
 
-        # JS'i çalıştır (hemen "DISPATCHED" döner, sonuç async gelir)
         self.browser.page().runJavaScript(send_js)
 
         # Sonucu polling ile kontrol et
@@ -3861,6 +4087,24 @@ class TribalWarsBot(QMainWindow):
 
         queue_layout.addLayout(q_btn_row)
 
+        # Gecikme ayarı
+        delay_row = QHBoxLayout()
+        delay_row.setSpacing(4)
+        delay_lbl = QLabel("Komutlar arası:")
+        delay_lbl.setStyleSheet("font-size: 10px; color: #5a3e1b;")
+        delay_row.addWidget(delay_lbl)
+        self.map_queue_delay = QSpinBox()
+        self.map_queue_delay.setRange(0, 300000)
+        self.map_queue_delay.setValue(5000)
+        self.map_queue_delay.setSuffix(" ms")
+        self.map_queue_delay.setSingleStep(500)
+        self.map_queue_delay.setFixedWidth(90)
+        self.map_queue_delay.setToolTip("Her komut arasına eklenecek gecikme (milisaniye)")
+        self.map_queue_delay.setStyleSheet("font-size: 10px;")
+        delay_row.addWidget(self.map_queue_delay)
+        delay_row.addStretch()
+        queue_layout.addLayout(delay_row)
+
         # Ordu Gönder butonu
         self.map_send_army_btn = QPushButton("⚔️ Ordu Gönder")
         self.map_send_army_btn.setCursor(Qt.PointingHandCursor)
@@ -4073,6 +4317,33 @@ class TribalWarsBot(QMainWindow):
         farm_row4.addStretch()
         farm_layout.addLayout(farm_row4)
 
+        # Satır 5: Tur arası bekleme ayarları
+        farm_row5 = QHBoxLayout()
+        farm_row5.setSpacing(6)
+
+        farm_row5.addWidget(QLabel("Tur arası bekleme:"))
+        self.farm_round_wait_mode = QComboBox()
+        self.farm_round_wait_mode.addItems(["Sabit Süre", "En Yakın Dönüş"])
+        self.farm_round_wait_mode.setFixedWidth(130)
+        self.farm_round_wait_mode.setCurrentIndex(0)
+        self.farm_round_wait_mode.currentIndexChanged.connect(self._farm_round_mode_changed)
+        farm_row5.addWidget(self.farm_round_wait_mode)
+
+        farm_row5.addSpacing(6)
+        self.farm_round_wait_time = QSpinBox()
+        self.farm_round_wait_time.setRange(10, 36000)
+        self.farm_round_wait_time.setValue(300)
+        self.farm_round_wait_time.setSuffix(" sn")
+        self.farm_round_wait_time.setFixedWidth(90)
+        farm_row5.addWidget(self.farm_round_wait_time)
+
+        farm_row5.addStretch()
+        self.farm_round_wait_label = QLabel("")
+        self.farm_round_wait_label.setStyleSheet("font-size: 10px; color: #2d5a9e;")
+        farm_row5.addWidget(self.farm_round_wait_label)
+
+        farm_layout.addLayout(farm_row5)
+
         farm_group.setLayout(farm_layout)
         layout.addWidget(farm_group)
 
@@ -4086,6 +4357,9 @@ class TribalWarsBot(QMainWindow):
         self._farm_sending = False
         self._farm_blacklist = set()
         self._farm_return_times = []  # [(dönüş_timestamp, asker_sayısı), ...]
+        self._farm_round_waiting = False
+        self._farm_round_wait_until = 0
+        self._farm_round_return_times = []
 
         # Harita verisi
         self._map_villages = []
@@ -4369,32 +4643,119 @@ class TribalWarsBot(QMainWindow):
         self._map_queue_refresh()
 
     def _map_open_send_dialog(self):
-        """Ordu gönder dialogunu aç."""
+        """Ordu gönder dialogunu aç. Sonuçları birebir _sa_add_task ile aynı mantıkla ekle."""
         if not self._map_queue:
             QMessageBox.warning(self, "Uyarı", "Kuyrukta hedef köy yok!\nHaritada köylere tıklayarak ekleyin.")
             return
-        dlg = MapArmySendDialog(self, self._map_queue, self._game_data, self.SA_UNIT_DEFS)
+        dlg = MapArmySendDialog(self, self._map_queue, self._game_data, self.SA_UNIT_DEFS,
+                                self._server_time_text if self._server_time_synced else "")
         if dlg.exec_() == dlg.Accepted:
             results = dlg.get_results()
-            for entry in results:
-                self._map_add_to_army_queue(entry)
+            if not results:
+                return
+            delay_ms = self.map_queue_delay.value()
+            added = 0
+            for idx, entry in enumerate(results):
+                entry["_delay_offset_ms"] = idx * delay_ms
+                self._sa_add_task_direct(entry)
+                added += 1
             self._add_log("HARİTA", "success",
-                f"{len(results)} komut Ordu Gönder kuyruğuna eklendi!")
+                f"{added} komut eklendi! (komutlar arası {delay_ms}ms gecikme)")
 
-    def _map_add_to_army_queue(self, entry):
-        """Harita kuyruğundan gelen veriyi Ordu Gönder tablosuna ekle."""
+    def _sa_add_task_direct(self, entry):
+        """_sa_add_task ile birebir aynı mantık — form yerine parametre alır.
+        Zaman hesaplama, format, tabloya ekleme tamamen aynı kod."""
+        import math
+
         src_text = entry["source"]
-        tgt = f"{entry['tgt_x']}|{entry['tgt_y']}"
-        cmd_type = entry.get("cmd_type", "Sld")
+        tgt_x = entry["tgt_x"]
+        tgt_y = entry["tgt_y"]
+        tgt = f"{tgt_x}|{tgt_y}"
 
         troop_values = []
+        has_troops = False
+        troop_keys_sent = []
         for key, _ in self.SA_UNIT_DEFS:
-            troop_values.append(str(entry["troops"].get(key, 0)))
+            val = entry["troops"].get(key, 0)
+            troop_values.append(str(val))
+            if val > 0:
+                has_troops = True
+                troop_keys_sent.append(key)
 
+        if not has_troops:
+            return
+
+        # Kaynak koordinatlarını bul
+        src_match = re.search(r'\((\d+)\|(\d+)\)', src_text)
+        if src_match:
+            src_x, src_y = int(src_match.group(1)), int(src_match.group(2))
+        else:
+            src_x, src_y = self._sa_get_source_coords()
+            if src_x is None:
+                return
+
+        # Yolculuk süresini hesapla
+        distance = math.sqrt((tgt_x - src_x) ** 2 + (tgt_y - src_y) ** 2)
+        travel_sec = self._sa_calc_travel_time(distance, troop_keys_sent)
+
+        # Zaman parse
+        time_mode = entry.get("time_mode")
+        send_time_str = entry.get("send_time", "—")
+        arrive_time_str = entry.get("arrive_time", "—")
+
+        time_str_to_parse = None
+        active_mode = None
+        if time_mode == "send" and send_time_str != "—":
+            time_str_to_parse = send_time_str
+            active_mode = "send"
+        elif time_mode == "arrive" and arrive_time_str != "—":
+            time_str_to_parse = arrive_time_str
+            active_mode = "arrive"
+        elif send_time_str != "—":
+            time_str_to_parse = send_time_str
+            active_mode = "send"
+        elif arrive_time_str != "—":
+            time_str_to_parse = arrive_time_str
+            active_mode = "arrive"
+
+        if not time_str_to_parse:
+            return
+
+        # "GG.AA'de SS:DD:SS:ms" → date ve clock parçala
+        m = re.match(r"(\d{1,2})\.(\d{1,2})'de (\d{1,2}):(\d{2}):(\d{2}):(\d{3})", time_str_to_parse)
+        if m:
+            date_str = f"{m.group(1)}.{m.group(2)}"
+            clock_str = f"{m.group(3)}:{m.group(4)}:{m.group(5)}:{m.group(6)}"
+        else:
+            return
+
+        input_dt = self._sa_parse_time_input(date_str, clock_str)
+        if input_dt is None:
+            return
+
+        # Gecikme offset'i uygula (haritadan sıralı komutlar için, milisaniye)
+        delay_offset_ms = entry.get("_delay_offset_ms", 0)
+        if delay_offset_ms > 0:
+            input_dt = input_dt + datetime.timedelta(milliseconds=delay_offset_ms)
+
+        # Gönderim / Varış / Dönüş hesapla (birebir _sa_add_task ile aynı)
+        travel_delta = datetime.timedelta(seconds=travel_sec)
+
+        if active_mode == "send":
+            send_dt = input_dt
+            arrive_dt = send_dt + travel_delta
+        else:
+            arrive_dt = input_dt
+            send_dt = arrive_dt - travel_delta
+
+        return_dt = arrive_dt + travel_delta
+
+        send_str = self._sa_format_time(send_dt)
+        arrive_str = self._sa_format_time(arrive_dt)
+        return_str = self._sa_format_time(return_dt, ms_zero=True)
+
+        cmd_type = entry.get("cmd_type", "Sld")
         task_id = str(self.sa_table.topLevelItemCount() + 1)
-        send_str = entry.get("send_time", "—")
-        arrive_str = entry.get("arrive_time", "—")
-        return_str = entry.get("return_time", "—")
 
         row_data = [src_text, tgt] + troop_values + [cmd_type, send_str, arrive_str, return_str, task_id]
         item = QTreeWidgetItem(row_data)
@@ -4412,6 +4773,12 @@ class TribalWarsBot(QMainWindow):
 
         self.sa_table.addTopLevelItem(item)
         self._sa_update_totals()
+
+        travel_min = travel_sec / 60
+        self._add_log("KOMUT", "info",
+            f"Komut eklendi: {cmd_type} {src_text} → ({tgt}) | "
+            f"Mesafe: {distance:.2f} kare | Yolculuk: {travel_min:.1f}dk | "
+            f"Gönderim: {send_str} | Varış: {arrive_str} | Dönüş: {return_str}")
 
     # ── HARİTA SİNYAL HANDLER'LARI ────────────────
 
@@ -4446,6 +4813,21 @@ class TribalWarsBot(QMainWindow):
 
     # ── OTOMATİK FARM SİSTEMİ ─────────────────
 
+    def _farm_round_mode_changed(self, index):
+        self.farm_round_wait_time.setEnabled(index == 0)
+
+    def _farm_record_return_time(self, tx, ty, troops):
+        """Başarılı farm saldırısının tahmini dönüş zamanını kaydet."""
+        import time, math
+        v = self._game_data.get("village", {})
+        src_x = v.get("x", 0)
+        src_y = v.get("y", 0)
+        distance = math.sqrt((tx - src_x) ** 2 + (ty - src_y) ** 2)
+        troop_keys = list(troops.keys()) if isinstance(troops, dict) else []
+        travel_sec = self._sa_calc_travel_time(distance, troop_keys)
+        return_timestamp = time.time() + (2 * travel_sec)
+        self._farm_round_return_times.append(return_timestamp)
+
     def _farm_start(self):
         """Farm sirkülasyonunu başlat."""
         if not self._map_data_loaded:
@@ -4463,6 +4845,10 @@ class TribalWarsBot(QMainWindow):
         self._farm_barb_index = 0
         self._farm_sent_count = 0
         self._farm_last_send = 0
+        self._farm_round_waiting = False
+        self._farm_round_wait_until = 0
+        self._farm_round_return_times = []
+        self.farm_round_wait_label.setText("")
 
         # Tablodaki durumları sıfırla
         for i in range(self.map_barb_table.topLevelItemCount()):
@@ -4526,9 +4912,31 @@ class TribalWarsBot(QMainWindow):
         if not self._map_data_loaded:
             return
 
-        # Aralık kontrolü
         import time
         now = time.time()
+
+        # Tur arası bekleme kontrolü
+        if self._farm_round_waiting:
+            if self._farm_round_wait_until == 0:
+                self.farm_status_label.setText("Durum: Dönüş zamanı hesaplanıyor...")
+                self.farm_status_label.setStyleSheet("font-size: 10px; color: #2d5a9e;")
+                return
+            remaining = self._farm_round_wait_until - now
+            if remaining > 0:
+                mins, secs = divmod(int(remaining), 60)
+                self.farm_status_label.setText(f"Durum: Yeni tur {mins}dk {secs}sn sonra")
+                self.farm_status_label.setStyleSheet("font-size: 10px; color: #2d5a9e;")
+                self.farm_round_wait_label.setText(f"Bekleme: {mins}dk {secs}sn")
+                return
+            else:
+                self._farm_round_waiting = False
+                self._farm_round_wait_until = 0
+                self.farm_round_wait_label.setText("")
+                self.farm_status_label.setText("Durum: Yeni tur başlıyor...")
+                self.farm_status_label.setStyleSheet("font-size: 10px; color: #228822;")
+                self._add_log("FARM", "info", "🔄 Yeni farm turu başlıyor")
+
+        # Aralık kontrolü
         interval = self.farm_interval.value()
         if now - self._farm_last_send < interval:
             remaining_sec = int(interval - (now - self._farm_last_send))
@@ -4586,9 +4994,7 @@ class TribalWarsBot(QMainWindow):
             checked += 1
 
         if not target:
-            # Tüm köyler gönderildi, başa sar
-            self.farm_status_label.setText("Durum: Tur tamamlandı, başa sarılıyor...")
-            self.farm_status_label.setStyleSheet("font-size: 10px; color: #2d5a9e;")
+            # Tüm köyler gönderildi — tabloyu sıfırla
             for i in range(total):
                 it = self.map_barb_table.topLevelItem(i)
                 if it:
@@ -4597,6 +5003,35 @@ class TribalWarsBot(QMainWindow):
             self._farm_barb_index = 0
             self._farm_sent_count = 0
             self._farm_update_labels()
+
+            mode = self.farm_round_wait_mode.currentIndex()
+            if mode == 0:
+                wait_sec = self.farm_round_wait_time.value()
+                self._farm_round_wait_until = time.time() + wait_sec
+                self._farm_round_waiting = True
+                mins, secs = divmod(wait_sec, 60)
+                self.farm_status_label.setText(f"Durum: Tur bitti, {mins}dk {secs}sn bekleniyor...")
+                self.farm_status_label.setStyleSheet("font-size: 10px; color: #2d5a9e;")
+                self._add_log("FARM", "info", f"⏸ Tur tamamlandı, {mins}dk {secs}sn bekleniyor")
+            else:
+                self._farm_round_waiting = True
+                if self._farm_round_return_times:
+                    nearest = min(self._farm_round_return_times)
+                    self._farm_round_wait_until = nearest + 10
+                    wait_sec = max(1, int(self._farm_round_wait_until - time.time()))
+                    mins, secs = divmod(wait_sec, 60)
+                    self.farm_status_label.setText(
+                        f"Durum: En yakın dönüş {mins}dk {secs}sn sonra (+10sn)")
+                    self.farm_status_label.setStyleSheet("font-size: 10px; color: #2d5a9e;")
+                    self._add_log("FARM", "info",
+                        f"⏸ Tur tamamlandı, en yakın dönüş {mins}dk {secs}sn sonra (+10sn)")
+                else:
+                    fallback = 60
+                    self._farm_round_wait_until = time.time() + fallback
+                    self.farm_status_label.setText(f"Durum: Dönüş verisi yok, {fallback}sn bekleniyor...")
+                    self.farm_status_label.setStyleSheet("font-size: 10px; color: #cc8800;")
+                    self._add_log("FARM", "warn", f"⏸ Dönüş verisi yok, {fallback}sn bekleniyor")
+                self._farm_round_return_times = []
             return
 
         # Saldırı gönder
@@ -4732,6 +5167,8 @@ class TribalWarsBot(QMainWindow):
                 self._add_log("FARM", "success", f"✅ Farm saldırısı → ({tx}|{ty})")
                 self.browser.page().runJavaScript(
                     f"if(window.__tw_bot_results) delete window.__tw_bot_results['{cmd_id}'];")
+
+                self._farm_record_return_time(tx, ty, troops)
 
             elif result_str.startswith("NO_TROOPS"):
                 msg = result_str.replace("NO_TROOPS|", "")
@@ -5623,6 +6060,10 @@ class TribalWarsBot(QMainWindow):
         # Tarayıcı sekmesine geç
         self.tabs.setCurrentIndex(0)
 
+        # Dünya ayarlarını sıfırla
+        self._world_settings_fetched = False
+        self._game_data = {}
+
         # Giriş akışını başlat
         self._login_state = "navigating"
         server_url = SERVERS[self.server_combo.currentIndex()][1]
@@ -5773,6 +6214,7 @@ class TribalWarsBot(QMainWindow):
             full_url = base_url.rstrip('/') + world_href
             self._add_log("DÜNYA", "info", f"Dünyaya giriliyor: {world_name} → {full_url}")
             self._login_state = "waiting_world"
+            self._world_settings_fetched = False
             self.browser.navigate(full_url)
 
     # ── OYUN VERİSİ ÇEKME ─────────────────────
@@ -5973,7 +6415,94 @@ class TribalWarsBot(QMainWindow):
                 f"Veri güncellendi: {village.get('name', '?')} ({village.get('coord', '?')}) | "
                 f"Puan: {village.get('points', 0)} | Köyler: {len(all_v)} | Dünya: {data.get('world', '?')}")
 
+            if not getattr(self, '_world_settings_fetched', False):
+                self._fetch_world_settings()
+
         self.browser.page().runJavaScript(scrape_js, on_scrape_result)
+
+    def _fetch_world_settings(self):
+        """Sunucunun /page/settings sayfasından dünya hızı ve birim hızını çek."""
+        fetch_js = """
+        (function() {
+            var base = window.location.origin;
+            var url = base + '/page/settings';
+            window.__tw_world_settings = 'LOADING';
+            fetch(url, {credentials: 'same-origin'})
+            .then(function(r) { return r.text(); })
+            .then(function(html) {
+                var doc = new DOMParser().parseFromString(html, 'text/html');
+                var rows = doc.querySelectorAll('table.data-table tr');
+                var result = {};
+                rows.forEach(function(row) {
+                    var cells = row.querySelectorAll('td');
+                    if (cells.length >= 2) {
+                        var label = cells[0].textContent.trim().toLowerCase();
+                        var value = cells[1].textContent.trim();
+                        if (label === 'game speed' || label === 'oyun hızı' || label === 'spielgeschwindigkeit' || label.indexOf('game speed') !== -1) {
+                            result.world_speed = parseFloat(value);
+                        }
+                        if (label === 'unit speed' || label === 'birim hızı' || label === 'einheitengeschwindigkeit' || label.indexOf('unit speed') !== -1) {
+                            result.unit_speed = parseFloat(value);
+                        }
+                    }
+                });
+                window.__tw_world_settings = JSON.stringify(result);
+            })
+            .catch(function(err) {
+                window.__tw_world_settings = JSON.stringify({error: String(err)});
+            });
+        })();
+        """
+        self.browser.page().runJavaScript(fetch_js)
+        self._poll_world_settings(0)
+
+    def _poll_world_settings(self, attempt):
+        """World settings verisini polling ile al."""
+        if attempt > 30:
+            self._world_settings_fetched = True
+            self._add_log("AYAR", "warn", "Dünya ayarları alınamadı, mevcut değerler kullanılacak")
+            ws = self._game_data.get("world_speed", 1)
+            us = self._game_data.get("unit_speed", 1)
+            self._add_log("AYAR", "info", f"Mevcut hız: world_speed={ws}, unit_speed={us}")
+            return
+
+        check_js = "window.__tw_world_settings || 'WAITING';"
+
+        def on_poll(result):
+            result_str = str(result) if result else "WAITING"
+            if result_str in ("WAITING", "LOADING"):
+                QTimer.singleShot(200, lambda: self._poll_world_settings(attempt + 1))
+                return
+            try:
+                data = json.loads(result_str)
+            except:
+                self._world_settings_fetched = True
+                self._add_log("AYAR", "warn", "Dünya ayarları parse edilemedi")
+                return
+
+            if data.get("error"):
+                self._world_settings_fetched = True
+                self._add_log("AYAR", "warn", f"Ayar çekme hatası: {data['error']}")
+                return
+
+            self._world_settings_fetched = True
+            ws = data.get("world_speed")
+            us = data.get("unit_speed")
+
+            if ws and ws > 0:
+                self._game_data["world_speed"] = ws
+            if us and us > 0:
+                self._game_data["unit_speed"] = us
+
+            final_ws = self._game_data.get('world_speed', 1)
+            final_us = self._game_data.get('unit_speed', 1)
+            self._add_log("AYAR", "success",
+                f"✅ Dünya ayarları alındı: Oyun hızı={final_ws}, Birim hızı={final_us}")
+            self._update_world_speed_label()
+
+            self.browser.page().runJavaScript("window.__tw_world_settings = null;")
+
+        self.browser.page().runJavaScript(check_js, on_poll)
 
     def _update_player_info(self, data):
         """Oyuncu bilgisi etiketini güncelle."""
@@ -5987,6 +6516,29 @@ class TribalWarsBot(QMainWindow):
             f"🌍 Dünya: {data.get('world', '?')}"
         )
         self.player_info_label.setText(txt)
+        self._update_world_speed_label()
+
+    def _update_world_speed_label(self):
+        ws = self._game_data.get("world_speed", None)
+        us = self._game_data.get("unit_speed", None)
+        fetched = getattr(self, '_world_settings_fetched', False)
+
+        ws_text = str(ws) if ws else "—"
+        us_text = str(us) if us else "—"
+
+        if fetched and ws and us:
+            style = "font-size: 11px; padding: 3px 4px; background: #d4edda; border-radius: 3px; color: #155724;"
+            source = "(ayarlar sayfasından doğrulandı)"
+        elif ws or us:
+            style = "font-size: 11px; padding: 3px 4px; background: #fff3cd; border-radius: 3px; color: #856404;"
+            source = "(oyun verisinden)"
+        else:
+            style = "font-size: 11px; padding: 3px 4px; background: #f8d7da; border-radius: 3px; color: #721c24;"
+            source = "(henüz alınamadı)"
+
+        self.world_speed_label.setText(
+            f"⚙️ Dünya Hızı: {ws_text} | Birim Hızı: {us_text}  {source}")
+        self.world_speed_label.setStyleSheet(style)
 
     def _update_resources(self, data):
         """Kaynak etiketlerini güncelle."""
@@ -6328,11 +6880,14 @@ class TribalWarsBot(QMainWindow):
     def _stop_bot(self):
         self.is_running = False
         self._login_state = "idle"
+        self._world_settings_fetched = False
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.status_indicator.setText("● DURDURULDU")
         self.status_indicator.setStyleSheet("color: #cc4444; font-weight: bold; font-size: 11px;")
         self._add_log("SİSTEM", "warn", "Bot durduruldu.")
+        self.world_speed_label.setText("⚙️ Dünya Hızı: — | Birim Hızı: —")
+        self.world_speed_label.setStyleSheet("font-size: 11px; padding: 3px 4px; background: #fff3cd; border-radius: 3px; color: #856404;")
         # Dünya combobox'ı sıfırla
         self.world_combo.clear()
         self.world_combo.addItem("— Giriş yapın —")
