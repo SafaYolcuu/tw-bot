@@ -21,7 +21,8 @@ from PyQt5.QtWidgets import (
     QSpinBox, QTreeWidget, QTreeWidgetItem, QTextEdit, QSplitter,
     QFrame, QGroupBox, QGridLayout, QHeaderView, QStatusBar,
     QSizePolicy, QFormLayout, QMessageBox, QTableWidget, QTableWidgetItem,
-    QTimeEdit, QDateEdit, QAbstractItemView, QDoubleSpinBox, QSlider
+    QTimeEdit, QDateEdit, QAbstractItemView, QDoubleSpinBox, QSlider,
+    QDialog
 )
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage, QWebEngineProfile, QWebEngineSettings
 
@@ -41,7 +42,7 @@ VILLAGE_TYPES = [
     ("yours", "#e8e832", "Senin"),
     ("enemy", "#cc2222", "Düşman"),
     ("ally", "#4488cc", "Müttefik"),
-    ("other", "#dd8833", "Diğer"),
+    ("other", "#FF6600", "Diğer"),
     ("abandoned", "#888888", "Terk Edilmiş"),
     ("nap", "#9944aa", "NAP"),
     ("tribe", "#1a3a8a", "Kabile"),
@@ -518,6 +519,7 @@ class MapCanvasWidget(QWidget):
     """
 
     village_double_clicked = pyqtSignal(int, int, int)
+    village_clicked = pyqtSignal(object)
     view_changed = pyqtSignal(float, float, float)
 
     # Standart tile boyutu
@@ -716,6 +718,12 @@ class MapCanvasWidget(QWidget):
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
+            if self._dragging and self._drag_start_pos:
+                moved = (event.pos() - self._drag_start_pos).manhattanLength()
+                if moved < 5:
+                    v = self._village_at_pixel(event.pos().x(), event.pos().y())
+                    if v:
+                        self.village_clicked.emit(v)
             self._dragging = False
             self.setCursor(Qt.OpenHandCursor)
 
@@ -847,12 +855,23 @@ class MapCanvasWidget(QWidget):
                         painter.setBrush(QBrush(color))
                         painter.drawRect(int(px - dot/2), int(py - dot/2), dot, dot)
 
-                    # Köy renkli alt çizgi (sahiplik göstergesi)
+                    # Köy renkli overlay (sahiplik göstergesi — yarı saydam)
                     color = QColor(village.get("color", "#888888"))
+                    overlay = QColor(color)
+                    overlay.setAlpha(70)
                     painter.setPen(Qt.NoPen)
+                    painter.setBrush(QBrush(overlay))
+                    painter.drawRect(draw_x, draw_y, int(tw), int(th))
+
+                    # Köy renkli alt çizgi (kalın sahiplik çubuğu)
                     painter.setBrush(QBrush(color))
-                    bar_h = max(2, int(th * 0.08))
+                    bar_h = max(3, int(th * 0.18))
                     painter.drawRect(draw_x, draw_y + int(th) - bar_h, int(tw), bar_h)
+
+                    # Köy renkli kenar çizgisi
+                    painter.setPen(QPen(color, max(1, int(self._zoom * 1.5))))
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawRect(draw_x, draw_y, int(tw), int(th))
 
                     # Hover vurgulama
                     if hover_v and village.get("x") == hover_v.get("x") and \
@@ -996,6 +1015,332 @@ class MapCanvasWidget(QWidget):
                 font.setBold(False)
                 painter.setFont(font)
             painter.drawText(bx + 8, by + 14 + i * line_h, line)
+
+# ─────────────────────────────────────────────
+#  HARİTA ORDU GÖNDER DİALOGU
+# ─────────────────────────────────────────────
+
+class MapArmySendDialog(QDialog):
+    def __init__(self, parent, queue, game_data, unit_defs):
+        super().__init__(parent)
+        self.setWindowTitle("⚔️ Ordu Gönder — Harita Kuyruğu")
+        self.setMinimumSize(880, 520)
+        self.resize(920, 580)
+        self._queue = queue
+        self._game_data = game_data
+        self._unit_defs = unit_defs
+        self._results = []
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        # ── Kaynak köy seçimi ──
+        src_row = QHBoxLayout()
+        src_row.addWidget(QLabel("Kaynak:"))
+        self.src_combo = QComboBox()
+        self.src_combo.setMinimumWidth(220)
+        villages = self._game_data.get("villages", [])
+        if villages:
+            for v in villages:
+                name = v.get("name", "Köy")
+                coord = f"({v.get('x', '?')}|{v.get('y', '?')})"
+                self.src_combo.addItem(f"{name} {coord}", v)
+        else:
+            v = self._game_data.get("village", {})
+            if v:
+                name = v.get("name", "Köy")
+                coord = f"({v.get('x', '?')}|{v.get('y', '?')})"
+                self.src_combo.addItem(f"{name} {coord}", v)
+            else:
+                self.src_combo.addItem("— Köy bulunamadı —")
+        src_row.addWidget(self.src_combo)
+        src_row.addStretch()
+        layout.addLayout(src_row)
+
+        # ── Asker giriş alanları ──
+        troop_group = QGroupBox("Asker Seçimi")
+        troop_layout = QHBoxLayout()
+        troop_layout.setSpacing(2)
+
+        self.troop_inputs = {}
+        for key, short in self._unit_defs:
+            unit_frame = QFrame()
+            unit_frame.setStyleSheet(
+                "border: 1px solid #d0c8b0; border-radius: 3px; padding: 1px;"
+                "background: #faf5eb;")
+            uf_layout = QVBoxLayout(unit_frame)
+            uf_layout.setContentsMargins(3, 2, 3, 2)
+            uf_layout.setSpacing(1)
+
+            icon_lbl = QLabel()
+            icon_lbl.setAlignment(Qt.AlignCenter)
+            icon_lbl.setFixedHeight(18)
+            icon_lbl.setStyleSheet("border: none;")
+            troop_icon_mgr.apply_to_label(icon_lbl, key)
+            uf_layout.addWidget(icon_lbl)
+
+            name_lbl = QLabel(short)
+            name_lbl.setAlignment(Qt.AlignCenter)
+            name_lbl.setStyleSheet(
+                "font-size: 9px; font-weight: bold; color: #5a3e1b; border: none;")
+            uf_layout.addWidget(name_lbl)
+
+            spin = QSpinBox()
+            spin.setRange(0, 99999)
+            spin.setValue(0)
+            spin.setFixedWidth(58)
+            spin.setAlignment(Qt.AlignCenter)
+            spin.setStyleSheet(
+                "font-size: 11px; border: 1px solid #b89b6a; background: white;")
+            uf_layout.addWidget(spin)
+            self.troop_inputs[key] = spin
+
+            troop_layout.addWidget(unit_frame)
+
+        troop_layout.addStretch()
+        troop_group.setLayout(troop_layout)
+        troop_group.setStyleSheet(
+            "QGroupBox { font-weight: bold; font-size: 11px; color: #5a3e1b;"
+            "border: 1px solid #b89b6a; border-radius: 4px; margin-top: 8px; padding-top: 14px;"
+            "background: qlineargradient(y1:0,y2:1,stop:0 #f8f0e0,stop:1 #ece0cc); }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
+        layout.addWidget(troop_group)
+
+        # ── Tür + Zaman ──
+        opt_row = QHBoxLayout()
+        opt_row.setSpacing(10)
+
+        opt_row.addWidget(QLabel("Tür:"))
+        self.cmd_type_combo = QComboBox()
+        self.cmd_type_combo.addItems(["Saldırı", "Destek"])
+        self.cmd_type_combo.setFixedWidth(90)
+        self.cmd_type_combo.setStyleSheet(
+            "background: #faf5eb; border: 1px solid #b89b6a; padding: 3px;")
+        opt_row.addWidget(self.cmd_type_combo)
+
+        opt_row.addSpacing(20)
+
+        self.btn_arrive = QPushButton("Varış zamanı ayarla")
+        self.btn_arrive.setCursor(Qt.PointingHandCursor)
+        self.btn_arrive.setCheckable(True)
+        self.btn_arrive.setStyleSheet(
+            "background: qlineargradient(y1:0,y2:1,stop:0 #f5e6c8,stop:1 #d4b896);"
+            "border: 1px solid #b89b6a; border-radius: 3px; padding: 4px 12px;"
+            "font-weight: bold; font-size: 11px; color: #5a3e1b;")
+        self.btn_arrive.clicked.connect(lambda: self._toggle_time("arrive"))
+        opt_row.addWidget(self.btn_arrive)
+
+        self.btn_send = QPushButton("Gönderim zamanı ayarla")
+        self.btn_send.setCursor(Qt.PointingHandCursor)
+        self.btn_send.setCheckable(True)
+        self.btn_send.setStyleSheet(
+            "background: qlineargradient(y1:0,y2:1,stop:0 #f5e6c8,stop:1 #d4b896);"
+            "border: 1px solid #b89b6a; border-radius: 3px; padding: 4px 12px;"
+            "font-weight: bold; font-size: 11px; color: #5a3e1b;")
+        self.btn_send.clicked.connect(lambda: self._toggle_time("send"))
+        opt_row.addWidget(self.btn_send)
+
+        opt_row.addStretch()
+        layout.addLayout(opt_row)
+
+        # Zaman giriş satırı
+        self.time_widget = QWidget()
+        time_row = QHBoxLayout(self.time_widget)
+        time_row.setContentsMargins(0, 0, 0, 0)
+        time_row.setSpacing(6)
+
+        self.time_label = QLabel("Varış zamanı:")
+        self.time_label.setStyleSheet("font-weight: bold; color: #5a3e1b; font-size: 11px;")
+        time_row.addWidget(self.time_label)
+
+        self.time_date = QLineEdit()
+        self.time_date.setPlaceholderText("GG.AA")
+        self.time_date.setFixedWidth(55)
+        self.time_date.setAlignment(Qt.AlignCenter)
+        self.time_date.setStyleSheet("border: 1px solid #b89b6a; padding: 3px;")
+        time_row.addWidget(self.time_date)
+
+        time_row.addWidget(QLabel("'de"))
+
+        self.time_clock = QLineEdit()
+        self.time_clock.setPlaceholderText("SS:DD:SS:ms")
+        self.time_clock.setFixedWidth(110)
+        self.time_clock.setAlignment(Qt.AlignCenter)
+        self.time_clock.setStyleSheet("border: 1px solid #b89b6a; padding: 3px;")
+        time_row.addWidget(self.time_clock)
+
+        time_row.addStretch()
+        self.time_widget.setVisible(False)
+        layout.addWidget(self.time_widget)
+
+        self._time_mode = None
+
+        # ── Hedef kuyruğu tablosu ──
+        q_group = QGroupBox(f"Hedefler ({len(self._queue)} köy)")
+        q_layout = QVBoxLayout()
+        self.target_table = QTreeWidget()
+        self.target_table.setHeaderLabels(["", "Koordinat", "Köy Adı", "Puan", "Sahip"])
+        self.target_table.setRootIsDecorated(False)
+        self.target_table.setAlternatingRowColors(True)
+        self.target_table.setColumnWidth(0, 30)
+        self.target_table.setColumnWidth(1, 80)
+        self.target_table.setColumnWidth(2, 120)
+        self.target_table.setColumnWidth(3, 60)
+        self.target_table.setColumnWidth(4, 100)
+
+        for i, v in enumerate(self._queue):
+            coord = f"({v['x']}|{v['y']})"
+            name = v.get("name", "?")
+            pts = str(v.get("points", "?"))
+            pid = v.get("player_id", 0)
+            pname = v.get("player_name", "")
+            owner = pname if (pid and pname) else ("Barbar" if not pid else f"ID:{pid}")
+            item = QTreeWidgetItem([str(i + 1), coord, name, pts, owner])
+            item.setTextAlignment(0, Qt.AlignCenter)
+            item.setTextAlignment(1, Qt.AlignCenter)
+            item.setTextAlignment(3, Qt.AlignCenter)
+            self.target_table.addTopLevelItem(item)
+
+        q_layout.addWidget(self.target_table)
+        q_group.setLayout(q_layout)
+        q_group.setStyleSheet(
+            "QGroupBox { font-weight: bold; font-size: 11px; color: #5a3e1b;"
+            "border: 1px solid #b89b6a; border-radius: 4px; margin-top: 8px; padding-top: 14px;"
+            "background: #faf8f2; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
+        layout.addWidget(q_group, 1)
+
+        # ── Alt butonlar ──
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+
+        btn_cancel = QPushButton("İptal")
+        btn_cancel.setCursor(Qt.PointingHandCursor)
+        btn_cancel.setFixedWidth(100)
+        btn_cancel.setMinimumHeight(32)
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+
+        btn_add = QPushButton("+ Tabloya Ekle")
+        btn_add.setCursor(Qt.PointingHandCursor)
+        btn_add.setFixedWidth(160)
+        btn_add.setMinimumHeight(32)
+        btn_add.setStyleSheet(
+            "background: qlineargradient(y1:0,y2:1,stop:0 #f5e6c8,stop:1 #d4b896);"
+            "border: 1px solid #b89b6a; border-radius: 4px; padding: 6px 16px;"
+            "font-weight: bold; font-size: 12px; color: #5a3e1b;")
+        btn_add.clicked.connect(self._on_add)
+        btn_row.addWidget(btn_add)
+
+        layout.addLayout(btn_row)
+
+    def _toggle_time(self, mode):
+        if mode == "arrive":
+            self.btn_arrive.setChecked(True)
+            self.btn_send.setChecked(False)
+            self.time_label.setText("Varış zamanı:")
+            self._time_mode = "arrive"
+        else:
+            self.btn_send.setChecked(True)
+            self.btn_arrive.setChecked(False)
+            self.time_label.setText("Gönderim zamanı:")
+            self._time_mode = "send"
+        self.time_widget.setVisible(True)
+
+    def _on_add(self):
+        has_troops = any(spin.value() > 0 for spin in self.troop_inputs.values())
+        if not has_troops:
+            QMessageBox.warning(self, "Uyarı", "En az bir asker girin!")
+            return
+
+        src_data = self.src_combo.currentData()
+        src_text = self.src_combo.currentText()
+
+        troops = {}
+        for key, spin in self.troop_inputs.items():
+            if spin.value() > 0:
+                troops[key] = spin.value()
+
+        cmd_type = "Sld" if self.cmd_type_combo.currentIndex() == 0 else "Dst"
+
+        import math
+
+        src_x = src_data.get("x", 500) if src_data else 500
+        src_y = src_data.get("y", 500) if src_data else 500
+
+        UNIT_SPEEDS = {
+            "spear": 18, "sword": 22, "axe": 18, "archer": 18,
+            "spy": 9, "light": 10, "marcher": 10, "heavy": 11,
+            "ram": 30, "catapult": 30, "knight": 10, "snob": 35,
+        }
+
+        time_date = self.time_date.text().strip() if self._time_mode else ""
+        time_clock = self.time_clock.text().strip() if self._time_mode else ""
+
+        for v in self._queue:
+            tgt_x, tgt_y = v["x"], v["y"]
+            distance = math.sqrt((tgt_x - src_x) ** 2 + (tgt_y - src_y) ** 2)
+
+            slowest = 0
+            for unit_key in troops:
+                spd = UNIT_SPEEDS.get(unit_key, 18)
+                if spd > slowest:
+                    slowest = spd
+            travel_sec = distance * slowest * 60 if slowest else 0
+
+            send_str, arrive_str, return_str = "—", "—", "—"
+            if self._time_mode and time_date and time_clock:
+                input_dt = self._parse_time(time_date, time_clock)
+                if input_dt:
+                    travel_delta = datetime.timedelta(seconds=travel_sec)
+                    if self._time_mode == "send":
+                        send_dt = input_dt
+                        arrive_dt = send_dt + travel_delta
+                    else:
+                        arrive_dt = input_dt
+                        send_dt = arrive_dt - travel_delta
+                    return_dt = arrive_dt + travel_delta
+                    send_str = send_dt.strftime("%d.%m %H:%M:%S")
+                    arrive_str = arrive_dt.strftime("%d.%m %H:%M:%S")
+                    return_str = return_dt.strftime("%d.%m %H:%M:%S")
+
+            self._results.append({
+                "source": src_text,
+                "tgt_x": tgt_x,
+                "tgt_y": tgt_y,
+                "troops": troops,
+                "cmd_type": cmd_type,
+                "send_time": send_str,
+                "arrive_time": arrive_str,
+                "return_time": return_str,
+            })
+
+        self.accept()
+
+    def _parse_time(self, date_str, clock_str):
+        try:
+            now = datetime.datetime.now()
+            parts = date_str.split(".")
+            day = int(parts[0])
+            month = int(parts[1]) if len(parts) > 1 else now.month
+            year = now.year
+
+            time_parts = clock_str.replace(":", " ").split()
+            hour = int(time_parts[0]) if len(time_parts) > 0 else 0
+            minute = int(time_parts[1]) if len(time_parts) > 1 else 0
+            sec = int(time_parts[2]) if len(time_parts) > 2 else 0
+            ms = int(time_parts[3]) if len(time_parts) > 3 else 0
+
+            return datetime.datetime(year, month, day, hour, minute, sec, ms * 1000)
+        except Exception:
+            return None
+
+    def get_results(self):
+        return self._results
+
 
 # ─────────────────────────────────────────────
 #  ANA PENCERE
@@ -3449,14 +3794,94 @@ class TribalWarsBot(QMainWindow):
         ctrl_row.addStretch()
         layout.addLayout(ctrl_row)
 
-        # Harita widget
+        # ── Harita + Sağ Panel (Splitter) ──
+        map_splitter = QSplitter(Qt.Horizontal)
+
+        # Sol: Harita widget
         self.map_widget = MapCanvasWidget()
         self.map_widget.setMinimumHeight(400)
         self.map_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        # Sinyalleri bağla
         self.map_widget.village_double_clicked.connect(self._map_on_village_dblclick)
+        self.map_widget.village_clicked.connect(self._map_on_village_click)
         self.map_widget.view_changed.connect(self._map_on_view_changed)
-        layout.addWidget(self.map_widget, 1)
+        map_splitter.addWidget(self.map_widget)
+
+        # Sağ: Hedef Kuyruk Paneli
+        queue_panel = QWidget()
+        queue_layout = QVBoxLayout(queue_panel)
+        queue_layout.setContentsMargins(4, 0, 4, 0)
+        queue_layout.setSpacing(4)
+
+        q_title = QLabel("🎯 Hedef Kuyruğu")
+        q_title.setStyleSheet(
+            "font-weight: bold; font-size: 12px; color: #5a3e1b;"
+            "padding: 4px; background: qlineargradient(y1:0,y2:1,stop:0 #f5e6c8,stop:1 #d4b896);"
+            "border: 1px solid #b89b6a; border-radius: 3px;")
+        q_title.setAlignment(Qt.AlignCenter)
+        queue_layout.addWidget(q_title)
+
+        q_hint = QLabel("Haritada köylere tıklayarak kuyruğa ekleyin")
+        q_hint.setStyleSheet("font-size: 9px; color: #888; font-style: italic;")
+        q_hint.setAlignment(Qt.AlignCenter)
+        queue_layout.addWidget(q_hint)
+
+        self.map_queue_list = QTreeWidget()
+        self.map_queue_list.setHeaderLabels(["#", "Koordinat", "Köy Adı", "Puan", "Sahip"])
+        self.map_queue_list.setRootIsDecorated(False)
+        self.map_queue_list.setAlternatingRowColors(True)
+        self.map_queue_list.setSelectionMode(QTreeWidget.ExtendedSelection)
+        self.map_queue_list.setColumnWidth(0, 30)
+        self.map_queue_list.setColumnWidth(1, 70)
+        self.map_queue_list.setColumnWidth(2, 90)
+        self.map_queue_list.setColumnWidth(3, 50)
+        self.map_queue_list.setColumnWidth(4, 70)
+        self.map_queue_list.header().setStyleSheet(
+            "QHeaderView::section { font-size: 9px; padding: 2px;"
+            "background: #e8dcc8; border: 1px solid #c0b090; }")
+        queue_layout.addWidget(self.map_queue_list, 1)
+
+        self.map_queue_count_label = QLabel("Kuyruk: 0 hedef")
+        self.map_queue_count_label.setStyleSheet("font-size: 10px; color: #555; font-weight: bold;")
+        queue_layout.addWidget(self.map_queue_count_label)
+
+        q_btn_row = QHBoxLayout()
+        q_btn_row.setSpacing(4)
+
+        btn_q_remove = QPushButton("Seçileni Sil")
+        btn_q_remove.setCursor(Qt.PointingHandCursor)
+        btn_q_remove.setStyleSheet("font-size: 10px;")
+        btn_q_remove.clicked.connect(self._map_queue_remove_selected)
+        q_btn_row.addWidget(btn_q_remove)
+
+        btn_q_clear = QPushButton("Tümünü Temizle")
+        btn_q_clear.setCursor(Qt.PointingHandCursor)
+        btn_q_clear.setStyleSheet("font-size: 10px;")
+        btn_q_clear.clicked.connect(self._map_queue_clear)
+        q_btn_row.addWidget(btn_q_clear)
+
+        queue_layout.addLayout(q_btn_row)
+
+        # Ordu Gönder butonu
+        self.map_send_army_btn = QPushButton("⚔️ Ordu Gönder")
+        self.map_send_army_btn.setCursor(Qt.PointingHandCursor)
+        self.map_send_army_btn.setMinimumHeight(36)
+        self.map_send_army_btn.setStyleSheet(
+            "background: qlineargradient(y1:0,y2:1,stop:0 #cc4444,stop:1 #992222);"
+            "color: white; font-weight: bold; font-size: 12px;"
+            "border: 1px solid #881111; border-radius: 4px; padding: 6px;")
+        self.map_send_army_btn.clicked.connect(self._map_open_send_dialog)
+        queue_layout.addWidget(self.map_send_army_btn)
+
+        queue_panel.setMinimumWidth(260)
+        queue_panel.setMaximumWidth(400)
+        map_splitter.addWidget(queue_panel)
+
+        map_splitter.setStretchFactor(0, 3)
+        map_splitter.setStretchFactor(1, 1)
+        layout.addWidget(map_splitter, 1)
+
+        # Kuyruk verisi
+        self._map_queue = []
 
         # Lejand
         legend_row = QHBoxLayout()
@@ -3465,7 +3890,7 @@ class TribalWarsBot(QMainWindow):
             ("🔵 Klan", "#4488cc"),
             ("🔴 Düşman", "#cc2222"),
             ("⚫ Barbar", "#666666"),
-            ("🟤 Diğer", "#dd8833"),
+            ("🟤 Diğer", "#FF6600"),
         ]
         for text, color in legend_items:
             lbl = QLabel(text)
@@ -3888,6 +4313,105 @@ class TribalWarsBot(QMainWindow):
         self._farm_barb_index = 0
         self._farm_sent_count = 0
         self._farm_update_labels()
+
+    # ── HARİTA KUYRUK YÖNETİMİ ────────────────
+
+    def _map_on_village_click(self, village):
+        """Haritada köye tek tıklandığında kuyruğa ekle."""
+        coord = f"({village['x']}|{village['y']})"
+        for existing in self._map_queue:
+            if existing["x"] == village["x"] and existing["y"] == village["y"]:
+                self._add_log("HARİTA", "warn", f"Köy zaten kuyrukta: {coord}")
+                return
+        self._map_queue.append(village)
+        self._map_queue_refresh()
+        name = village.get("name", "?")
+        self._add_log("HARİTA", "info", f"Kuyruğa eklendi: {name} {coord}")
+
+    def _map_queue_refresh(self):
+        """Kuyruk listesini güncelle."""
+        self.map_queue_list.clear()
+        for i, v in enumerate(self._map_queue):
+            coord = f"({v['x']}|{v['y']})"
+            name = v.get("name", "?")
+            pts = str(v.get("points", "?"))
+            pid = v.get("player_id", 0)
+            pname = v.get("player_name", "")
+            if pid and pname:
+                owner = pname
+            elif pid:
+                owner = f"ID:{pid}"
+            else:
+                owner = "Barbar"
+            item = QTreeWidgetItem([str(i + 1), coord, name, pts, owner])
+            item.setTextAlignment(0, Qt.AlignCenter)
+            item.setTextAlignment(1, Qt.AlignCenter)
+            item.setTextAlignment(3, Qt.AlignCenter)
+            self.map_queue_list.addTopLevelItem(item)
+        self.map_queue_count_label.setText(f"Kuyruk: {len(self._map_queue)} hedef")
+
+    def _map_queue_remove_selected(self):
+        """Seçili hedefleri kuyruktan kaldır."""
+        selected = self.map_queue_list.selectedItems()
+        if not selected:
+            return
+        indices = sorted(
+            [self.map_queue_list.indexOfTopLevelItem(item) for item in selected],
+            reverse=True)
+        for idx in indices:
+            if 0 <= idx < len(self._map_queue):
+                self._map_queue.pop(idx)
+        self._map_queue_refresh()
+
+    def _map_queue_clear(self):
+        """Kuyruğu tamamen temizle."""
+        self._map_queue.clear()
+        self._map_queue_refresh()
+
+    def _map_open_send_dialog(self):
+        """Ordu gönder dialogunu aç."""
+        if not self._map_queue:
+            QMessageBox.warning(self, "Uyarı", "Kuyrukta hedef köy yok!\nHaritada köylere tıklayarak ekleyin.")
+            return
+        dlg = MapArmySendDialog(self, self._map_queue, self._game_data, self.SA_UNIT_DEFS)
+        if dlg.exec_() == dlg.Accepted:
+            results = dlg.get_results()
+            for entry in results:
+                self._map_add_to_army_queue(entry)
+            self._add_log("HARİTA", "success",
+                f"{len(results)} komut Ordu Gönder kuyruğuna eklendi!")
+
+    def _map_add_to_army_queue(self, entry):
+        """Harita kuyruğundan gelen veriyi Ordu Gönder tablosuna ekle."""
+        src_text = entry["source"]
+        tgt = f"{entry['tgt_x']}|{entry['tgt_y']}"
+        cmd_type = entry.get("cmd_type", "Sld")
+
+        troop_values = []
+        for key, _ in self.SA_UNIT_DEFS:
+            troop_values.append(str(entry["troops"].get(key, 0)))
+
+        task_id = str(self.sa_table.topLevelItemCount() + 1)
+        send_str = entry.get("send_time", "—")
+        arrive_str = entry.get("arrive_time", "—")
+        return_str = entry.get("return_time", "—")
+
+        row_data = [src_text, tgt] + troop_values + [cmd_type, send_str, arrive_str, return_str, task_id]
+        item = QTreeWidgetItem(row_data)
+
+        for col in range(2, 14):
+            item.setTextAlignment(col, Qt.AlignCenter)
+            if troop_values[col - 2] != "0":
+                item.setForeground(col, QColor("#2d5a9e"))
+            else:
+                item.setForeground(col, QColor("#ccc"))
+
+        item.setTextAlignment(14, Qt.AlignCenter)
+        for col in [15, 16, 17, 18]:
+            item.setTextAlignment(col, Qt.AlignCenter)
+
+        self.sa_table.addTopLevelItem(item)
+        self._sa_update_totals()
 
     # ── HARİTA SİNYAL HANDLER'LARI ────────────────
 
