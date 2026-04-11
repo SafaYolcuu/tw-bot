@@ -21,8 +21,9 @@ echo.
 
 echo [2/3] Build baslatiliyor...
 echo       Bu islem birkaç dakika surebilir...
+echo       Not: Cikti dist_build klasorune yazilir (eski EXE acik olsa bile sorun cikmaz).
 echo.
-pyinstaller tribal_wars_bot.spec --noconfirm --clean
+pyinstaller tribal_wars_bot.spec --noconfirm --clean --distpath dist_build --workpath build_release
 if %errorlevel% neq 0 (
     echo.
     echo HATA: Build basarisiz!
@@ -32,11 +33,11 @@ if %errorlevel% neq 0 (
 echo.
 
 echo [3/3] Kurulum dosyasi kopyalaniyor...
-copy /Y README_KURULUM.txt dist\TribalWarsBot\ >nul 2>&1
+copy /Y README_KURULUM.txt dist_build\TribalWarsBot\ >nul 2>&1
 echo.
 echo ============================================
 echo   BUILD TAMAMLANDI!
-echo   Cikti klasoru: dist\TribalWarsBot\
+echo   Cikti klasoru: dist_build\TribalWarsBot\
 echo   Kullaniciya bu klasoru zip'leyip gonderin.
 echo ============================================
 echo.

@@ -1,6 +1,8 @@
 # PyInstaller
 build/
+build_release/
 dist/
+dist_build/
 *.spec.bak
 
 # Python

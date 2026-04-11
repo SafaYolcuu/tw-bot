@@ -9,6 +9,7 @@ Gereksinimler:
 import sys
 import re
 import json
+import math
 import random
 import datetime
 import urllib.request
@@ -22,7 +23,7 @@ from PyQt5.QtWidgets import (
     QFrame, QGroupBox, QGridLayout, QHeaderView, QStatusBar,
     QSizePolicy, QFormLayout, QMessageBox, QTableWidget, QTableWidgetItem,
     QTimeEdit, QDateEdit, QAbstractItemView, QDoubleSpinBox, QSlider,
-    QDialog
+    QDialog, QRadioButton, QButtonGroup,
 )
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage, QWebEngineProfile, QWebEngineSettings
 
@@ -34,6 +35,7 @@ SERVERS = [
     ("tribalwars.works", "https://www.tribalwars.works"),
     ("tribalwars.net", "https://www.tribalwars.net"),
     ("tribalwars.com.tr", "https://www.tribalwars.com.tr"),
+    ("klanlar.org", "https://www.klanlar.org"),
     ("tribalwars.co.uk", "https://www.tribalwars.co.uk"),
     ("tribalwars.de", "https://www.die-staemme.de"),
 ]
@@ -2402,14 +2404,14 @@ class TribalWarsBot(QMainWindow):
             adjusted_send_dt = send_dt + datetime.timedelta(milliseconds=offset_ms)
             diff_ms = (adjusted_send_dt - server_dt).total_seconds() * 1000
 
-            # 5 saniye kala: rally point token'ını önceden cache'le
-            if 0 < diff_ms <= 5000 and state not in ("cached", "confirmed", "confirming"):
+            # 6 saniye kala: rally point token'ını önceden cache'le (fetch bitene kadar süre)
+            if 0 < diff_ms <= 6000 and state not in ("cached", "confirmed", "confirming"):
                 item.setData(0, Qt.UserRole, "caching")
                 self._dispatch_precache(item, i)
 
-            # 1.5 saniye kala: try=confirm POST'unu önceden yap + JS timer kur
-            # (precache'in tamamlanması için en az 3.5sn beklenmiş olur)
-            elif 0 < diff_ms <= 1500 and state == "cached":
+            # 2 saniye kala: try=confirm POST'unu önceden yap + JS timer kur
+            # (precache'in tamamlanması için en az ~4sn beklenmiş olur)
+            elif 0 < diff_ms <= 2000 and state == "cached":
                 item.setData(0, Qt.UserRole, "confirming")
                 self._dispatch_preconfirm(item, i)
 
@@ -2507,7 +2509,10 @@ class TribalWarsBot(QMainWindow):
             .then(function(r) {{ return r.text(); }})
             .then(function(html) {{
                 var doc = new DOMParser().parseFromString(html, 'text/html');
-                var form = doc.getElementById('command-data-form');
+                var form = doc.getElementById('command-data-form')
+                    || doc.querySelector('form#command-data-form')
+                    || doc.querySelector('form[action*="try=confirm"]')
+                    || doc.querySelector('form[action*="screen=place"]');
                 if (form) {{
                     var data = {{}};
                     form.querySelectorAll('input[type="hidden"]').forEach(function(h) {{
@@ -2595,77 +2600,118 @@ class TribalWarsBot(QMainWindow):
             if (!window.__tw_bot_results) window.__tw_bot_results = {{}};
             if (!window.__tw_bot_fire) window.__tw_bot_fire = {{}};
 
-            var cached = window.__tw_bot_cache && window.__tw_bot_cache[cacheKey];
-            if (!cached) return;
-
-            delete window.__tw_bot_cache[cacheKey];
-            var tokenData = JSON.parse(cached);
-
-            var fd = new URLSearchParams();
-            for (var key in tokenData) {{
-                if (key !== '__form_action') fd.append(key, tokenData[key]);
+            function __twFindConfirmForm(doc) {{
+                return doc.getElementById('command-data-form')
+                    || doc.querySelector('form#command-data-form')
+                    || doc.querySelector('form[action*="try=confirm"]')
+                    || doc.querySelector('form[action*="screen=place"][action*="action=command"]');
             }}
-            for (var unit in troops) {{ fd.append(unit, troops[unit]); }}
-            fd.set('x', targetX);
-            fd.set('y', targetY);
-            if (attackType === 'attack') {{ fd.append('attack', 'true'); }}
-            else {{ fd.append('support', 'true'); }}
 
-            var formAction = tokenData.__form_action || '/game.php?village=' + villageId + '&screen=place&try=confirm';
+            function __twChFromHtml(html) {{
+                if (!html) return '';
+                var m = html.match(/name=["']ch["']\\s+value=["']([^"']*)["']/i)
+                    || html.match(/name=["']ch["']\\s+value=([^\\s>]+)/i)
+                    || html.match(/value=["']([^"']+)["'][^>]*name=["']ch["']/i);
+                return m ? m[1] : '';
+            }}
 
-            fetch(formAction, {{
-                method: 'POST',
-                headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
-                body: fd.toString(),
-                credentials: 'same-origin'
-            }})
-            .then(function(r) {{ return r.text(); }})
-            .then(function(confirmHtml) {{
-                if (!confirmHtml) return;
+            function __twFormHasCh(cf, html) {{
+                if (!cf) return false;
+                if (cf.querySelector('input[name="ch"], button[name="ch"], select[name="ch"]')) return true;
+                return !!__twChFromHtml(html);
+            }}
 
-                var doc2 = new DOMParser().parseFromString(confirmHtml, 'text/html');
-                var cf = doc2.getElementById('command-data-form');
-                if (!cf || !cf.querySelector('input[name="ch"]')) return;
-
+            function __twAppendConfirmBody(cf, html) {{
                 var cd = new URLSearchParams();
-                cf.querySelectorAll('input[type="hidden"]').forEach(function(h) {{
-                    if (h.name) cd.append(h.name, h.value);
+                cf.querySelectorAll('input[type="hidden"], input[name="ch"], button[name="ch"]').forEach(function(h) {{
+                    if (h.name && h.name !== 'submit_confirm') cd.append(h.name, h.value || '');
                 }});
+                if (!cd.get('ch')) {{
+                    var cv = __twChFromHtml(html);
+                    if (cv) cd.append('ch', cv);
+                }}
                 cd.append('submit_confirm', 'true');
-                var bodyStr = cd.toString();
-                var actionUrl = cf.getAttribute('action');
+                return cd.toString();
+            }}
 
-                window.__tw_bot_fire[cmdId] = function() {{
-                    window.__tw_bot_results[cmdId] = 'SENDING';
-                    fetch(actionUrl, {{
-                        method: 'POST',
-                        headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
-                        body: bodyStr,
-                        credentials: 'same-origin'
-                    }})
-                    .then(function(r) {{ return r.text(); }})
-                    .then(function() {{
-                        window.__tw_bot_results[cmdId] = 'SENT_OK';
-                    }})
-                    .catch(function(e) {{
-                        window.__tw_bot_results[cmdId] = 'ERROR|' + String(e);
-                    }});
-                }};
+            function __twWaitCache(key, attempt, done) {{
+                var c = window.__tw_bot_cache && window.__tw_bot_cache[key];
+                if (c) {{ done(JSON.parse(c)); return; }}
+                if (attempt >= 45) {{ done(null); return; }}
+                setTimeout(function() {{ __twWaitCache(key, attempt + 1, done); }}, 100);
+            }}
 
-                var elapsed = Date.now() - startMs;
-                var delay = remainingMs - elapsed;
-                if (delay > 0 && delay < 30000) {{
-                    setTimeout(function() {{
+            __twWaitCache(cacheKey, 0, function(tokenData) {{
+                if (!tokenData) return;
+
+                delete window.__tw_bot_cache[cacheKey];
+
+                var fd = new URLSearchParams();
+                for (var key in tokenData) {{
+                    if (key !== '__form_action') fd.append(key, tokenData[key]);
+                }}
+                for (var unit in troops) {{ fd.append(unit, troops[unit]); }}
+                fd.set('x', targetX);
+                fd.set('y', targetY);
+                if (attackType === 'attack') {{ fd.append('attack', 'true'); }}
+                else {{ fd.append('support', 'true'); }}
+
+                var formAction = tokenData.__form_action || '/game.php?village=' + villageId + '&screen=place&try=confirm';
+
+                fetch(formAction, {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
+                    body: fd.toString(),
+                    credentials: 'same-origin'
+                }})
+                .then(function(r) {{ return r.text(); }})
+                .then(function(confirmHtml) {{
+                    if (!confirmHtml) return;
+
+                    var doc2 = new DOMParser().parseFromString(confirmHtml, 'text/html');
+                    var cf = __twFindConfirmForm(doc2);
+                    if (!cf || !__twFormHasCh(cf, confirmHtml)) return;
+
+                    var bodyStr = __twAppendConfirmBody(cf, confirmHtml);
+                    var actionUrl = cf.getAttribute('action');
+                    if (!actionUrl) return;
+
+                    window.__tw_bot_fire[cmdId] = function() {{
+                        window.__tw_bot_results[cmdId] = 'SENDING';
+                        fetch(actionUrl, {{
+                            method: 'POST',
+                            headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+                            body: bodyStr,
+                            credentials: 'same-origin'
+                        }})
+                        .then(function(r) {{ return r.text(); }})
+                        .then(function() {{
+                            window.__tw_bot_results[cmdId] = 'SENT_OK';
+                        }})
+                        .catch(function(e) {{
+                            window.__tw_bot_results[cmdId] = 'ERROR|' + String(e);
+                        }});
+                    }};
+
+                    var elapsed = Date.now() - startMs;
+                    var delay = remainingMs - elapsed;
+                    function __twTryFire() {{
                         if (!window.__tw_bot_results[cmdId] ||
                             (window.__tw_bot_results[cmdId] !== 'SENT_OK' &&
                              window.__tw_bot_results[cmdId] !== 'SENDING')) {{
                             window.__tw_bot_fire[cmdId]();
                         }}
-                    }}, delay);
-                }}
-            }})
-            .catch(function(e) {{
-                // Sessizce başarısız ol — Python fallback devreye girecek
+                    }}
+                    // Gecikme zaten geçtiyse hemen kuyruğa al (0ms); aksi hedef ana kadar bekle
+                    if (delay <= 0) {{
+                        setTimeout(__twTryFire, 0);
+                    }} else if (delay < 60000) {{
+                        setTimeout(__twTryFire, delay);
+                    }} else {{
+                        setTimeout(__twTryFire, 0);
+                    }}
+                }})
+                .catch(function(e) {{}});
             }});
         }})();
         """
@@ -2748,6 +2794,43 @@ class TribalWarsBot(QMainWindow):
             var cmdId = '{cmd_id}';
             var cacheKey = '{cache_key}';
 
+            function __twFindPlaceForm(doc) {{
+                return doc.getElementById('command-data-form')
+                    || doc.querySelector('form#command-data-form')
+                    || doc.querySelector('form[action*="try=confirm"]')
+                    || doc.querySelector('form[action*="screen=place"]');
+            }}
+            function __twFindConfirmForm(doc) {{
+                return doc.getElementById('command-data-form')
+                    || doc.querySelector('form#command-data-form')
+                    || doc.querySelector('form[action*="try=confirm"]')
+                    || doc.querySelector('form[action*="screen=place"][action*="action=command"]');
+            }}
+            function __twChFromHtml(html) {{
+                if (!html) return '';
+                var m = html.match(/name=["']ch["']\\s+value=["']([^"']*)["']/i)
+                    || html.match(/name=["']ch["']\\s+value=([^\\s>]+)/i)
+                    || html.match(/value=["']([^"']+)["'][^>]*name=["']ch["']/i);
+                return m ? m[1] : '';
+            }}
+            function __twFormHasCh(cf, html) {{
+                if (!cf) return false;
+                if (cf.querySelector('input[name="ch"], button[name="ch"], select[name="ch"]')) return true;
+                return !!__twChFromHtml(html);
+            }}
+            function __twAppendConfirmBody(cf, html) {{
+                var cd = new URLSearchParams();
+                cf.querySelectorAll('input[type="hidden"], input[name="ch"], button[name="ch"]').forEach(function(h) {{
+                    if (h.name && h.name !== 'submit_confirm') cd.append(h.name, h.value || '');
+                }});
+                if (!cd.get('ch')) {{
+                    var cv = __twChFromHtml(html);
+                    if (cv) cd.append('ch', cv);
+                }}
+                cd.append('submit_confirm', 'true');
+                return cd.toString();
+            }}
+
             if (!window.__tw_bot_results) window.__tw_bot_results = {{}};
 
             // Preconfirm fire fonksiyonu varsa → tek POST (hızlı yol)
@@ -2774,7 +2857,7 @@ class TribalWarsBot(QMainWindow):
                 .then(function(r) {{ return r.text(); }})
                 .then(function(html) {{
                     var doc = new DOMParser().parseFromString(html, 'text/html');
-                    var form = doc.getElementById('command-data-form');
+                    var form = __twFindPlaceForm(doc);
                     if (!form) return null;
                     var data = {{}};
                     form.querySelectorAll('input[type="hidden"]').forEach(function(h) {{
@@ -2793,8 +2876,8 @@ class TribalWarsBot(QMainWindow):
                 }}
 
                 var fd = new URLSearchParams();
-                for (var key in tokenData) {{
-                    if (key !== '__form_action') fd.append(key, tokenData[key]);
+                for (var tk in tokenData) {{
+                    if (tk !== '__form_action') fd.append(tk, tokenData[tk]);
                 }}
                 for (var unit in troops) {{ fd.append(unit, troops[unit]); }}
                 fd.set('x', targetX);
@@ -2813,28 +2896,32 @@ class TribalWarsBot(QMainWindow):
             }})
             .then(function(r) {{ if (r) return r.text(); }})
             .then(function(confirmHtml) {{
-                if (!confirmHtml) return;
+                if (!confirmHtml) {{
+                    window.__tw_bot_results[cmdId] = 'ERROR|Onay sayfasi bos';
+                    return;
+                }}
 
                 var doc2 = new DOMParser().parseFromString(confirmHtml, 'text/html');
-                var cf = doc2.getElementById('command-data-form');
+                var cf = __twFindConfirmForm(doc2);
                 if (!cf) {{
                     window.__tw_bot_results[cmdId] = 'ERROR|Onay formu bulunamadi';
                     return;
                 }}
-                if (!cf.querySelector('input[name="ch"]')) {{
+                if (!__twFormHasCh(cf, confirmHtml)) {{
                     window.__tw_bot_results[cmdId] = 'ERROR|ch token bulunamadi';
                     return;
                 }}
-                var cd = new URLSearchParams();
-                cf.querySelectorAll('input[type="hidden"]').forEach(function(h) {{
-                    if (h.name) cd.append(h.name, h.value);
-                }});
-                cd.append('submit_confirm', 'true');
+                var bodyStr = __twAppendConfirmBody(cf, confirmHtml);
+                var actionUrl = cf.getAttribute('action');
+                if (!actionUrl) {{
+                    window.__tw_bot_results[cmdId] = 'ERROR|Form action yok';
+                    return;
+                }}
 
-                return fetch(cf.getAttribute('action'), {{
+                return fetch(actionUrl, {{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
-                    body: cd.toString(),
+                    body: bodyStr,
                     credentials: 'same-origin'
                 }});
             }})
@@ -5458,16 +5545,83 @@ class TribalWarsBot(QMainWindow):
         row2.addStretch()
         layout.addLayout(row2)
 
+        # Evde tut (Sophie keepHome)
+        kh_row = QHBoxLayout()
+        kh_row.addWidget(QLabel("Evde tut:"))
+        self.scav_keep_home = {}
+        for key, name in self.SCAV_UNITS:
+            kh_row.addWidget(QLabel(name))
+            kh = QSpinBox()
+            kh.setRange(0, 999999)
+            kh.setFixedWidth(64)
+            kh.setToolTip(f"{name} — köyde bırakılacak minimum")
+            self.scav_keep_home[key] = kh
+            kh_row.addWidget(kh)
+        kh_row.addStretch()
+        layout.addLayout(kh_row)
+
+        # Kullanılacak temizlik seviyeleri (Sv1–Sv4)
+        cat_row = QHBoxLayout()
+        cat_row.addWidget(QLabel("Seviyeler:"))
+        self.scav_cat_cbs = {}
+        for oid, lbl in [
+            (1, "Sv1 %10"), (2, "Sv2 %25"), (3, "Sv3 %50"), (4, "Sv4 %75"),
+        ]:
+            cb = QCheckBox(lbl)
+            cb.setChecked(True)
+            cb.setStyleSheet("font-size: 10px;")
+            self.scav_cat_cbs[oid] = cb
+            cat_row.addWidget(cb)
+        cat_row.addStretch()
+        layout.addLayout(cat_row)
+
+        # Hedef dönüş süresi (saat) — off/def köy (Sophie runTimes)
+        rt_row = QHBoxLayout()
+        rt_row.addWidget(QLabel("Hedef süre (saat) Off:"))
+        self.scav_rt_off = QDoubleSpinBox()
+        self.scav_rt_off.setRange(0.1, 24.0)
+        self.scav_rt_off.setSingleStep(0.5)
+        self.scav_rt_off.setDecimals(2)
+        self.scav_rt_off.setValue(4.0)
+        self.scav_rt_off.setToolTip("Çoğunluk off birimli köyler için (Sophie time.off)")
+        rt_row.addWidget(self.scav_rt_off)
+        rt_row.addWidget(QLabel("Def:"))
+        self.scav_rt_def = QDoubleSpinBox()
+        self.scav_rt_def.setRange(0.1, 24.0)
+        self.scav_rt_def.setSingleStep(0.5)
+        self.scav_rt_def.setDecimals(2)
+        self.scav_rt_def.setValue(3.0)
+        self.scav_rt_def.setToolTip("Çoğunluk def birimli köyler için (Sophie time.def)")
+        rt_row.addStretch()
+        layout.addLayout(rt_row)
+
+        # Dağıtım modu (Sophie prioritiseHighCat / balanced)
+        prio_row = QHBoxLayout()
+        prio_row.addWidget(QLabel("Dağıtım:"))
+        self.scav_prio_group = QButtonGroup(self)
+        self.scav_prio_balanced = QRadioButton("Dengeli (çok asker + tüm kategoriler)")
+        self.scav_prio_highfirst = QRadioButton("Önce yüksek kategori doldur (Sophie öncelik)")
+        self.scav_prio_balanced.setChecked(True)
+        self.scav_prio_group.addButton(self.scav_prio_balanced, 0)
+        self.scav_prio_group.addButton(self.scav_prio_highfirst, 1)
+        prio_row.addWidget(self.scav_prio_balanced)
+        prio_row.addWidget(self.scav_prio_highfirst)
+        prio_row.addStretch()
+        layout.addLayout(prio_row)
+
         # Köy tablosu
         self.scav_table = QTreeWidget()
         self.scav_table.setAlternatingRowColors(True)
         self.scav_table.setRootIsDecorated(False)
         self.scav_table.setHeaderLabels([
-            "Köy", "Sv1", "Sv2", "Sv3", "Sv4", "Evdeki Asker", "Durum"
+            "Köy", "Sv1", "Sv2", "Sv3", "Sv4",
+            "Atıma kalan", "Evdeki Asker", "Durum",
         ])
-        for i in range(7):
-            self.scav_table.header().setSectionResizeMode(i,
-                QHeaderView.Stretch if i in (0, 5, 6) else QHeaderView.ResizeToContents)
+        for i in range(8):
+            self.scav_table.header().setSectionResizeMode(
+                i,
+                QHeaderView.Stretch if i in (0, 6, 7) else QHeaderView.ResizeToContents,
+            )
         layout.addWidget(self.scav_table, 1)
 
         layout.addStretch()
@@ -5482,12 +5636,19 @@ class TribalWarsBot(QMainWindow):
         self._scav_checking = False
         self._scav_next_send = 0
         self._scav_villages_cache = []  # Tüm köy verileri
+        self._scav_world_meta = {}  # duration_factor, duration_exponent, duration_initial_seconds
 
     # ── TEMİZLİK (TOPLU) FONKSİYONLAR ────────
 
     SCAV_CARRY = {
         "spear": 25, "sword": 15, "axe": 10, "archer": 10,
         "light": 80, "marcher": 50, "heavy": 50, "knight": 100,
+    }
+
+    # Off / def sınıflandırması (Sophie unitType)
+    SCAV_UNIT_OFF_DEF = {
+        "spear": "def", "sword": "def", "axe": "off", "archer": "def",
+        "light": "off", "marcher": "off", "heavy": "def", "knight": "def",
     }
 
     def _scav_start(self):
@@ -5533,7 +5694,9 @@ class TribalWarsBot(QMainWindow):
         self._scav_update_countdowns()
         if self._scav_next_send > now:
             remaining = int(self._scav_next_send - now)
-            self.scav_status_label.setText(f"Durum: Sonraki kontrol {remaining}sn")
+            self.scav_status_label.setText(
+                f"Durum: Sonraki veri çekimi ~{remaining}sn (köy süreleri tabloda)"
+            )
             self.scav_status_label.setStyleSheet("font-size: 10px; color: #aa6600;")
             return
         self._scav_process()
@@ -5559,6 +5722,20 @@ class TribalWarsBot(QMainWindow):
                         item.setText(col, "✓ Bitti")
                         item.setForeground(col, QColor("#228822"))
 
+            # Atıma kalan (köy: tüm açık slotlar boşalana kadar)
+            col_ready = 5
+            rts = item.data(col_ready, Qt.UserRole)
+            if rts and isinstance(rts, (int, float)) and float(rts) > now:
+                rem = max(0, int(float(rts) - now))
+                mins, secs = divmod(rem, 60)
+                hrs, mins = divmod(mins, 60)
+                item.setText(col_ready, f"{hrs:02d}:{mins:02d}:{secs:02d}")
+                item.setForeground(col_ready, QColor("#aa6600"))
+            elif rts and isinstance(rts, (int, float)) and float(rts) > 0:
+                item.setText(col_ready, "✓ Hazır")
+                item.setForeground(col_ready, QColor("#228822"))
+                item.setData(col_ready, Qt.UserRole, 0)
+
     def _scav_process(self):
         """Mass scavenging sayfasından tüm köylerin verisini çek."""
         if not self.browser:
@@ -5573,77 +5750,125 @@ class TribalWarsBot(QMainWindow):
         self.scav_status_label.setText("Durum: Veriler çekiliyor...")
         self.scav_status_label.setStyleSheet("font-size: 10px; color: #2d5a9e;")
 
-        selected_units = [k for k, cb in self.scav_unit_cbs.items() if cb.isChecked()]
-        selected_js = json.dumps(selected_units)
-
-        # Mass scavenging sayfasını fetch et (tüm köyler tek sayfada veya sayfalanmış)
-        fetch_js = f"""
-        (function() {{
+        # Sophie tarzı: tüm sayfalar + dünya duration_* + tam köy JSON'u
+        vid = str(village_id).replace("\\", "").replace('"', "")
+        fetch_js = r"""
+        (function() {
             window.__tw_scav_mass = 'LOADING';
-            var baseUrl = '/game.php?village={village_id}&screen=place&mode=scavenge_mass';
+            var baseUrl = '/game.php?village=__VILLAGE_ID__&screen=place&mode=scavenge_mass';
 
-            fetch(baseUrl, {{credentials: 'same-origin'}})
-            .then(function(r) {{ return r.text(); }})
-            .then(function(html) {{
-                try {{
-                    // Köy verilerini bul: [...] array
-                    var match = html.match(/\\[(\\{{"village_id"[\\s\\S]*?\\}})\\]/);
-                    if (!match) {{
-                        window.__tw_scav_mass = JSON.stringify({{status:'ERROR',message:'Köy verisi bulunamadi'}});
+            function extractVillagesArray(html) {
+                var needles = ['[{"village_id":', '[{"village_id" :', '[{ "village_id":', '[{ "village_id" :'];
+                var start = -1;
+                for (var n = 0; n < needles.length; n++) {
+                    var idx = html.indexOf(needles[n]);
+                    if (idx >= 0) { start = idx; break; }
+                }
+                if (start < 0) return null;
+                var depth = 0;
+                for (var i = start; i < html.length; i++) {
+                    var c = html[i];
+                    if (c === '[') depth++;
+                    else if (c === ']') {
+                        depth--;
+                        if (depth === 0) {
+                            try { return JSON.parse(html.substring(start, i + 1)); }
+                            catch (e) { return null; }
+                        }
+                    }
+                }
+                return null;
+            }
+
+            function extractWorldDuration(html) {
+                var m = html.match(/"duration_factor"\s*:\s*([0-9.]+)[\s\S]{0,800}?"duration_exponent"\s*:\s*([0-9.]+)[\s\S]{0,800}?"duration_initial_seconds"\s*:\s*([0-9.+-eE.]+)/);
+                if (!m) return null;
+                return {
+                    duration_factor: parseFloat(m[1]),
+                    duration_exponent: parseFloat(m[2]),
+                    duration_initial_seconds: parseFloat(m[3])
+                };
+            }
+
+            function extractMaxPage(html) {
+                var re = /[?&]page=(\d+)/g, m, mx = 0;
+                while ((m = re.exec(html)) !== null) {
+                    var n = parseInt(m[1], 10);
+                    if (!isNaN(n) && n > mx) mx = n;
+                }
+                return mx;
+            }
+
+            function normalizeVillage(v) {
+                var opts = {};
+                for (var id in v.options) {
+                    if (!Object.prototype.hasOwnProperty.call(v.options, id)) continue;
+                    var opt = v.options[id];
+                    var rt = null;
+                    if (opt.scavenging_squad) {
+                        rt = opt.scavenging_squad.return_time;
+                    }
+                    opts[id] = {
+                        is_locked: !!opt.is_locked,
+                        is_active: !!(opt.scavenging_squad),
+                        return_time: rt,
+                        unlock_time: opt.unlock_time || null
+                    };
+                }
+                return {
+                    village_id: v.village_id,
+                    village_name: v.village_name,
+                    name: v.village_name,
+                    unit_counts_home: v.unit_counts_home || {},
+                    unit_carry_factor: (v.unit_carry_factor != null && v.unit_carry_factor !== undefined) ? v.unit_carry_factor : 1,
+                    has_rally_point: !!v.has_rally_point,
+                    options: opts
+                };
+            }
+
+            async function loadAll() {
+                try {
+                    var r0 = await fetch(baseUrl + '&page=0', { credentials: 'same-origin' });
+                    var h0 = await r0.text();
+                    var world = extractWorldDuration(h0);
+                    var raw0 = extractVillagesArray(h0);
+                    if (!raw0 || !raw0.length) {
+                        var rAlt = await fetch(baseUrl, { credentials: 'same-origin' });
+                        h0 = await rAlt.text();
+                        world = world || extractWorldDuration(h0);
+                        raw0 = extractVillagesArray(h0);
+                    }
+                    if (!raw0 || !raw0.length) {
+                        window.__tw_scav_mass = JSON.stringify({ status: 'ERROR', message: 'Koy verisi bulunamadi (dizi)' });
                         return;
-                    }}
-                    var villages = JSON.parse('[' + match[1] + ']');
-                    var selectedUnits = {selected_js};
-
+                    }
+                    var allRaw = raw0.slice();
+                    var maxPage = extractMaxPage(h0);
+                    for (var p = 1; p <= maxPage; p++) {
+                        await new Promise(function(res) { setTimeout(res, 200); });
+                        var rp = await fetch(baseUrl + '&page=' + p, { credentials: 'same-origin' });
+                        var hp = await rp.text();
+                        var arr = extractVillagesArray(hp);
+                        if (arr && arr.length) {
+                            for (var i = 0; i < arr.length; i++) allRaw.push(arr[i]);
+                        }
+                    }
                     var result = [];
-                    villages.forEach(function(v) {{
-                        // Evdeki seçili askerleri
-                        var available = {{}};
-                        var totalHome = 0;
-                        selectedUnits.forEach(function(u) {{
-                            var c = v.unit_counts_home[u] || 0;
-                            if (c > 0) {{ available[u] = c; totalHome += c; }}
-                        }});
-
-                        var opts = {{}};
-                        for (var id in v.options) {{
-                            var opt = v.options[id];
-                            var sq = null;
-                            if (opt.scavenging_squad) {{
-                                sq = {{
-                                    unit_counts: opt.scavenging_squad.unit_counts,
-                                    return_time: opt.scavenging_squad.return_time
-                                }};
-                            }}
-                            opts[id] = {{
-                                is_locked: opt.is_locked,
-                                is_active: opt.scavenging_squad !== null,
-                                return_time: opt.scavenging_squad ? opt.scavenging_squad.return_time : null,
-                                unlock_time: opt.unlock_time || null,
-                                squad: sq
-                            }};
-                        }}
-
-                        result.push({{
-                            village_id: v.village_id,
-                            name: v.village_name,
-                            available: available,
-                            total_home: totalHome,
-                            options: opts,
-                            has_rally_point: v.has_rally_point
-                        }});
-                    }});
-
-                    window.__tw_scav_mass = JSON.stringify({{status:'OK', villages: result}});
-                }} catch(e) {{
-                    window.__tw_scav_mass = JSON.stringify({{status:'ERROR',message:e.message}});
-                }}
-            }})
-            .catch(function(err) {{
-                window.__tw_scav_mass = JSON.stringify({{status:'ERROR',message:String(err)}});
-            }});
-        }})();
-        """
+                    for (var j = 0; j < allRaw.length; j++) {
+                        result.push(normalizeVillage(allRaw[j]));
+                    }
+                    window.__tw_scav_mass = JSON.stringify({
+                        status: 'OK',
+                        world: world,
+                        villages: result
+                    });
+                } catch (e) {
+                    window.__tw_scav_mass = JSON.stringify({ status: 'ERROR', message: String(e) });
+                }
+            }
+            loadAll();
+        })();
+        """.replace("__VILLAGE_ID__", vid)
 
         self.browser.page().runJavaScript(fetch_js)
         self._scav_poll_mass(0)
@@ -5674,6 +5899,7 @@ class TribalWarsBot(QMainWindow):
                 return
 
             villages = data.get("villages", [])
+            self._scav_world_meta = data.get("world") or {}
             self._scav_villages_cache = villages
             self._scav_update_table(villages)
 
@@ -5695,10 +5921,21 @@ class TribalWarsBot(QMainWindow):
                       "light":"HSv","marcher":"AOk","heavy":"ASv","knight":"Şöv",
                       "spy":"Cas","ram":"Koç","catapult":"Man","snob":"Mis"}
 
+        selected_units = [k for k, cb in self.scav_unit_cbs.items() if cb.isChecked()]
+
         for v in villages:
-            name = v.get("name", "?")
+            name = v.get("name") or v.get("village_name", "?")
             opts = v.get("options", {})
-            available = v.get("available", {})
+            uch = v.get("unit_counts_home") or {}
+            # Gösterim: seçili birimler − evde tut
+            available = {}
+            for u in selected_units:
+                keep = 0
+                if u in self.scav_keep_home:
+                    keep = int(self.scav_keep_home[u].value() or 0)
+                c = int(uch.get(u, 0) or 0) - keep
+                if c > 0:
+                    available[u] = c
 
             # Evdeki asker özeti
             troop_parts = []
@@ -5748,85 +5985,286 @@ class TribalWarsBot(QMainWindow):
             status = f"{free_count} boş" if free_count > 0 else "Tümü dolu"
             status_color = "#228822" if free_count > 0 else "#2d5a9e"
 
-            item = QTreeWidgetItem([name, sv_texts[0], sv_texts[1], sv_texts[2], sv_texts[3], troops_text, status])
+            # Köy bazlı: açık slotların tamamı boşalana kadar süre (UI geri sayımı)
+            ready_col = 5
+            if not v.get("has_rally_point"):
+                ready_text = "—"
+                ready_ts = 0.0
+                ready_color = "#888888"
+            else:
+                ready_ts = self._scav_village_next_ready_unix(opts, now)
+                if ready_ts <= 0 or ready_ts <= now:
+                    ready_text = "✓ Hazır"
+                    ready_ts = 0.0
+                    ready_color = "#228822"
+                else:
+                    rem = max(0, int(ready_ts - now))
+                    mins, secs = divmod(rem, 60)
+                    hrs, mins = divmod(mins, 60)
+                    ready_text = f"{hrs:02d}:{mins:02d}:{secs:02d}"
+                    ready_color = "#aa6600"
+
+            item = QTreeWidgetItem([
+                name,
+                sv_texts[0], sv_texts[1], sv_texts[2], sv_texts[3],
+                ready_text,
+                troops_text,
+                status,
+            ])
             for col in range(1, 5):
                 item.setForeground(col, QColor(sv_colors[col - 1]))
                 item.setTextAlignment(col, Qt.AlignCenter)
                 item.setData(col, Qt.UserRole, sv_return_times[col - 1])  # Geri sayım için
-            item.setForeground(6, QColor(status_color))
-            item.setTextAlignment(6, Qt.AlignCenter)
+            item.setForeground(ready_col, QColor(ready_color))
+            item.setTextAlignment(ready_col, Qt.AlignCenter)
+            item.setData(ready_col, Qt.UserRole, ready_ts if ready_ts > now else 0)
+            item.setForeground(7, QColor(status_color))
+            item.setTextAlignment(7, Qt.AlignCenter)
             item.setData(0, Qt.UserRole, v)  # Köy verisini sakla
             self.scav_table.addTopLevelItem(item)
 
+    def _scav_sophie_haul(self, time_hours, duration_factor, duration_exponent, duration_initial_seconds):
+        """Sophie script ile aynı: parseInt((...)**(1/de)/100) sonra sqrt (tam sayı)."""
+        try:
+            df = float(duration_factor)
+            de = float(duration_exponent)
+            di = float(duration_initial_seconds)
+        except (TypeError, ValueError):
+            return 0
+        if df <= 0 or de == 0:
+            return 0
+        t_sec = float(time_hours) * 3600.0
+        try:
+            inner = (t_sec / df - di) ** (1.0 / de) / 100.0
+            if inner < 0 or inner != inner:  # NaN
+                inner = 0.0
+            mid = int(inner)
+            if mid < 0:
+                mid = 0
+            return int(math.sqrt(mid))
+        except (ValueError, OSError, OverflowError):
+            return 0
+
+    def _scav_sophie_total_loot(self, troops_allowed, unit_carry_factor):
+        """Sophie calculateHaulCategories — birim taşıma × dünya carry faktörü."""
+        f = float(unit_carry_factor or 1)
+        total = 0.0
+        for key, cnt in troops_allowed.items():
+            if cnt <= 0:
+                continue
+            base = float(self.SCAV_CARRY.get(key, 0))
+            if base <= 0:
+                continue
+            total += float(cnt) * f * base
+        return total
+
+    def _scav_sophie_calculate_units(
+        self,
+        troops_allowed,
+        total_loot,
+        total_haul,
+        haul_category_rate,
+        prioritise_high_cat,
+        send_order,
+    ):
+        """
+        Sophie calculateUnitsPerVillage (version != 'old' dalları).
+        """
+        unit_haul = self.SCAV_CARRY
+        units_ready = {0: {}, 1: {}, 2: {}, 3: {}}
+        ta = dict(troops_allowed)
+        troop_number = sum(max(0, int(c)) for c in ta.values())
+
+        def greedy_high_to_low(pool):
+            p = dict(pool)
+            for j in range(3, -1, -1):
+                reach = float(haul_category_rate.get(j + 1, 0) or 0)
+                for unit in send_order:
+                    if unit not in p or p[unit] <= 0 or reach <= 0:
+                        continue
+                    base = float(unit_haul.get(unit, 0))
+                    if base <= 0:
+                        continue
+                    amount_needed = int(reach // base)
+                    if amount_needed > p[unit]:
+                        units_ready[j][unit] = p[unit]
+                        reach -= p[unit] * base
+                        p[unit] = 0
+                    else:
+                        units_ready[j][unit] = amount_needed
+                        reach = 0
+                        p[unit] -= amount_needed
+            return p
+
+        if total_loot > total_haul:
+            greedy_high_to_low(ta)
+        else:
+            if (not prioritise_high_cat) and troop_number > 130:
+                for j in range(4):
+                    for key in list(ta.keys()):
+                        hr = float(haul_category_rate.get(j + 1, 0) or 0)
+                        if total_loot > 0 and total_haul > 0:
+                            val = int(
+                                (total_loot / total_haul * hr) * (float(ta[key]) / total_loot)
+                            )
+                        else:
+                            val = 0
+                        units_ready[j][key] = val
+            else:
+                greedy_high_to_low(ta)
+
+        return units_ready
+
+    def _scav_all_open_slots_idle(self, opts):
+        """Kilitli olmayan (açık) her temizlik slotu boştur; biri bile aktif temizlikteyse False."""
+        for oid in ("1", "2", "3", "4"):
+            opt = opts.get(oid) or opts.get(int(oid)) or {}
+            if opt.get("is_locked"):
+                continue
+            if opt.get("is_active"):
+                return False
+        return True
+
+    def _scav_village_next_ready_unix(self, opts, now):
+        """Açık slotlarda aktif temizlik varken: hepsinin biteceği an (en geç dönüş). Hazırsa 0."""
+        latest = None
+        any_open_active = False
+        for oid in ("1", "2", "3", "4"):
+            opt = opts.get(oid) or opts.get(int(oid)) or {}
+            if opt.get("is_locked"):
+                continue
+            if not opt.get("is_active"):
+                continue
+            any_open_active = True
+            rt = opt.get("return_time")
+            if rt and float(rt) > now:
+                t = float(rt)
+                if latest is None or t > latest:
+                    latest = t
+        if not any_open_active:
+            return 0.0
+        if latest is None:
+            return float(now) + 20.0
+        return float(latest)
+
     def _scav_send_all(self, villages):
-        """Tüm köylerdeki boş seviyelere toplu gönderim yap."""
+        """Sophie (Shinko) mantığı; yalnız açık (kilitli olmayan) slotların tamamı boşken köye dokunulur."""
         import time
-        # Seviye → ganimetin ne kadarını alır (göreceli ağırlık)
-        loot_factors = {1: 0.10, 2: 0.25, 3: 0.50, 4: 0.75}
         now = time.time()
         all_squads = []
         sent_villages = 0
+
+        world = self._scav_world_meta or {}
+        df = world.get("duration_factor")
+        de = world.get("duration_exponent")
+        di = world.get("duration_initial_seconds")
+        if df is None or de is None or di is None:
+            self._add_log(
+                "TEMİZLİK",
+                "error",
+                "Dünya süre parametreleri okunamadı (duration_*). Sayfayı yenileyip tekrar deneyin.",
+            )
+            self._scav_schedule_next_mass(villages)
+            self._scav_checking = False
+            return
+
+        time_off = float(self.scav_rt_off.value())
+        time_def = float(self.scav_rt_def.value())
+        prioritise_high = self.scav_prio_highfirst.isChecked()
+        cat_enabled = {i: self.scav_cat_cbs[i].isChecked() for i in (1, 2, 3, 4)}
+        send_order = [k for k, _ in self.SCAV_UNITS if self.scav_unit_cbs[k].isChecked()]
+
+        if not send_order:
+            self._scav_schedule_next_mass(villages)
+            self._scav_checking = False
+            return
+
+        loot_pct = {1: 0.10, 2: 0.25, 3: 0.50, 4: 0.75}
 
         for v in villages:
             if not v.get("has_rally_point"):
                 continue
 
             opts = v.get("options", {})
-            available = dict(v.get("available", {}))
             village_id = v.get("village_id")
-            total_troops = sum(available.values())
+            uch = v.get("unit_counts_home") or {}
+            ucf = float(v.get("unit_carry_factor") or 1)
 
-            # Boş seviyeleri yüksekten düşüğe topla
-            free_options = []
-            for oid in ["4", "3", "2", "1"]:
-                opt = opts.get(oid, {})
-                if not opt.get("is_locked") and not opt.get("is_active"):
-                    free_options.append(int(oid))
-
-            if not free_options or total_troops < 10:
+            # Açık slotlardan herhangi biri aktif temizlikteyse bu köye bu turda dokunma
+            if not self._scav_all_open_slots_idle(opts):
                 continue
 
-            # Her seviyenin göreceli ağırlığını hesapla
-            total_weight = sum(loot_factors[o] for o in free_options)
+            troops_allowed = {}
+            for key in send_order:
+                keep = int(self.scav_keep_home[key].value() or 0)
+                c = int(uch.get(key, 0) or 0) - keep
+                if c > 0:
+                    troops_allowed[key] = c
 
-            # remaining: her adımda azalan havuz
-            remaining = dict(available)
-            village_squads = []
+            if sum(troops_allowed.values()) < 10:
+                continue
 
-            for i, opt_id in enumerate(free_options):
-                is_last = (i == len(free_options) - 1)
+            type_count = {"off": 0, "def": 0}
+            for prop, cnt in troops_allowed.items():
+                role = self.SCAV_UNIT_OFF_DEF.get(prop, "def")
+                type_count[role] = type_count.get(role, 0) + int(cnt)
 
-                if is_last:
-                    # Son seviye: kalan tüm askerler buraya
-                    troops_for_level = {u: c for u, c in remaining.items() if c > 0}
+            if type_count["off"] > type_count["def"]:
+                haul = self._scav_sophie_haul(time_off, df, de, di)
+            else:
+                haul = self._scav_sophie_haul(time_def, df, de, di)
+
+            total_loot = self._scav_sophie_total_loot(troops_allowed, ucf)
+            if total_loot <= 0:
+                continue
+
+            haul_category_rate = {}
+            for oid in (1, 2, 3, 4):
+                sk = str(oid)
+                opt = opts.get(sk) or opts.get(oid) or {}
+                blocked = opt.get("is_locked") or opt.get("is_active")
+                if blocked:
+                    haul_category_rate[oid] = 0.0
                 else:
-                    share = loot_factors[opt_id] / total_weight
-                    troops_for_level = {}
-                    for unit, count in remaining.items():
-                        if count <= 0:
-                            continue
-                        alloc = max(1, round(count * share))
-                        alloc = min(alloc, count)
-                        troops_for_level[unit] = alloc
+                    haul_category_rate[oid] = float(haul) / loot_pct[oid]
+                if not cat_enabled.get(oid):
+                    haul_category_rate[oid] = 0.0
 
-                level_total = sum(troops_for_level.values())
-                if level_total < 10:
-                    # Bu seviye için yeterli asker yok; kalanları bir sonrakine bırak
+            total_haul = sum(haul_category_rate.values())
+            if total_haul <= 0:
+                continue
+
+            units_ready = self._scav_sophie_calculate_units(
+                troops_allowed,
+                total_loot,
+                total_haul,
+                haul_category_rate,
+                prioritise_high,
+                send_order,
+            )
+
+            village_squads = []
+            for k in range(4):
+                oid = k + 1
+                sk = str(oid)
+                opt = opts.get(sk) or opts.get(oid) or {}
+                if opt.get("is_locked") or opt.get("is_active"):
                     continue
-
+                if not cat_enabled.get(oid):
+                    continue
+                uc = {u: int(c) for u, c in units_ready.get(k, {}).items() if int(c) > 0}
+                level_total = sum(uc.values())
+                if level_total < 10:
+                    continue
                 village_squads.append({
                     "village_id": village_id,
                     "candidate_squad": {
-                        "unit_counts": troops_for_level,
-                        "carry_max": 9999999999
+                        "unit_counts": uc,
+                        "carry_max": 9999999999,
                     },
-                    "option_id": opt_id,
-                    "use_premium": False
+                    "option_id": oid,
+                    "use_premium": False,
                 })
-
-                # Kullanılan askerleri havuzdan düş
-                for u, c in troops_for_level.items():
-                    remaining[u] = remaining.get(u, 0) - c
 
             if village_squads:
                 all_squads.extend(village_squads)
@@ -5837,8 +6275,18 @@ class TribalWarsBot(QMainWindow):
             self._scav_checking = False
             return
 
+        # En verimli önce: Sv4 > Sv3 > Sv2 > Sv1; aynı seviyede köy id
+        def _scav_squad_order(s):
+            try:
+                vid = int(s.get("village_id") or 0)
+            except (TypeError, ValueError):
+                vid = 0
+            return (-int(s.get("option_id", 0)), vid)
+
+        all_squads.sort(key=_scav_squad_order)
+
         self._add_log("TEMİZLİK", "info",
-            f"Toplu gönderim: {len(all_squads)} temizlik, {sent_villages} köy")
+            f"Toplu gönderim (Sophie mantığı): {len(all_squads)} temizlik, {sent_villages} köy")
 
         self._scav_send_batch(all_squads, 0, sent_villages)
 
@@ -5912,27 +6360,52 @@ class TribalWarsBot(QMainWindow):
         self.browser.page().runJavaScript(check_js, on_poll)
 
     def _scav_schedule_next_mass(self, villages):
-        """Tüm köylerdeki en yakın dönüşü bul, o zamana kadar bekle."""
+        """Otomatik tarama aralığı: çok uzun beklememek için üst sınır (köy süreleri tabloda).
+        Her `_scav_process` tüm köyleri tekrar tarar; hazır olan köylere ayrı ayrı gönderilir."""
         import time
         now = time.time()
-        nearest = None
+        next_wake_delta = None
 
         for v in villages:
-            for oid, opt in v.get("options", {}).items():
+            opts = v.get("options", {})
+            latest_open_active = None
+            for oid in ("1", "2", "3", "4"):
+                opt = opts.get(oid) or opts.get(int(oid)) or {}
+                if opt.get("is_locked"):
+                    continue
+                if not opt.get("is_active"):
+                    continue
                 rt = opt.get("return_time")
                 if rt and rt > now:
-                    if nearest is None or rt < nearest:
-                        nearest = rt
+                    end_t = float(rt)
+                else:
+                    end_t = now + 25.0
+                if latest_open_active is None or end_t > latest_open_active:
+                    latest_open_active = end_t
+            if latest_open_active is not None:
+                delta = latest_open_active - now
+                if next_wake_delta is None or delta < next_wake_delta:
+                    next_wake_delta = delta
 
-        if nearest:
-            wait = max(5, int(nearest - now) + 3)
+        # Üst sınır: 50–70 sn arası rastgele (sabit periyot tespitini zorlaştırır)
+        poll_cap = random.randint(50, 70)
+
+        if next_wake_delta is not None:
+            wait = max(5, min(int(next_wake_delta) + 3, poll_cap))
             self._scav_next_send = now + wait
-            self.scav_status_label.setText(f"Durum: Tümü dolu, {wait}sn sonra dönecek")
+            self.scav_status_label.setText(
+                f"Durum: Sonraki tarama ~{wait}sn (köy başı süre: Atıma kalan)"
+            )
             self.scav_status_label.setStyleSheet("font-size: 10px; color: #2d5a9e;")
-            self._add_log("TEMİZLİK", "info", f"⏳ En yakın dönüş {wait}sn sonra")
+            self._add_log(
+                "TEMİZLİK",
+                "info",
+                f"⏳ Sonraki tarama ~{wait}sn (tabloda her köyün kendi geri sayımı)",
+            )
         else:
-            self._scav_next_send = now + 60
-            self.scav_status_label.setText("Durum: 60sn sonra tekrar kontrol")
+            idle_wait = random.randint(50, 70)
+            self._scav_next_send = now + idle_wait
+            self.scav_status_label.setText(f"Durum: ~{idle_wait}sn sonra tekrar kontrol")
             self.scav_status_label.setStyleSheet("font-size: 10px; color: #aa6600;")
 
     # ── RAPORLAR ───────────────────────────────
