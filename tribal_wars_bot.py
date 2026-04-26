@@ -2094,8 +2094,8 @@ class MisyonerMultiWaveDialog(QDialog):
 
         hint = QLabel(
             "Kaynak, hedef ve komut türü «Ordu Gönder» sekmesinden alınır. "
-            "Girdiğiniz gönderim anı birinci dalgadır; sonraki her dalga yaklaşık "
-            f"{getattr(bot, 'SA_DISPATCH_WAVE_GAP_MS', 200)} ms sonra (oyunla uyumlu)."
+            "Varış veya gönderim zamanı seçin; birinci dalgaya göre sonraki her dalga yaklaşık "
+            f"{getattr(bot, 'SA_DISPATCH_WAVE_GAP_MS', 200)} ms arayla eklenir (oyunla uyumlu)."
         )
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -2129,33 +2129,59 @@ class MisyonerMultiWaveDialog(QDialog):
         self._wave_spin.blockSignals(False)
         self._wave_spin.valueChanged.connect(self._resize_wave_rows)
 
-        time_row = QHBoxLayout()
-        time_row.addWidget(QLabel("Gönderim zamanı:"))
+        _btn_style = (
+            "background: qlineargradient(y1:0,y2:1,stop:0 #f5e6c8,stop:1 #d4b896);"
+            "border: 1px solid #b89b6a; border-radius: 3px; padding: 4px 10px;"
+            "font-weight: bold; font-size: 11px; color: #5a3e1b;"
+        )
+        _btn_checked_style = (
+            "background: qlineargradient(y1:0,y2:1,stop:0 #d4b896,stop:1 #b89b6a);"
+            "border: 2px solid #7a5a30; border-radius: 3px; padding: 3px 9px;"
+            "font-weight: bold; font-size: 11px; color: #3a2010;"
+        )
+        btn_row = QHBoxLayout()
+        self._btn_set_arrive = QPushButton("Varış zamanı ayarla")
+        self._btn_set_arrive.setCursor(Qt.PointingHandCursor)
+        self._btn_set_arrive.setCheckable(True)
+        self._btn_set_arrive.setStyleSheet(_btn_style)
+        self._btn_set_arrive.clicked.connect(self._toggle_time_mode)
+        btn_row.addWidget(self._btn_set_arrive)
+        self._btn_set_send = QPushButton("Gönderim zamanı ayarla")
+        self._btn_set_send.setCursor(Qt.PointingHandCursor)
+        self._btn_set_send.setCheckable(True)
+        self._btn_set_send.setStyleSheet(_btn_style)
+        self._btn_set_send.clicked.connect(self._toggle_time_mode)
+        btn_row.addWidget(self._btn_set_send)
+        btn_row.addStretch()
+        root.addLayout(btn_row)
+        self._btn_style_normal = _btn_style
+        self._btn_style_checked = _btn_checked_style
+
+        time_inner = QHBoxLayout()
+        self._time_label = QLabel("Gönderim zamanı:")
+        self._time_label.setStyleSheet("font-weight: bold; color: #5a3e1b; font-size: 11px;")
+        time_inner.addWidget(self._time_label)
         self._time_date = QLineEdit()
         self._time_date.setPlaceholderText("GG.AA")
         self._time_date.setFixedWidth(56)
         self._time_date.setAlignment(Qt.AlignCenter)
-        time_row.addWidget(self._time_date)
-        time_row.addWidget(QLabel("'de"))
+        time_inner.addWidget(self._time_date)
+        time_inner.addWidget(QLabel("'de"))
         self._time_clock = QLineEdit()
         self._time_clock.setPlaceholderText("SS:DD:SS:ms")
         self._time_clock.setFixedWidth(110)
         self._time_clock.setAlignment(Qt.AlignCenter)
-        time_row.addWidget(self._time_clock)
+        time_inner.addWidget(self._time_clock)
         b_srv = QPushButton("Sunucu saati")
         b_srv.setCursor(Qt.PointingHandCursor)
         b_srv.clicked.connect(self._fill_server_time)
-        time_row.addWidget(b_srv)
-        b_arrive = QPushButton("Varış → Gönderim")
-        b_arrive.setCursor(Qt.PointingHandCursor)
-        b_arrive.setToolTip(
-            "Yukarıdaki saati varış zamanı olarak kabul edip\n"
-            "yolculuk süresini çıkararak gönderim zamanını hesaplar."
-        )
-        b_arrive.clicked.connect(self._calc_send_from_arrival)
-        time_row.addWidget(b_arrive)
-        time_row.addStretch()
-        root.addLayout(time_row)
+        time_inner.addWidget(b_srv)
+        time_inner.addStretch()
+        self._time_widget = QWidget()
+        self._time_widget.setLayout(time_inner)
+        self._time_widget.setVisible(False)
+        root.addWidget(self._time_widget)
+        self._time_mode = None
 
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self._on_accept)
@@ -2247,43 +2273,34 @@ class MisyonerMultiWaveDialog(QDialog):
         except Exception:
             pass
 
-    def _calc_send_from_arrival(self):
-        """Zaman alanındaki saati varış zamanı olarak kabul edip gönderim zamanını hesaplar."""
-        td = self._time_date.text().strip()
-        tc = self._time_clock.text().strip()
-        if not td or not tc:
-            return
-        arrive_dt = self._bot._sa_parse_time_input(td, tc)
-        if arrive_dt is None:
-            return
-        try:
-            src_x, src_y = self._bot._sa_get_source_coords()
-            tgt_x = self._bot.sa_tgt_x.value()
-            tgt_y = self._bot.sa_tgt_y.value()
-            if src_x is None:
-                return
-            # Tablodaki tüm satırlardan kullanılan birim anahtarlarını topla
-            troop_keys = []
-            for r in range(self._table.rowCount()):
-                for c, (key, _) in enumerate(self._unit_defs):
-                    try:
-                        val = int((self._table.item(r, c).text() or "0"))
-                    except (ValueError, AttributeError):
-                        val = 0
-                    if val > 0 and key not in troop_keys:
-                        troop_keys.append(key)
-            if not troop_keys:
-                troop_keys = ["snob"]
-            distance = math.sqrt(
-                (float(tgt_x) - float(src_x)) ** 2 + (float(tgt_y) - float(src_y)) ** 2
-            )
-            travel_sec = self._bot._sa_calc_travel_time(distance, troop_keys)
-            send_dt = arrive_dt - datetime.timedelta(seconds=travel_sec)
-            ms = send_dt.microsecond // 1000
-            self._time_date.setText(send_dt.strftime("%d.%m"))
-            self._time_clock.setText(send_dt.strftime("%H:%M:%S") + f":{ms:03d}")
-        except Exception:
-            pass
+    def _toggle_time_mode(self):
+        sender = self.sender()
+        if sender == self._btn_set_arrive:
+            if self._btn_set_arrive.isChecked():
+                self._time_mode = "arrive"
+                self._time_label.setText("Varış zamanı:")
+                self._time_widget.setVisible(True)
+                self._fill_server_time()
+                self._btn_set_send.setChecked(False)
+            else:
+                self._time_mode = None
+                self._time_widget.setVisible(False)
+        elif sender == self._btn_set_send:
+            if self._btn_set_send.isChecked():
+                self._time_mode = "send"
+                self._time_label.setText("Gönderim zamanı:")
+                self._time_widget.setVisible(True)
+                self._fill_server_time()
+                self._btn_set_arrive.setChecked(False)
+            else:
+                self._time_mode = None
+                self._time_widget.setVisible(False)
+        self._btn_set_arrive.setStyleSheet(
+            self._btn_style_checked if self._btn_set_arrive.isChecked() else self._btn_style_normal
+        )
+        self._btn_set_send.setStyleSheet(
+            self._btn_style_checked if self._btn_set_send.isChecked() else self._btn_style_normal
+        )
 
     def _read_troops_from_row(self, r):
         d = {}
@@ -2311,10 +2328,16 @@ class MisyonerMultiWaveDialog(QDialog):
             return
         tgt_x = bot.sa_tgt_x.value()
         tgt_y = bot.sa_tgt_y.value()
+        if not self._time_mode:
+            QMessageBox.warning(
+                self, "Uyarı",
+                "'Varış zamanı ayarla' veya 'Gönderim zamanı ayarla' butonuna basın."
+            )
+            return
         td = self._time_date.text().strip()
         tc = self._time_clock.text().strip()
         if not td or not tc:
-            QMessageBox.warning(self, "Uyarı", "Gönderim tarih ve saatini girin.")
+            QMessageBox.warning(self, "Uyarı", "Tarih ve saati girin.")
             return
         input_dt = bot._sa_parse_time_input(td, tc)
         if input_dt is None:
@@ -2333,11 +2356,35 @@ class MisyonerMultiWaveDialog(QDialog):
         else:
             troops_list = [self._read_troops_from_row(r) for r in range(n)]
 
+        # "arrive" modunda: varış zamanından yolculuğu çıkararak gönderim zamanını hesapla
+        if self._time_mode == "arrive":
+            try:
+                used_keys = set()
+                for r in range(n):
+                    for c, (key, _) in enumerate(self._unit_defs):
+                        it = self._table.item(r, c)
+                        try:
+                            if int((it.text() if it else "0") or 0) > 0:
+                                used_keys.add(key)
+                        except ValueError:
+                            pass
+                if not used_keys:
+                    used_keys = {"snob"}
+                distance = math.sqrt(
+                    (float(tgt_x) - float(src_x)) ** 2 + (float(tgt_y) - float(src_y)) ** 2
+                )
+                travel_sec = bot._sa_calc_travel_time(distance, list(used_keys))
+                base_send_dt = input_dt - datetime.timedelta(seconds=travel_sec)
+            except Exception:
+                base_send_dt = input_dt
+        else:
+            base_send_dt = input_dt
+
         gap_ms = int(getattr(bot, "SA_DISPATCH_WAVE_GAP_MS", 200) or 200)
         added = 0
         errs = []
         for w, troops_map in enumerate(troops_list):
-            wave_send_dt = input_dt + datetime.timedelta(milliseconds=w * gap_ms)
+            wave_send_dt = base_send_dt + datetime.timedelta(milliseconds=w * gap_ms)
             ok, err = bot._sa_append_row_from_values(
                 src_text,
                 src_x,
