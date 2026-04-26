@@ -2146,6 +2146,14 @@ class MisyonerMultiWaveDialog(QDialog):
         b_srv.setCursor(Qt.PointingHandCursor)
         b_srv.clicked.connect(self._fill_server_time)
         time_row.addWidget(b_srv)
+        b_arrive = QPushButton("Varış → Gönderim")
+        b_arrive.setCursor(Qt.PointingHandCursor)
+        b_arrive.setToolTip(
+            "Yukarıdaki saati varış zamanı olarak kabul edip\n"
+            "yolculuk süresini çıkararak gönderim zamanını hesaplar."
+        )
+        b_arrive.clicked.connect(self._calc_send_from_arrival)
+        time_row.addWidget(b_arrive)
         time_row.addStretch()
         root.addLayout(time_row)
 
@@ -2208,8 +2216,8 @@ class MisyonerMultiWaveDialog(QDialog):
                         item.setBackground(QColor("#c0392b"))
                         item.setForeground(QColor("#ffffff"))
                     else:
-                        item.setBackground(QColor())
-                        item.setForeground(QColor())
+                        item.setData(Qt.BackgroundRole, None)
+                        item.setData(Qt.ForegroundRole, None)
                     cumulative += val
         finally:
             self._table.blockSignals(False)
@@ -2236,6 +2244,44 @@ class MisyonerMultiWaveDialog(QDialog):
                 s = time_match.group(3)
                 ms = (time_match.group(4) or "0")[:3].zfill(3)
                 self._time_clock.setText(f"{h}:{m}:{s}:{ms}")
+        except Exception:
+            pass
+
+    def _calc_send_from_arrival(self):
+        """Zaman alanındaki saati varış zamanı olarak kabul edip gönderim zamanını hesaplar."""
+        td = self._time_date.text().strip()
+        tc = self._time_clock.text().strip()
+        if not td or not tc:
+            return
+        arrive_dt = self._bot._sa_parse_time_input(td, tc)
+        if arrive_dt is None:
+            return
+        try:
+            src_x, src_y = self._bot._sa_get_source_coords()
+            tgt_x = self._bot.sa_tgt_x.value()
+            tgt_y = self._bot.sa_tgt_y.value()
+            if src_x is None:
+                return
+            # Tablodaki tüm satırlardan kullanılan birim anahtarlarını topla
+            troop_keys = []
+            for r in range(self._table.rowCount()):
+                for c, (key, _) in enumerate(self._unit_defs):
+                    try:
+                        val = int((self._table.item(r, c).text() or "0"))
+                    except (ValueError, AttributeError):
+                        val = 0
+                    if val > 0 and key not in troop_keys:
+                        troop_keys.append(key)
+            if not troop_keys:
+                troop_keys = ["snob"]
+            distance = math.sqrt(
+                (float(tgt_x) - float(src_x)) ** 2 + (float(tgt_y) - float(src_y)) ** 2
+            )
+            travel_sec = self._bot._sa_calc_travel_time(distance, troop_keys)
+            send_dt = arrive_dt - datetime.timedelta(seconds=travel_sec)
+            ms = send_dt.microsecond // 1000
+            self._time_date.setText(send_dt.strftime("%d.%m"))
+            self._time_clock.setText(send_dt.strftime("%H:%M:%S") + f":{ms:03d}")
         except Exception:
             pass
 
