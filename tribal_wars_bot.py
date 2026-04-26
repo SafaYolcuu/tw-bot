@@ -2125,7 +2125,7 @@ class MisyonerMultiWaveDialog(QDialog):
         root.addWidget(self._table, 1)
 
         self._wave_spin.blockSignals(True)
-        self._wave_spin.setValue(3)
+        self._wave_spin.setValue(1)
         self._wave_spin.blockSignals(False)
         self._wave_spin.valueChanged.connect(self._resize_wave_rows)
 
@@ -2155,8 +2155,18 @@ class MisyonerMultiWaveDialog(QDialog):
         root.addWidget(bb)
 
         self._auto_split_cb.stateChanged.connect(self._toggle_manual_table)
+
+        # Köydeki mevcut birlikleri çek (hücre doğrulama için)
+        try:
+            sx, sy = bot._sa_get_source_coords()
+            v = bot._sa_find_village_at_coord(sx, sy) if sx is not None else None
+            self._troops_avail = (v.get("troops") or {}) if v else {}
+        except Exception:
+            self._troops_avail = {}
+
         self._resize_wave_rows()
         self._toggle_manual_table()
+        self._table.cellChanged.connect(self._validate_cells)
 
         dark = bool(getattr(bot, "_dark_mode", False))
         self.setStyleSheet(_misyoner_multi_dialog_stylesheet(dark))
@@ -2175,6 +2185,34 @@ class MisyonerMultiWaveDialog(QDialog):
                 self._table.setItem(r, c, it)
         for r in range(n):
             self._table.setVerticalHeaderItem(r, QTableWidgetItem(str(r + 1)))
+        self._validate_cells()
+
+    def _validate_cells(self):
+        """Her sütunda birikimli toplam köydeki mevcut birliği aşarsa hücreyi kırmızı yap."""
+        troops = getattr(self, "_troops_avail", {})
+        self._table.blockSignals(True)
+        try:
+            for c, (key, _) in enumerate(self._unit_defs):
+                avail = int(troops.get(key, 0) or 0)
+                cumulative = 0
+                for r in range(self._table.rowCount()):
+                    item = self._table.item(r, c)
+                    if not item:
+                        continue
+                    try:
+                        val = max(0, int(item.text() or 0))
+                    except ValueError:
+                        val = 0
+                    remaining = avail - cumulative
+                    if avail > 0 and val > remaining:
+                        item.setBackground(QColor("#c0392b"))
+                        item.setForeground(QColor("#ffffff"))
+                    else:
+                        item.setBackground(QColor())
+                        item.setForeground(QColor())
+                    cumulative += val
+        finally:
+            self._table.blockSignals(False)
 
     def _fill_server_time(self):
         text = getattr(self._bot, "_server_time_text", "") or ""
