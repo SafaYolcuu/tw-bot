@@ -4892,7 +4892,8 @@ class TribalWarsBot(QMainWindow):
             rows = []
             for i in range(self.sa_table.topLevelItemCount()):
                 it = self.sa_table.topLevelItem(i)
-                rows.append([it.text(c) for c in range(n)])
+                state = str(it.data(0, Qt.UserRole) or "")
+                rows.append([it.text(c) for c in range(n)] + [state])
             self._settings.setValue("army_queue/rows_json", json.dumps(rows, ensure_ascii=False))
             self._settings.sync()
         except (TypeError, ValueError):
@@ -4912,12 +4913,26 @@ class TribalWarsBot(QMainWindow):
         if not isinstance(rows, list):
             return
         n = self.sa_table.columnCount()
+        # Geçici state'ler (başarıyla gönderilmedi): yeniden pending'e düşer
+        _TRANSIENT = {"caching", "cached", "confirming", "confirmed", "sending"}
         self.sa_table.clear()
         for row in rows:
-            if not isinstance(row, list) or len(row) != n:
+            if not isinstance(row, list):
                 continue
-            item = QTreeWidgetItem([str(x) for x in row])
-            troop_values = row[2:14]
+            # Geriye uyumluluk: eski kayıtlar n sütunlu, yeniler n+1 (state eklenmiş)
+            if len(row) == n + 1:
+                text_cols = row[:n]
+                state = str(row[n])
+            elif len(row) == n:
+                text_cols = row
+                state = ""
+            else:
+                continue
+            # Geçici state'leri temizle
+            if state in _TRANSIENT:
+                state = ""
+            item = QTreeWidgetItem([str(x) for x in text_cols])
+            troop_values = text_cols[2:14]
             for col in range(2, 14):
                 item.setTextAlignment(col, Qt.AlignCenter)
                 ti = col - 2
@@ -4931,6 +4946,11 @@ class TribalWarsBot(QMainWindow):
                 if col < n:
                     item.setTextAlignment(col, Qt.AlignCenter)
             self.sa_table.addTopLevelItem(item)
+            # Kaydedilmiş state'e göre görsel uygula
+            if state == "sent":
+                self._dispatch_mark_sent(item)
+            elif state == "error":
+                self._dispatch_mark_error(item, "—")
         self._sa_update_totals()
 
     def _sa_update_totals(self):
