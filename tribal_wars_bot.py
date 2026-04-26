@@ -526,6 +526,13 @@ class StealthBrowser(QWebEngineView):
         settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
         settings.setAttribute(QWebEngineSettings.ScrollAnimatorEnabled, True)
 
+        # HTTP disk cache — tekrar ziyaret edilen kaynaklar (css/js/img) ağdan çekilmesin
+        try:
+            self.profile.setHttpCacheType(QWebEngineProfile.DiskHttpCache)
+            self.profile.setHttpCacheMaximumSize(50 * 1024 * 1024)  # 50 MB
+        except Exception:
+            pass
+
     def _inject_stealth_js(self, ok):
         """Sayfa yüklendikten sonra anti-detection JavaScript enjekte et."""
         if not ok:
@@ -13978,11 +13985,35 @@ class TribalWarsBot(QMainWindow):
     # ── YARDIMCI ───────────────────────────────
 
     def _start_sync_timer(self):
-        self.sync_timer = QTimer(self)
-        self.sync_timer.timeout.connect(self._fetch_server_time)
-        self.sync_timer.start(50)  # 50ms — akıcı milisaniye
         self._server_time_text = ""
+
+        # Ekran güncellemesi — saf Python, JS yok, 50ms
+        self.sync_timer = QTimer(self)
+        self.sync_timer.timeout.connect(self._tick_server_time_display)
+        self.sync_timer.start(50)
+
+        # JS resync — anchor'ı günceller, başlangıçta 2 saniye
+        self._resync_timer = QTimer(self)
+        self._resync_timer.timeout.connect(self._fetch_server_time)
+        self._resync_timer.start(2000)
+
+        # İlk anchor'ı hemen al
         self._fetch_server_time()
+
+    def _tick_server_time_display(self):
+        """50ms'de bir, saf Python ile sunucu saatini label'a yazar (JS çağrısı yok)."""
+        if not self._server_time_synced or self._server_time_anchor_dt is None or self._server_time_anchor_perf is None:
+            self._show_local_time()
+            return
+        try:
+            elapsed = time.perf_counter() - self._server_time_anchor_perf
+            dt = self._server_time_anchor_dt + datetime.timedelta(seconds=elapsed)
+            ms = int((elapsed * 1000) % 1000)
+            text = dt.strftime("%d/%m/%Y %H:%M:%S") + f".{ms:03d}"
+            self.sync_label.setText(f"Sunucu Saati: {text}")
+            self.sync_label.setStyleSheet("color: #228822; font-weight: bold; font-size: 10px;")
+        except Exception:
+            self._show_local_time()
 
     def _fetch_server_time(self):
         """Sayfadaki sunucu saatini Timing + DOM ile örnekler.
@@ -14079,9 +14110,23 @@ class TribalWarsBot(QMainWindow):
                 self._server_time_anchor_dt = None
                 self._server_time_anchor_perf = None
                 self._anchor_timing_ms = None
-            self.sync_label.setText(f"Sunucu Saati: {self._server_time_text}")
-            self.sync_label.setStyleSheet(
-                "color: #228822; font-weight: bold; font-size: 10px;")
+
+            # Dispatch aktifse (bekleyen gönderim varsa) 50ms, yoksa 2 saniye
+            dispatch_active = False
+            try:
+                if (hasattr(self, "sa_table") and
+                        hasattr(self, "enable_sending_cb") and
+                        self.enable_sending_cb.isChecked()):
+                    for _i in range(self.sa_table.topLevelItemCount()):
+                        _it = self.sa_table.topLevelItem(_i)
+                        if _it and _it.data(0, Qt.UserRole) not in ("sent", "error"):
+                            dispatch_active = True
+                            break
+            except Exception:
+                pass
+            new_interval = 50 if dispatch_active else 2000
+            if hasattr(self, "_resync_timer") and self._resync_timer.interval() != new_interval:
+                self._resync_timer.setInterval(new_interval)
 
         self.browser.page().runJavaScript(fetch_js, on_result)
 
@@ -14209,6 +14254,15 @@ class TribalWarsBot(QMainWindow):
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # Chromium GPU rasterization — QApplication oluşturulmadan önce ayarlanmalı
+    for _flag in [
+        "--enable-gpu-rasterization",
+        "--enable-accelerated-2d-canvas",
+        "--ignore-gpu-blocklist",
+    ]:
+        if _flag not in sys.argv:
+            sys.argv.append(_flag)
+
     app = QApplication(sys.argv)
     tw_apply_saved_proxy_environment()
     app.setFont(QFont("Segoe UI", 9))
