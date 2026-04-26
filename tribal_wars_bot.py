@@ -13205,7 +13205,35 @@ class TribalWarsBot(QMainWindow):
             }
 
             enrichTroopsFromGameDataUnits(result.all_villages);
-            
+
+            // units_table bu sayfada yoksa: mode=units XHR ile snob verisini güncelle.
+            // Her sayfada senkron XHR çalıştırmamak için 5 dakikalık window cache kullanılır.
+            if (!unitsTableEl) {
+                try {
+                    var _snobNow = Date.now();
+                    var _snobTtl = 5 * 60 * 1000;
+                    var _snobCached = window.__tw_bot_units_cache;
+                    var _snobHtml = null;
+                    if (_snobCached && (_snobNow - _snobCached.t) < _snobTtl) {
+                        _snobHtml = _snobCached.html;
+                    } else {
+                        var _uUnits = new URL(window.location.href);
+                        _uUnits.searchParams.set('screen', 'overview_villages');
+                        _uUnits.searchParams.set('mode', 'units');
+                        if (!_uUnits.searchParams.get('group')) _uUnits.searchParams.set('group', '0');
+                        _uUnits.searchParams.set('page_size', '500');
+                        _uUnits.searchParams.delete('page');
+                        _snobHtml = fetchOverviewHtmlSync(_uUnits.href);
+                        if (_snobHtml) window.__tw_bot_units_cache = { t: _snobNow, html: _snobHtml };
+                    }
+                    if (_snobHtml) {
+                        var _uDoc = new DOMParser().parseFromString(_snobHtml, 'text/html');
+                        var _uTbl = _uDoc.getElementById('units_table');
+                        if (_uTbl) mergeVillagesById(result.all_villages, parseCombinedTableRows(_uTbl));
+                    }
+                } catch(ex) {}
+            }
+
             // Mevcut aktif köyün asker sayıları (seçili satırdan)
             result.troops = {};
             if (result.all_villages.length > 0) {
