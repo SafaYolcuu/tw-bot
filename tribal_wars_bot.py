@@ -6481,7 +6481,9 @@ class TribalWarsBot(QMainWindow):
 
         self._bq_processing = False
         self._bq_current_levels = {}
+        self._bq_current_in_progress = {}
         self._bq_levels_cache = {}
+        self._bq_in_progress_cache = {}
         self._bq_levels_fetch_vid = ""
         self._bq_fetch_done_cb = None
         # id(item) -> unblock timestamp; prevents skipping while waiting for resources/queue
@@ -6848,7 +6850,29 @@ class TribalWarsBot(QMainWindow):
                         break;
                     }}
                 }}
-                window.__tw_bq_levels = JSON.stringify({{status: 'OK', levels: levels, imgs: imgs}});
+                // Aktif inşaat kuyruğunu parse et: hangi bina hangi seviyeye doğru gidiyor?
+                var inProgress = {{}};
+                var bqEl = doc.getElementById('buildqueue');
+                if (bqEl) {{
+                    var bqRows = bqEl.querySelectorAll('tr');
+                    for (var bqi = 0; bqi < bqRows.length; bqi++) {{
+                        var bqr = bqRows[bqi];
+                        var cl = bqr.querySelector('a[href*="cancel_order"]');
+                        if (!cl) continue;
+                        var clh = cl.getAttribute('href') || '';
+                        var bqm = clh.match(/buildingid=([^&]+)/);
+                        if (!bqm) continue;
+                        var bqKey = bqm[1];
+                        var bqTxt = bqr.textContent;
+                        var bqlm = bqTxt.match(/Level\\s+(\\d+)/i) || bqTxt.match(/Seviye\\s+(\\d+)/i);
+                        if (bqlm) {{
+                            var bqLv = parseInt(bqlm[1]);
+                            if (!inProgress[bqKey] || bqLv > inProgress[bqKey])
+                                inProgress[bqKey] = bqLv;
+                        }}
+                    }}
+                }}
+                window.__tw_bq_levels = JSON.stringify({{status: 'OK', levels: levels, imgs: imgs, in_progress: inProgress}});
             }})
             .catch(function(err) {{
                 window.__tw_bq_levels = JSON.stringify({{status: 'ERROR', message: String(err)}});
@@ -6898,10 +6922,13 @@ class TribalWarsBot(QMainWindow):
                 return
 
             levels = data.get("levels", {})
+            in_progress = data.get("in_progress", {})
             self._bq_current_levels = levels
+            self._bq_current_in_progress = in_progress
             vid = getattr(self, "_bq_levels_fetch_vid", "") or ""
             if vid:
                 self._bq_levels_cache[vid] = dict(levels)
+                self._bq_in_progress_cache[vid] = dict(in_progress)
             self._add_log("BİNA", "success",
                 f"✅ Bina seviyeleri güncellendi: {len(levels)} bina")
 
@@ -7043,6 +7070,17 @@ class TribalWarsBot(QMainWindow):
             if cur is not None:
                 import time as _time
                 item.setText(4, str(cur))
+                # Get in-progress info for this village/building
+                if row_vid is None or str(row_vid).strip() == "":
+                    ip = self._bq_current_in_progress
+                else:
+                    vs2 = str(row_vid)
+                    ip = self._bq_in_progress_cache.get(vs2)
+                    if ip is None and vs2 == combo_vid:
+                        ip = self._bq_current_in_progress
+                    elif ip is None:
+                        ip = {}
+                in_prog_level = ip.get(bkey)
                 if cur >= target:
                     # Complete — also unblock
                     self._bq_blocked_until.pop(id(item), None)
@@ -7050,6 +7088,14 @@ class TribalWarsBot(QMainWindow):
                     item.setForeground(5, QColor("#228822"))
                     for col in range(6):
                         item.setBackground(col, QColor("#e8f5e8"))
+                elif in_prog_level is not None and in_prog_level >= target:
+                    # Building is currently in game's queue at this target level
+                    if self._bq_blocked_until.get(id(item), 0) <= _time.time():
+                        item.setText(5, f"⏳ Oyun kuyruğunda yapılıyor (mevcut: {cur})")
+                        item.setForeground(5, QColor("#2d5a9e"))
+                        for col in range(6):
+                            item.setBackground(col, QColor(
+                                "#1a2a3a" if getattr(self, "_dark_mode", False) else "#e8f0ff"))
                 elif self._bq_blocked_until.get(id(item), 0) > _time.time():
                     # Still blocked — don't overwrite the countdown status
                     pass
@@ -7235,6 +7281,31 @@ class TribalWarsBot(QMainWindow):
                         if (ex > 0) endTimes.push(ex);
                     }}
                 }}
+
+                // Hedef bina zaten oyunun kuyruğunda hedef seviyeye doğru inşa ediliyorsa bekle
+                if (buildqueue) {{
+                    var qrows = buildqueue.querySelectorAll('tr');
+                    for (var qi = 0; qi < qrows.length; qi++) {{
+                        var qrow = qrows[qi];
+                        var cancelLink = qrow.querySelector('a[href*="cancel_order"]');
+                        if (!cancelLink) continue;
+                        var chref = cancelLink.getAttribute('href') || '';
+                        var bm = chref.match(/buildingid=([^&]+)/);
+                        if (!bm || bm[1] !== buildingKey) continue;
+                        // Bu bina kuyruğunda — hedef seviyeyi metinden çek
+                        var rowTxt = qrow.textContent;
+                        var lm = rowTxt.match(/Level\\s+(\\d+)/i) || rowTxt.match(/Seviye\\s+(\\d+)/i);
+                        var qTargetLv = lm ? parseInt(lm[1]) : 0;
+                        if (qTargetLv === targetLevel) {{
+                            var timerEl = qrow.querySelector('[data-endtime]');
+                            var finishSec = timerEl ? (parseInt(timerEl.getAttribute('data-endtime')) || 0) : 0;
+                            var remainBq = finishSec > nowSec ? finishSec - nowSec : 90;
+                            window.__tw_bq_result = 'ALREADY_BUILDING|' + currentLevel + '|' + remainBq;
+                            return;
+                        }}
+                    }}
+                }}
+
                 // Aktif (şu anda inşa edilen) + sıraya alınmış (sortable_row / buildorder_N)
                 var activeBuilds  = endTimes.length;
                 var sortableBuilds = buildqueue
@@ -7336,7 +7407,8 @@ class TribalWarsBot(QMainWindow):
             .then(function(resultHtml) {{
                 var cur = window.__tw_bq_result || '';
                 if (cur.startsWith('ERROR') || cur.startsWith('DONE') ||
-                    cur.startsWith('BUSY') || cur.startsWith('NO_RES')) return;
+                    cur.startsWith('BUSY') || cur.startsWith('NO_RES') ||
+                    cur.startsWith('ALREADY_BUILDING')) return;
 
                 if (resultHtml && resultHtml.indexOf('buildqueue') > -1) {{
                     var level = cur.replace('UPGRADING|', '');
@@ -7472,6 +7544,28 @@ class TribalWarsBot(QMainWindow):
                     self._bq_processing = False
                     self._add_log("BİNA", "info", "Kuyruk dolu; [data-endtime] yok — 20 sn sonra yine dene")
                     self._bq_schedule_build_wake(20000)
+
+            elif result_str.startswith("ALREADY_BUILDING|"):
+                import time as _tab
+                parts = result_str.split("|")
+                cur_level = parts[1] if len(parts) > 1 else "?"
+                remain_sec = int(parts[2]) if len(parts) > 2 else 90
+                wait_sec = max(remain_sec + 5, 30)
+                self._bq_blocked_until[id(item)] = _tab.time() + wait_sec
+                mins = remain_sec // 60
+                secs = remain_sec % 60
+                item.setText(4, str(cur_level))
+                item.setText(5, f"⏳ Oyun kuyruğunda yapılıyor — {mins:02d}:{secs:02d} sonra tamamlanır")
+                item.setForeground(5, QColor("#2d5a9e"))
+                for col in range(item.columnCount()):
+                    item.setBackground(col, QColor(
+                        "#1a2a3a" if getattr(self, "_dark_mode", False) else "#e8f0ff"))
+                self._add_log("BİNA", "info",
+                    f"{building_key} → seviye {target_level} zaten oyun kuyruğunda yapılıyor; "
+                    f"~{mins}dk {secs}sn sonra tekrar kontrol edilecek")
+                self._bq_persist_queue()
+                self._bq_processing = False
+                self._bq_schedule_build_wake(wait_sec * 1000 + 500)
 
             elif result_str.startswith("NO_RES|"):
                 import random as _rnd, time as _t2
