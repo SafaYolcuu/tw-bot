@@ -7829,6 +7829,24 @@ class TribalWarsBot(QMainWindow):
         barb_group = QGroupBox("Yakındaki barbar köyleri")
         barb_layout = QVBoxLayout()
         barb_layout.setContentsMargins(4, 4, 4, 4)
+        barb_layout.setSpacing(4)
+
+        # Mesafe filtresi satırı
+        barb_filter_row = QHBoxLayout()
+        barb_filter_row.addWidget(QLabel("Maks mesafe:"))
+        self.map_barb_radius = QSpinBox()
+        self.map_barb_radius.setRange(1, 999)
+        self.map_barb_radius.setValue(20)
+        self.map_barb_radius.setFixedWidth(60)
+        self.map_barb_radius.setToolTip("Bu mesafeye (birim) kadar olan barbar köyleri listelenir")
+        barb_filter_row.addWidget(self.map_barb_radius)
+        barb_filter_btn = QPushButton("Filtrele")
+        barb_filter_btn.setFixedWidth(70)
+        barb_filter_btn.clicked.connect(self._map_refresh_barb_table)
+        barb_filter_row.addWidget(barb_filter_btn)
+        barb_filter_row.addStretch()
+        barb_layout.addLayout(barb_filter_row)
+
         self.map_barb_table = QTreeWidget()
         self.map_barb_table.setAlternatingRowColors(True)
         self.map_barb_table.setRootIsDecorated(False)
@@ -8362,6 +8380,50 @@ class TribalWarsBot(QMainWindow):
 
         self.browser.page().runJavaScript(check_js, on_poll)
 
+    def _map_refresh_barb_table(self):
+        """Sadece barbar tablosunu yenile (haritayı yeniden çizmeden)."""
+        if not self._map_data_loaded or not self._map_villages:
+            return
+        import math, time as _brt2
+        cx = self.map_center_x.value()
+        cy = self.map_center_y.value()
+        barb_radius = getattr(self, "map_barb_radius", None)
+        barb_r = int(barb_radius.value()) if barb_radius is not None else 20
+
+        barb_list = []
+        for v in self._map_villages:
+            vx = v.get("x")
+            vy = v.get("y")
+            if vx is None or vy is None:
+                continue
+            if int(v.get("player_id", 0) or 0) != 0:
+                continue
+            dx = vx - cx
+            dy = vy - cy
+            dist = math.sqrt(dx * dx + dy * dy)
+            if dist <= barb_r:
+                barb_list.append(v | {"dist": dist})
+
+        barb_list.sort(key=lambda b: b["dist"])
+        self.map_barb_table.clear()
+        active = getattr(self, "_farm_active_coords", {})
+        _now2 = _brt2.time()
+        for b in barb_list[:200]:
+            coord = f"({b['x']}|{b['y']})"
+            coord_key = (int(b["x"]), int(b["y"]))
+            exp = active.get(coord_key, 0)
+            status = "✓ Gönderildi" if exp > _now2 else ""
+            item = QTreeWidgetItem([coord, str(b["points"]), f"{b['dist']:.1f}", b["name"], status])
+            item.setTextAlignment(1, Qt.AlignCenter)
+            item.setTextAlignment(2, Qt.AlignCenter)
+            item.setData(0, Qt.UserRole, {"x": b["x"], "y": b["y"]})
+            if status:
+                item.setForeground(4, QColor("#228822"))
+            self.map_barb_table.addTopLevelItem(item)
+        self._farm_barb_index = 0
+        self._farm_sent_count = 0
+        self._farm_update_labels()
+
     def _map_refresh(self):
         """Haritayı ve barbar tablosunu güncelle.
         Tüm köylere renk/tip atar ve widget'a gönderir.
@@ -8451,12 +8513,14 @@ class TribalWarsBot(QMainWindow):
                 "player_name": v.get("player_name", ""),
             })
 
-            # Barbar tablosu için mesafe hesapla (spinbox merkezine göre)
+            # Barbar tablosu için mesafe hesapla (barb spinbox'ına göre)
             if is_barb:
                 dx = vx - cx
                 dy = vy - cy
                 dist = math.sqrt(dx * dx + dy * dy)
-                if dist <= radius:
+                barb_radius = getattr(self, "map_barb_radius", None)
+                barb_r = int(barb_radius.value()) if barb_radius is not None else radius
+                if dist <= barb_r:
                     barb_list.append(v | {"dist": dist})
 
         # Widget'a TÜM köyleri ver — widget kendi viewport'una göre çizer
