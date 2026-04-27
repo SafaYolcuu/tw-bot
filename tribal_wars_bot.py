@@ -12446,13 +12446,11 @@ class TribalWarsBot(QMainWindow):
             "ağdaki sertifikayı sizin gözetiminiz dışındadır, riski kabul edin."
         )
         tg_lay.addRow(self.settings_tg_insecure_ssl_cb)
-        _cfg_path_str = str(_tw_config_path())
         self.settings_tg_help = QLabel(
             "Botu gruba ekleyin; grup için chat_id'yi @userinfobot veya getUpdates ile alın. "
             "Token'ı paylaşmayın. Mesaj: oyuncu adı, dünya, tespit türü. "
             "Ayarları Kaydet sonrası otomatik uyarılar çalışır. "
-            "SSL hatası alırsanız: üstteki doğrulamaıyı atla'yı açıp Kaydet.\n\n"
-            f"Kalıcı ayar dosyası (bot güncellenince silinmez, exe'nin yanında kalır):\n{_cfg_path_str}"
+            "SSL hatası alırsanız: üstteki doğrulamaıyı atla'yı açıp Kaydet."
         )
         self.settings_tg_help.setWordWrap(True)
         self.settings_tg_help.setObjectName("settingsProxyHelp")

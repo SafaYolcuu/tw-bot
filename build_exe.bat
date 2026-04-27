@@ -19,11 +19,17 @@ if %errorlevel% neq 0 (
 echo       PyInstaller hazir.
 echo.
 
+echo [HATIRLATICI] Telegram ayarlarini gondermek istiyorsaniz:
+echo   tw_config.json dosyasini duzenleyin (token ve chat_id), sonra build alin.
+echo   Bu dosya otomatik olarak dist_build\TribalWarsBot\ klasorune kopyalanir.
+echo.
+
 echo [2/3] Build baslatiliyor...
 echo       Bu islem birkaç dakika surebilir...
-echo       Not: Cikti dist_build klasorune yazilir (eski EXE acik olsa bile sorun cikmaz).
+echo       Not: Gecici dosyalar Windows TEMP altinda (OneDrive disinda).
+echo       Cikti: dist_build\TribalWarsBot\
 echo.
-pyinstaller tribal_wars_bot.spec --noconfirm --clean --distpath dist_build --workpath build_release
+python build_exe.py
 if %errorlevel% neq 0 (
     echo.
     echo HATA: Build basarisiz!
