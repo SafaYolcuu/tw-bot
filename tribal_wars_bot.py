@@ -113,6 +113,40 @@ TW_PLANNER_SCRIPT_URL = "https://safayolcuu.github.io/klanlar/arascript.js"
 QSETTINGS_ORG = "TribalWarsBot"
 QSETTINGS_APP = "TWB"
 
+# Kalici ayar dosyasi: exe'nin yaninda tw_config.json.
+# Yeni exe dagitilsa bile bu dosya silinmez; arkadaslar sadece exe'yi gunceller.
+def _tw_config_path() -> Path:
+    """Exe'nin (veya script'in) bulundugu klasorde tw_config.json dondur."""
+    if getattr(sys, "frozen", False):
+        base = Path(sys.executable).parent
+    else:
+        base = Path(__file__).parent
+    return base / "tw_config.json"
+
+
+def _tw_load_config() -> dict:
+    """tw_config.json'i oku; dosya yoksa veya bozuksa bos dict."""
+    p = _tw_config_path()
+    try:
+        if p.exists():
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _tw_save_config(data: dict) -> None:
+    """tw_config.json'a yaz (mevcut anahtarlari koru, sadece verilen anahtarlari guncelle)."""
+    p = _tw_config_path()
+    existing = _tw_load_config()
+    existing.update(data)
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 
 def tw_apply_saved_proxy_environment() -> None:
     """
@@ -175,9 +209,13 @@ def _tw_telegram_build_opener(insecure_skip_verify: bool = None):
     """Kurumsal ağ/SSL tarama (self‑signed) için `insecure_skip_verify` veya QSettings
     `notify/telegram_insecure_ssl`. Aksi: doğrulanmış sertifika, varsa `certifi` mağazası.
     Oyun global proxy’si yok: ProxyHandler boş; Telegram ayrı."""
-    s = QSettings(QSETTINGS_ORG, QSETTINGS_APP)
     if insecure_skip_verify is None:
-        insecure_skip_verify = s.value("notify/telegram_insecure_ssl", False, type=bool)
+        cfg = _tw_load_config()
+        s = QSettings(QSETTINGS_ORG, QSETTINGS_APP)
+        insecure_skip_verify = cfg.get(
+            "telegram_insecure_ssl",
+            s.value("notify/telegram_insecure_ssl", False, type=bool)
+        )
     if insecure_skip_verify:
         ctx = ssl._create_unverified_context()
     else:
@@ -245,15 +283,17 @@ def _tw_telegram_msgbox_on_top(parent, is_warning, title, text) -> None:
 
 
 def tw_telegram_send_message_threaded(bot, text: str) -> None:
-    """QSettings: notify/telegram_*. Açıksa sendMessage. Hata olursa bot üzerinde log (ana thread)."""
+    """tw_config.json veya QSettings: notify/telegram_*. Açıksa sendMessage."""
     def work():
         err = None
         try:
+            cfg = _tw_load_config()
             s = QSettings(QSETTINGS_ORG, QSETTINGS_APP)
-            if not s.value("notify/telegram_enabled", False, type=bool):
+            enabled = cfg.get("telegram_enabled", s.value("notify/telegram_enabled", False, type=bool))
+            if not enabled:
                 return
-            token = (s.value("notify/telegram_bot_token", "") or "").strip()
-            chat = (s.value("notify/telegram_chat_id", "") or "").strip()
+            token = (cfg.get("telegram_bot_token") or s.value("notify/telegram_bot_token", "") or "").strip()
+            chat = (cfg.get("telegram_chat_id") or s.value("notify/telegram_chat_id", "") or "").strip()
             if not token or not chat or not (text and str(text).strip()):
                 return
             ok, emsg = tw_telegram_api_send_message(token, chat, str(text))
@@ -2846,13 +2886,21 @@ class TribalWarsBot(QMainWindow):
             self._settings.setValue("network/proxy_user", self.settings_proxy_user.text().strip())
             self._settings.setValue("network/proxy_password", self.settings_proxy_pass.text())
         if hasattr(self, "settings_tg_enable_cb"):
-            self._settings.setValue("notify/telegram_enabled", self.settings_tg_enable_cb.isChecked())
-            self._settings.setValue("notify/telegram_bot_token", self.settings_tg_token.text().strip())
-            self._settings.setValue("notify/telegram_chat_id", self.settings_tg_chat_id.text().strip())
+            tg_enabled = self.settings_tg_enable_cb.isChecked()
+            tg_token = self.settings_tg_token.text().strip()
+            tg_chat = self.settings_tg_chat_id.text().strip()
+            self._settings.setValue("notify/telegram_enabled", tg_enabled)
+            self._settings.setValue("notify/telegram_bot_token", tg_token)
+            self._settings.setValue("notify/telegram_chat_id", tg_chat)
+            _tw_save_config({
+                "telegram_enabled": tg_enabled,
+                "telegram_bot_token": tg_token,
+                "telegram_chat_id": tg_chat,
+            })
         if hasattr(self, "settings_tg_insecure_ssl_cb"):
-            self._settings.setValue(
-                "notify/telegram_insecure_ssl", self.settings_tg_insecure_ssl_cb.isChecked()
-            )
+            tg_ssl = self.settings_tg_insecure_ssl_cb.isChecked()
+            self._settings.setValue("notify/telegram_insecure_ssl", tg_ssl)
+            _tw_save_config({"telegram_insecure_ssl": tg_ssl})
         self._settings.sync()
         self._add_log("AYAR", "info", "Ayarlar diske kaydedildi.")
         QMessageBox.information(
@@ -12368,21 +12416,22 @@ class TribalWarsBot(QMainWindow):
         tg_group = QGroupBox("Telegram (doğrulama / hCaptcha uyarısı)")
         tg_lay = QFormLayout()
         tg_lay.setSpacing(6)
+        _cfg = _tw_load_config()
         self.settings_tg_enable_cb = QCheckBox("Telegram ile güvenlik uyarısı (hCaptcha vb.)")
         self.settings_tg_enable_cb.setChecked(
-            self._settings.value("notify/telegram_enabled", False, type=bool)
+            _cfg.get("telegram_enabled", self._settings.value("notify/telegram_enabled", False, type=bool))
         )
         tg_lay.addRow(self.settings_tg_enable_cb)
         self.settings_tg_token = QLineEdit()
         self.settings_tg_token.setText(
-            (self._settings.value("notify/telegram_bot_token", "") or "").strip()
+            (_cfg.get("telegram_bot_token") or self._settings.value("notify/telegram_bot_token", "") or "").strip()
         )
         self.settings_tg_token.setEchoMode(QLineEdit.Password)
         self.settings_tg_token.setPlaceholderText("@BotFather — bot token")
         tg_lay.addRow("Bot token:", self.settings_tg_token)
         self.settings_tg_chat_id = QLineEdit()
         self.settings_tg_chat_id.setText(
-            (self._settings.value("notify/telegram_chat_id", "") or "").strip()
+            (_cfg.get("telegram_chat_id") or self._settings.value("notify/telegram_chat_id", "") or "").strip()
         )
         self.settings_tg_chat_id.setPlaceholderText("Sohbet veya grup chat_id (grup: genelde eksi id)")
         tg_lay.addRow("Chat ID:", self.settings_tg_chat_id)
@@ -12390,18 +12439,20 @@ class TribalWarsBot(QMainWindow):
             "Kurumsal ağ / SSL tarama: Telegram API için sertifika doğrulamasını atla"
         )
         self.settings_tg_insecure_ssl_cb.setChecked(
-            self._settings.value("notify/telegram_insecure_ssl", False, type=bool)
+            _cfg.get("telegram_insecure_ssl", self._settings.value("notify/telegram_insecure_ssl", False, type=bool))
         )
         self.settings_tg_insecure_ssl_cb.setToolTip(
             "MITM veya kendi sertifikanız zincirde self-signed hatası verirse açın; "
             "ağdaki sertifikayı sizin gözetiminiz dışındadır, riski kabul edin."
         )
         tg_lay.addRow(self.settings_tg_insecure_ssl_cb)
+        _cfg_path_str = str(_tw_config_path())
         self.settings_tg_help = QLabel(
-            "Botu gruba ekleyin; grup için chat_id’yi @userinfobot veya getUpdates ile alın. "
-            "Token’ı paylaşmayın. Mesaj: oyuncu adı, dünya, tespit türü. "
+            "Botu gruba ekleyin; grup için chat_id'yi @userinfobot veya getUpdates ile alın. "
+            "Token'ı paylaşmayın. Mesaj: oyuncu adı, dünya, tespit türü. "
             "Ayarları Kaydet sonrası otomatik uyarılar çalışır. "
-            "SSL hatası (certificate verify) alırsanız: üstteki \"doğrulamayı atla\"yı açıp tekrar deneyin, sonra Kaydet."
+            "SSL hatası alırsanız: üstteki doğrulamaıyı atla'yı açıp Kaydet.\n\n"
+            f"Kalıcı ayar dosyası (bot güncellenince silinmez, exe'nin yanında kalır):\n{_cfg_path_str}"
         )
         self.settings_tg_help.setWordWrap(True)
         self.settings_tg_help.setObjectName("settingsProxyHelp")
