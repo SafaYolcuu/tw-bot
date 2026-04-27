@@ -7546,7 +7546,7 @@ class TribalWarsBot(QMainWindow):
         self.map_load_btn.clicked.connect(self._map_load_data)
         ctrl_row.addWidget(self.map_load_btn)
 
-        self.map_fetch_diplomacy_btn = QPushButton("Diplomayı yenile")
+        self.map_fetch_diplomacy_btn = QPushButton("Diplomasiyi yenile")
         self.map_fetch_diplomacy_btn.setToolTip(
             "Harita yüklendiğinde müttefik / SA / düşman klan ID’leri otomatik alınır.\n"
             "Oyunda diplomasiyi değiştirdiyseniz bu düğmeyle tekrar senkronize edin.")
@@ -7861,20 +7861,20 @@ class TribalWarsBot(QMainWindow):
         farm_row3.setSpacing(6)
         farm_row3.addWidget(QLabel("Şablon:"))
 
-        btn_hsv = QPushButton("25 HSv")
-        btn_hsv.setCursor(Qt.PointingHandCursor)
-        btn_hsv.clicked.connect(lambda: self._farm_template({"light": 25}))
-        farm_row3.addWidget(btn_hsv)
+        btn_2hsv = QPushButton("2 Hafif")
+        btn_2hsv.setCursor(Qt.PointingHandCursor)
+        btn_2hsv.clicked.connect(lambda: self._farm_template({"light": 2}))
+        farm_row3.addWidget(btn_2hsv)
 
-        btn_bal_hsv = QPushButton("10 Bal + 15 HSv")
-        btn_bal_hsv.setCursor(Qt.PointingHandCursor)
-        btn_bal_hsv.clicked.connect(lambda: self._farm_template({"axe": 10, "light": 15}))
-        farm_row3.addWidget(btn_bal_hsv)
+        btn_3hsv = QPushButton("3 Hafif")
+        btn_3hsv.setCursor(Qt.PointingHandCursor)
+        btn_3hsv.clicked.connect(lambda: self._farm_template({"light": 3}))
+        farm_row3.addWidget(btn_3hsv)
 
-        btn_cas = QPushButton("1 Cas")
-        btn_cas.setCursor(Qt.PointingHandCursor)
-        btn_cas.clicked.connect(lambda: self._farm_template({"spy": 1}))
-        farm_row3.addWidget(btn_cas)
+        btn_4hsv = QPushButton("4 Hafif")
+        btn_4hsv.setCursor(Qt.PointingHandCursor)
+        btn_4hsv.clicked.connect(lambda: self._farm_template({"light": 4}))
+        farm_row3.addWidget(btn_4hsv)
 
         farm_row3.addStretch()
 
