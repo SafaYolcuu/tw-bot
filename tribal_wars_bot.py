@@ -7530,18 +7530,6 @@ class TribalWarsBot(QMainWindow):
         self.map_center_y.setToolTip("Haritanın ortasındaki dünya Y koordinatı")
         ctrl_row.addWidget(self.map_center_y)
 
-        ctrl_row.addSpacing(12)
-        ctrl_row.addWidget(QLabel("Barbar listesi:"))
-        self.map_radius = QSpinBox()
-        self.map_radius.setRange(5, 100)
-        self.map_radius.setValue(30)
-        self.map_radius.setSuffix(" kare")
-        self.map_radius.setFixedWidth(78)
-        self.map_radius.setToolTip(
-            "Merkeze bu mesafede kalan barbar köyleri aşağıdaki tabloda listelenir. "
-            "Harita yakınlaştırması ile ilgili değildir; yakınlaştırma için fare tekerleği.")
-        ctrl_row.addWidget(self.map_radius)
-
         ctrl_row.addSpacing(10)
         self.map_show_barbs = QCheckBox("Barbar köyleri")
         self.map_show_barbs.setChecked(True)
@@ -7694,8 +7682,30 @@ class TribalWarsBot(QMainWindow):
         queue_layout.addWidget(self.map_send_army_btn)
 
         queue_panel.setMinimumWidth(272)
-        queue_panel.setMaximumWidth(380)
-        map_splitter.addWidget(queue_panel)
+
+        # Barbar köyleri tablosu — sağ panelin üstüne gelecek
+        barb_group = QGroupBox("Yakındaki barbar köyleri")
+        barb_layout = QVBoxLayout()
+        barb_layout.setContentsMargins(4, 4, 4, 4)
+        self.map_barb_table = QTreeWidget()
+        self.map_barb_table.setAlternatingRowColors(True)
+        self.map_barb_table.setRootIsDecorated(False)
+        self.map_barb_table.setHeaderLabels(["Koordinat", "Puan", "Mesafe", "Köy Adı", "Durum"])
+        self.map_barb_table.header().setSectionResizeMode(QHeaderView.Stretch)
+        barb_layout.addWidget(self.map_barb_table)
+        barb_group.setLayout(barb_layout)
+
+        # Sağ: dikey splitter (barbar üstte, kuyruk altta)
+        right_vsplit = QSplitter(Qt.Vertical)
+        right_vsplit.setChildrenCollapsible(False)
+        right_vsplit.setHandleWidth(4)
+        right_vsplit.addWidget(barb_group)
+        right_vsplit.addWidget(queue_panel)
+        right_vsplit.setStretchFactor(0, 1)
+        right_vsplit.setStretchFactor(1, 2)
+        right_vsplit.setMinimumWidth(272)
+
+        map_splitter.addWidget(right_vsplit)
 
         map_splitter.setStretchFactor(0, 5)
         map_splitter.setStretchFactor(1, 1)
@@ -7706,9 +7716,13 @@ class TribalWarsBot(QMainWindow):
             if sw < 500:
                 map_splitter.setSizes([780, 300])
                 return
-            q = min(340, max(272, sw // 4))
+            q = min(360, max(272, sw // 4))
             m = max(520, sw - q)
             map_splitter.setSizes([m, q])
+            # dikey: barbar ~35%, kuyruk ~65%
+            rh = right_vsplit.height()
+            if rh > 100:
+                right_vsplit.setSizes([max(120, rh * 35 // 100), max(200, rh * 65 // 100)])
 
         QTimer.singleShot(0, _apply_map_split_sizes)
 
@@ -7738,19 +7752,6 @@ class TribalWarsBot(QMainWindow):
         self.map_village_count_label.setStyleSheet("font-size: 10px; color: #555; font-weight: bold;")
         legend_row.addWidget(self.map_village_count_label)
         layout.addWidget(legend_frame)
-
-        # Barbar köyleri tablosu
-        barb_group = QGroupBox("Yakındaki barbar köyleri (merkez + yukarıdaki mesafe)")
-        barb_layout = QVBoxLayout()
-        self.map_barb_table = QTreeWidget()
-        self.map_barb_table.setAlternatingRowColors(True)
-        self.map_barb_table.setRootIsDecorated(False)
-        self.map_barb_table.setHeaderLabels(["Koordinat", "Puan", "Mesafe", "Köy Adı", "Durum"])
-        self.map_barb_table.header().setSectionResizeMode(QHeaderView.Stretch)
-        self.map_barb_table.setMaximumHeight(200)
-        barb_layout.addWidget(self.map_barb_table)
-        barb_group.setLayout(barb_layout)
-        layout.addWidget(barb_group)
 
         # ═══════════════════════════════════════════
         #  OTOMATİK FARM SİSTEMİ
@@ -7955,6 +7956,8 @@ class TribalWarsBot(QMainWindow):
         self._farm_round_waiting = False
         self._farm_round_wait_until = 0
         self._farm_round_return_times = []
+        # (x, y) -> beklenen_dönüş_timestamp; tablo yenilenince durumu korur
+        self._farm_active_coords: dict = {}
 
         # Harita verisi
         self._map_villages = []
@@ -8227,7 +8230,8 @@ class TribalWarsBot(QMainWindow):
 
         cx = self.map_center_x.value()
         cy = self.map_center_y.value()
-        radius = self.map_radius.value()
+        _r_spin = getattr(self, "farm_max_dist", None)
+        radius = int(_r_spin.value()) if _r_spin is not None else 50
         show_barbs = self.map_show_barbs.isChecked()
         show_players = self.map_show_players.isChecked()
 
@@ -8319,14 +8323,26 @@ class TribalWarsBot(QMainWindow):
         self.map_village_count_label.setText(f"Köy: {len(all_colored)} (toplam)")
 
         # Barbar tablosunu güncelle (mesafeye göre sırala)
+        import time as _brt
         barb_list.sort(key=lambda b: b["dist"])
         self.map_barb_table.clear()
+        active = getattr(self, "_farm_active_coords", {})
+        _now_brt = _brt.time()
         for b in barb_list[:100]:  # İlk 100
             coord = f"({b['x']}|{b['y']})"
-            item = QTreeWidgetItem([coord, str(b["points"]), f"{b['dist']:.1f}", b["name"], ""])
+            coord_key = (int(b["x"]), int(b["y"]))
+            exp = active.get(coord_key, 0)
+            if exp > _now_brt:
+                status = "✓ Gönderildi"
+            else:
+                status = ""
+                active.pop(coord_key, None)
+            item = QTreeWidgetItem([coord, str(b["points"]), f"{b['dist']:.1f}", b["name"], status])
             item.setTextAlignment(1, Qt.AlignCenter)
             item.setTextAlignment(2, Qt.AlignCenter)
             item.setData(0, Qt.UserRole, {"x": b["x"], "y": b["y"]})
+            if status:
+                item.setForeground(4, QColor("#228822"))
             self.map_barb_table.addTopLevelItem(item)
 
         # Farm indexini sıfırla
@@ -8569,6 +8585,7 @@ class TribalWarsBot(QMainWindow):
         travel_sec = self._sa_calc_travel_time(distance, troop_keys)
         return_timestamp = time.time() + (2 * travel_sec)
         self._farm_round_return_times.append(return_timestamp)
+        self._farm_active_coords[(tx, ty)] = return_timestamp
 
     def _farm_start(self):
         """Farm sirkülasyonunu başlat."""
@@ -8590,6 +8607,7 @@ class TribalWarsBot(QMainWindow):
         self._farm_round_waiting = False
         self._farm_round_wait_until = 0
         self._farm_round_return_times = []
+        self._farm_active_coords = {}
         self.farm_round_wait_label.setText("")
 
         # Tablodaki durumları sıfırla
@@ -8728,6 +8746,17 @@ class TribalWarsBot(QMainWindow):
                         idx += 1
                         checked += 1
                         continue
+                    _vd = item.data(0, Qt.UserRole)
+                    if _vd:
+                        _key = (int(_vd.get("x", 0)), int(_vd.get("y", 0)))
+                        import time as _fat
+                        if _fat.time() < self._farm_active_coords.get(_key, 0):
+                            # Henüz dönmedi — atla, durumu güncelle
+                            item.setText(4, "✓ Gönderildi")
+                            item.setForeground(4, QColor("#228822"))
+                            idx += 1
+                            checked += 1
+                            continue
                     target = item.data(0, Qt.UserRole)
                     target_item = item
                     self._farm_barb_index = idx + 1
