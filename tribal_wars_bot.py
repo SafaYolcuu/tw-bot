@@ -7208,15 +7208,56 @@ class TribalWarsBot(QMainWindow):
                     return;
                 }}
 
-                // Yükseltme butonu
-                var btn = row.querySelector('a.btn-build');
-                var upgradeUrl = null;
-                if (btn) {{
-                    upgradeUrl = btn.getAttribute('href');
+                // ── Maliyet: her zaman parse et (yükseltme denemesinden önce kontrol için) ──
+                var costWood = 0, costStone = 0, costIron = 0;
+                var cwEl = row.querySelector('.cost_wood, [class*="cost_wood"]');
+                var csEl = row.querySelector('.cost_stone, [class*="cost_stone"]');
+                var ciEl = row.querySelector('.cost_iron, [class*="cost_iron"]');
+                if (cwEl) costWood = parseInt(cwEl.textContent.replace(/\\D/g, '')) || 0;
+                if (csEl) costStone = parseInt(csEl.textContent.replace(/\\D/g, '')) || 0;
+                if (ciEl) costIron = parseInt(ciEl.textContent.replace(/\\D/g, '')) || 0;
+                if (costWood === 0 && costStone === 0 && costIron === 0) {{
+                    row.querySelectorAll('span.icon').forEach(function(sp) {{
+                        var cls = sp.className || '';
+                        var valTxt = sp.parentElement ? sp.parentElement.textContent.replace(/\\D/g, '') : '0';
+                        var val = parseInt(valTxt) || 0;
+                        if (cls.indexOf('wood') > -1)  costWood  = val;
+                        else if (cls.indexOf('stone') > -1) costStone = val;
+                        else if (cls.indexOf('iron')  > -1) costIron  = val;
+                    }});
                 }}
 
+                // ── Mevcut kaynaklar: fetch edilen sayfadan oku ──
+                var curWood = 0, curStone = 0, curIron = 0;
+                var prodWood = 0, prodStone = 0, prodIron = 0;
+                try {{
+                    var wdEl = doc.getElementById('wood');
+                    var stEl = doc.getElementById('stone');
+                    var irEl = doc.getElementById('iron');
+                    if (wdEl) curWood  = parseInt(wdEl.textContent.replace(/\\D/g, '')) || 0;
+                    if (stEl) curStone = parseInt(stEl.textContent.replace(/\\D/g, '')) || 0;
+                    if (irEl) curIron  = parseInt(irEl.textContent.replace(/\\D/g, '')) || 0;
+                    if (wdEl && wdEl.title) {{ var pm  = wdEl.title.match(/(\\d+)/); if (pm)  prodWood  = parseInt(pm[1])  || 0; }}
+                    if (stEl && stEl.title) {{ var pm2 = stEl.title.match(/(\\d+)/); if (pm2) prodStone = parseInt(pm2[1]) || 0; }}
+                    if (irEl && irEl.title) {{ var pm3 = irEl.title.match(/(\\d+)/); if (pm3) prodIron  = parseInt(pm3[1]) || 0; }}
+                }} catch(e) {{}}
+
+                // ── Hammadde yeterliliği: yükseltmeye GEÇMEDEN kontrol ──
+                var hasCost = (costWood > 0 || costStone > 0 || costIron > 0);
+                var resOk   = (curWood >= costWood && curStone >= costStone && curIron >= costIron);
+                if (hasCost && !resOk) {{
+                    window.__tw_bq_result = 'NO_RES|' + currentLevel +
+                        '|' + costWood + '|' + costStone + '|' + costIron +
+                        '|' + curWood  + '|' + curStone  + '|' + curIron +
+                        '|' + prodWood + '|' + prodStone + '|' + prodIron;
+                    return;
+                }}
+
+                // ── Yükseltme butonu ──
+                var btn = row.querySelector('a.btn-build');
+                var upgradeUrl = null;
+                if (btn) upgradeUrl = btn.getAttribute('href');
                 if (!upgradeUrl) {{
-                    // build_options'dan link ara
                     var optTd = row.querySelector('.build_options');
                     if (optTd) {{
                         var allLinks = optTd.querySelectorAll('a');
@@ -7230,61 +7271,11 @@ class TribalWarsBot(QMainWindow):
                     }}
                 }}
 
+                // Hammadde yeterli ama URL yoksa → ön koşul eksik veya max seviye
                 if (!upgradeUrl) {{
-                    // Kaynak yetersiz veya ön koşul — maliyet ve mevcut kaynakları çek
-                    var costWood = 0, costStone = 0, costIron = 0;
-                    var costTds = row.querySelectorAll('td');
-                    // Karargah tablosunda maliyet hücreleri: class="cost_wood", "cost_stone", "cost_iron"
-                    var cwEl = row.querySelector('.cost_wood, [class*="cost_wood"]');
-                    var csEl = row.querySelector('.cost_stone, [class*="cost_stone"]');
-                    var ciEl = row.querySelector('.cost_iron, [class*="cost_iron"]');
-                    if (cwEl) costWood = parseInt(cwEl.textContent.replace(/\\D/g, '')) || 0;
-                    if (csEl) costStone = parseInt(csEl.textContent.replace(/\\D/g, '')) || 0;
-                    if (ciEl) costIron = parseInt(ciEl.textContent.replace(/\\D/g, '')) || 0;
-
-                    // Alternatif: span.icon + sonraki span'dan maliyet okuma
-                    if (costWood === 0 && costStone === 0 && costIron === 0) {{
-                        var spans = row.querySelectorAll('span.icon');
-                        spans.forEach(function(sp) {{
-                            var cls = sp.className || '';
-                            var valEl = sp.parentElement;
-                            var valTxt = valEl ? valEl.textContent.replace(/\\D/g, '') : '0';
-                            var val = parseInt(valTxt) || 0;
-                            if (cls.indexOf('wood') > -1) costWood = val;
-                            else if (cls.indexOf('stone') > -1) costStone = val;
-                            else if (cls.indexOf('iron') > -1) costIron = val;
-                        }});
-                    }}
-
-                    // Mevcut kaynaklar ve üretim hızı (game_data'dan)
-                    var curWood = 0, curStone = 0, curIron = 0;
-                    var prodWood = 0, prodStone = 0, prodIron = 0;
-                    try {{
-                        var wd = document.getElementById('wood');
-                        var st = document.getElementById('stone');
-                        var ir = document.getElementById('iron');
-                        if (wd) curWood = parseInt(wd.textContent.replace(/\\D/g, '')) || 0;
-                        if (st) curStone = parseInt(st.textContent.replace(/\\D/g, '')) || 0;
-                        if (ir) curIron = parseInt(ir.textContent.replace(/\\D/g, '')) || 0;
-
-                        // Üretim hızı: title="Odun - saatte XXXX" formatında
-                        if (wd && wd.title) {{
-                            var pm = wd.title.match(/(\\d+)/);
-                            if (pm) prodWood = parseInt(pm[1]) || 0;
-                        }}
-                        if (st && st.title) {{
-                            var pm2 = st.title.match(/(\\d+)/);
-                            if (pm2) prodStone = parseInt(pm2[1]) || 0;
-                        }}
-                        if (ir && ir.title) {{
-                            var pm3 = ir.title.match(/(\\d+)/);
-                            if (pm3) prodIron = parseInt(pm3[1]) || 0;
-                        }}
-                    }} catch(e) {{}}
-
                     window.__tw_bq_result = 'NO_RES|' + currentLevel +
                         '|' + costWood + '|' + costStone + '|' + costIron +
-                        '|' + curWood + '|' + curStone + '|' + curIron +
+                        '|' + curWood  + '|' + curStone  + '|' + curIron +
                         '|' + prodWood + '|' + prodStone + '|' + prodIron;
                     return;
                 }}
@@ -7302,14 +7293,10 @@ class TribalWarsBot(QMainWindow):
                 if (resultHtml && resultHtml.indexOf('buildqueue') > -1) {{
                     var level = cur.replace('UPGRADING|', '');
                     window.__tw_bq_result = 'UPGRADED|' + level;
-                }} else if (resultHtml && resultHtml.indexOf('error') > -1) {{
-                    var doc3 = new DOMParser().parseFromString(resultHtml, 'text/html');
-                    var err = doc3.querySelector('.error_box, .error, p.error');
-                    var errMsg = err ? err.textContent.trim().substring(0, 60) : 'Bilinmeyen hata';
-                    window.__tw_bq_result = 'ERROR|' + errMsg;
                 }} else {{
+                    // Yükseltme yanıtında buildqueue yoksa sunucu reddetti — NO_RES olarak işle
                     var level2 = cur.replace('UPGRADING|', '');
-                    window.__tw_bq_result = 'UPGRADED|' + level2;
+                    window.__tw_bq_result = 'NO_RES|' + level2 + '|0|0|0|0|0|0|0|0|0';
                 }}
             }})
             .catch(function(err) {{
@@ -7465,8 +7452,8 @@ class TribalWarsBot(QMainWindow):
                     except (ValueError, IndexError):
                         detail = "Maliyet verisi okunamadı"
 
-                # Random 6-7 minute wait; don't skip to next item
-                wait_sec = _rnd.randint(360, 420)
+                # ~10 dakika rastgele bekleme; sıra atlanmaz
+                wait_sec = _rnd.randint(540, 660)
                 self._bq_blocked_until[id(item)] = _t2.time() + wait_sec
                 mins = wait_sec // 60
                 secs = wait_sec % 60
@@ -7477,7 +7464,7 @@ class TribalWarsBot(QMainWindow):
                 log_detail = f" | {detail}" if detail else ""
                 self._add_log("BİNA", "info",
                     f"Hammadde yetersiz: {building_key}{log_detail} — "
-                    f"{mins}dk {secs}sn sonra yeniden kontrol")
+                    f"~10 dk sonra ({mins}dk {secs}sn) yeniden kontrol; sıra atlanmıyor")
 
                 self._bq_persist_queue()
                 self._bq_processing = False
