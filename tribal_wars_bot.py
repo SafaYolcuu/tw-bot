@@ -9434,6 +9434,14 @@ class TribalWarsBot(QMainWindow):
         ("knight", "Şövalye"),
     ]
 
+    # Hangi birim hangi binadan eğitilir (bağımsız kuyruklar)
+    _RT_BUILDINGS = {
+        "barracks": {"units": {"spear", "sword", "axe", "archer"}, "label": "Kışla"},
+        "stable":   {"units": {"spy", "light", "marcher", "heavy"}, "label": "Ahır"},
+        "workshop": {"units": {"ram", "catapult"},                  "label": "Atölye"},
+        "other":    {"units": {"knight"},                            "label": "Diğer"},
+    }
+
     SCAV_CARRY = {
         "spear": 25, "sword": 15, "axe": 10, "archer": 10,
         "light": 80, "marcher": 50, "heavy": 50, "knight": 100,
@@ -10577,15 +10585,25 @@ class TribalWarsBot(QMainWindow):
             for k, _ in self.RT_UNITS if k in selected_units
         )
 
+        def _make_bld_states():
+            return {bk: {"next_index": 0, "next_fire": 0.0, "processing": False}
+                    for bk in self._RT_BUILDINGS}
+
         added, updated = 0, 0
         for vid, vname, coord in checked_vids:
             label = f"{vname} {coord}"
             if vid in self._rt_village_states:
-                # Update existing
+                # Update existing — preserve timers, reset indices
                 st = self._rt_village_states[vid]
                 st["units"] = set(selected_units)
                 st["row"].setText(1, unit_short_str)
                 st["row"].setText(2, "—")
+                for bk in self._RT_BUILDINGS:
+                    if bk not in st["buildings"]:
+                        st["buildings"][bk] = {"next_index": 0, "next_fire": 0.0, "processing": False}
+                    else:
+                        st["buildings"][bk]["next_index"] = 0
+                st["bld_current"] = {}
                 updated += 1
             else:
                 row = QTreeWidgetItem([label, unit_short_str, "—", "—", "Bekliyor"])
@@ -10595,10 +10613,9 @@ class TribalWarsBot(QMainWindow):
                 self.rt_table.addTopLevelItem(row)
                 self._rt_village_states[vid] = {
                     "row": row,
-                    "next_index": 0,
-                    "next_fire": 0.0,
-                    "processing": False,
                     "units": set(selected_units),
+                    "buildings": _make_bld_states(),
+                    "bld_current": {},
                 }
                 added += 1
 
@@ -10638,6 +10655,15 @@ class TribalWarsBot(QMainWindow):
             return []
         selected = st.get("units", set())
         return [(k, n) for k, n in self.RT_UNITS if k in selected]
+
+    def _rt_get_building_units(self, vid, bld_key):
+        """Belirli bir binaya ait seçili (key, name) listesi."""
+        st = self._rt_village_states.get(str(vid))
+        if not st:
+            return []
+        selected = st.get("units", set())
+        bld_units_set = self._RT_BUILDINGS.get(bld_key, {}).get("units", set())
+        return [(k, n) for k, n in self.RT_UNITS if k in selected and k in bld_units_set]
 
     # ── ASKER TOPLAMA: tick & işlem ──────────────────────────
 
@@ -10682,10 +10708,15 @@ class TribalWarsBot(QMainWindow):
         for vid, state in list(self._rt_village_states.items()):
             if not self._rt_is_village_active(vid):
                 continue
-            if state["processing"]:
-                continue
-            if state["next_fire"] <= now:
-                self._rt_process_village(vid)
+            for bld_key in self._RT_BUILDINGS:
+                bld_units = self._rt_get_building_units(vid, bld_key)
+                if not bld_units:
+                    continue
+                bst = state["buildings"][bld_key]
+                if bst["processing"]:
+                    continue
+                if bst["next_fire"] <= now:
+                    self._rt_process_building(vid, bld_key)
 
     def _rt_update_countdowns(self):
         import time
@@ -10694,34 +10725,58 @@ class TribalWarsBot(QMainWindow):
             row = state.get("row")
             if not row:
                 continue
-            if state.get("processing"):
-                continue
-            nf = state.get("next_fire", 0.0)
-            remain = nf - now
-            if remain > 1:
-                mins = int(remain) // 60
-                secs = int(remain) % 60
-                row.setText(3, f"{mins:02d}:{secs:02d}")
-            else:
-                row.setText(3, "—")
+            # Soonest next_fire across all buildings that have units
+            min_fire = None
+            any_processing = False
+            for bld_key in self._RT_BUILDINGS:
+                bld_units = self._rt_get_building_units(vid, bld_key)
+                if not bld_units:
+                    continue
+                bst = state["buildings"].get(bld_key, {})
+                if bst.get("processing"):
+                    any_processing = True
+                    continue
+                nf = bst.get("next_fire", 0.0)
+                if min_fire is None or nf < min_fire:
+                    min_fire = nf
+            if any_processing:
+                pass  # col 3 already set by poll handler
+            elif min_fire is not None:
+                remain = min_fire - now
+                if remain > 1:
+                    mins = int(remain) // 60
+                    secs = int(remain) % 60
+                    row.setText(3, f"{mins:02d}:{secs:02d}")
+                else:
+                    row.setText(3, "—")
+            # Rebuild col 2 from per-building current units
+            bld_current = state.get("bld_current", {})
+            parts = []
+            for bld_key, bld_info in self._RT_BUILDINGS.items():
+                unit_name = bld_current.get(bld_key)
+                if unit_name:
+                    parts.append(f"{bld_info['label']}: {unit_name}")
+            if parts:
+                row.setText(2, " | ".join(parts))
 
-    def _rt_process_village(self, vid):
+    def _rt_process_building(self, vid, bld_key):
+        """Belirli bir bina kuyruğunu işle (kışla/ahır/atölye bağımsız)."""
         state = self._rt_village_states.get(str(vid))
         if not state or not self.browser:
             return
-        units = self._rt_get_village_units(vid)
+        units = self._rt_get_building_units(vid, bld_key)
         if not units:
             return
 
-        state["next_index"] = state["next_index"] % len(units)
-        unit_key, unit_name = units[state["next_index"]]
-        state["processing"] = True
+        bst = state["buildings"][bld_key]
+        bst["next_index"] = bst["next_index"] % len(units)
+        unit_key, unit_name = units[bst["next_index"]]
+        bst["processing"] = True
         csrf = self._game_data.get("csrf", "")
         vid_str = str(vid)
-        js_global = "__tw_rt_" + vid_str
+        js_global = "__tw_rt_" + vid_str + "_" + bld_key
 
         row = state["row"]
-        row.setText(2, unit_name + "…")
         row.setText(4, "Kontrol ediliyor…")
         row.setForeground(4, QColor("#2d5a9e"))
 
@@ -10808,18 +10863,20 @@ class TribalWarsBot(QMainWindow):
         )
 
         self.browser.page().runJavaScript(fetch_js)
-        self._rt_poll_village(vid, js_global, unit_key, unit_name, 0)
+        self._rt_poll_building(vid, bld_key, js_global, unit_key, unit_name, 0)
 
-    def _rt_poll_village(self, vid, js_global, unit_key, unit_name, attempt):
+    def _rt_poll_building(self, vid, bld_key, js_global, unit_key, unit_name, attempt):
         state = self._rt_village_states.get(str(vid))
+        bld_label = self._RT_BUILDINGS.get(bld_key, {}).get("label", bld_key)
 
         if attempt > 80 or not state:
             if state:
-                state["processing"] = False
-                state["next_fire"] = __import__("time").time() + 15
+                bst = state["buildings"].get(bld_key, {})
+                bst["processing"] = False
+                bst["next_fire"] = __import__("time").time() + 15
                 row = state.get("row")
                 if row:
-                    row.setText(4, "Zaman aşımı — 15sn sonra tekrar")
+                    row.setText(4, f"[{bld_label}] Zaman aşımı — 15sn sonra tekrar")
                     row.setForeground(4, QColor("#cc4444"))
                     for c in range(5):
                         row.setBackground(c, self._rt_bg("timeout"))
@@ -10832,12 +10889,13 @@ class TribalWarsBot(QMainWindow):
             result_str = str(result) if result else "WAITING"
 
             if result_str in ("WAITING", "CHECKING") or result_str.startswith("POSTING"):
-                QTimer.singleShot(350, lambda: self._rt_poll_village(
-                    vid, js_global, unit_key, unit_name, attempt + 1))
+                QTimer.singleShot(350, lambda: self._rt_poll_building(
+                    vid, bld_key, js_global, unit_key, unit_name, attempt + 1))
                 return
 
             self.browser.page().runJavaScript("window['" + js_global + "'] = null;")
-            st["processing"] = False
+            bst = st["buildings"].get(bld_key, {})
+            bst["processing"] = False
             row = st.get("row")
 
             import time
@@ -10849,20 +10907,21 @@ class TribalWarsBot(QMainWindow):
                     build_time_sec = float(result_str.split("|")[1])
                 except (IndexError, ValueError):
                     pass
-                village_units = self._rt_get_village_units(vid)
-                st["next_index"] = (st["next_index"] + 1) % max(len(village_units), 1)
+                bld_units = self._rt_get_building_units(vid, bld_key)
+                bst["next_index"] = (bst["next_index"] + 1) % max(len(bld_units), 1)
                 wake_sec = build_time_sec + 2 if build_time_sec > 0 else 60
-                st["next_fire"] = now + wake_sec
+                bst["next_fire"] = now + wake_sec
                 mins = int(wake_sec) // 60
                 secs = int(wake_sec) % 60
+                st.setdefault("bld_current", {})[bld_key] = unit_name
                 if row:
-                    row.setText(2, unit_name)
-                    row.setText(4, f"✅ {unit_name} eğitimde — {mins:02d}:{secs:02d}")
+                    row.setText(3, f"{mins:02d}:{secs:02d}")
+                    row.setText(4, f"[{bld_label}] ✅ {unit_name} — {mins:02d}:{secs:02d}")
                     row.setForeground(4, QColor("#66cc66" if getattr(self, "_dark_mode", False) else "#228822"))
                     for c in range(5):
                         row.setBackground(c, self._rt_bg("trained"))
                 self._add_log("ASKER", "success",
-                    f"✅ {unit_name} ×1 → köy {vid} — ~{mins}dk {secs}sn")
+                    f"✅ [{bld_label}] {unit_name} ×1 → köy {vid} — ~{mins}dk {secs}sn")
 
             elif result_str.startswith("BUSY|"):
                 remain = 60
@@ -10870,55 +10929,53 @@ class TribalWarsBot(QMainWindow):
                     remain = int(result_str.split("|")[1])
                 except (IndexError, ValueError):
                     pass
-                st["next_fire"] = now + remain + 2
+                bst["next_fire"] = now + remain + 2
                 mins = remain // 60
                 secs = remain % 60
                 if row:
-                    row.setText(4, f"⏳ Kuyruk dolu — {mins:02d}:{secs:02d}")
+                    row.setText(4, f"[{bld_label}] ⏳ Kuyruk dolu — {mins:02d}:{secs:02d}")
                     row.setForeground(4, QColor("#cc9933" if getattr(self, "_dark_mode", False) else "#aa6600"))
                     for c in range(5):
                         row.setBackground(c, self._rt_bg("busy"))
                 self._add_log("ASKER", "info",
-                    f"Köy {vid} kuyruk dolu — {mins}dk {secs}sn bekle")
+                    f"[{bld_label}] Köy {vid} kuyruk dolu — {mins}dk {secs}sn bekle")
 
             elif result_str.startswith("BLOCKED|") or result_str.startswith("NO_UNIT|"):
                 import random as _rnd2
-                village_units = self._rt_get_village_units(vid)
-                st["next_index"] = (st["next_index"] + 1) % max(len(village_units), 1)
+                bld_units = self._rt_get_building_units(vid, bld_key)
+                bst["next_index"] = (bst["next_index"] + 1) % max(len(bld_units), 1)
 
                 is_no_unit = result_str.startswith("NO_UNIT|")
                 if is_no_unit:
-                    # Birim bu dünyada mevcut değil — ~1 saat bekle
                     wait_sec = _rnd2.randint(3300, 3900)
                     reason = "bu dünyada mevcut değil"
                 else:
-                    # Farm dolu / hammadde yetersiz — 9-11 dakika bekle
                     wait_sec = _rnd2.randint(540, 660)
                     reason = "hammadde/farm yetersiz"
 
-                st["next_fire"] = now + wait_sec
+                bst["next_fire"] = now + wait_sec
                 mins = wait_sec // 60
                 secs = wait_sec % 60
                 if row:
-                    row.setText(4, f"⏳ {unit_name} — {reason} ({mins:02d}:{secs:02d} sonra)")
+                    row.setText(4, f"[{bld_label}] ⏳ {unit_name} — {reason} ({mins:02d}:{secs:02d})")
                     row.setForeground(4, QColor("#cc9933" if getattr(self, "_dark_mode", False) else "#aa6600"))
                     for c in range(5):
                         row.setBackground(c, self._rt_bg("neutral"))
                 self._add_log("ASKER", "warn",
-                    f"Köy {vid}: {unit_name} — {reason}, {mins}dk {secs}sn sonra tekrar denenir")
+                    f"[{bld_label}] Köy {vid}: {unit_name} — {reason}, {mins}dk {secs}sn sonra tekrar")
 
             elif result_str.startswith("ERROR|"):
                 msg = result_str[6:]
-                st["next_fire"] = now + 20
+                bst["next_fire"] = now + 20
                 if row:
-                    row.setText(4, f"Hata: {msg[:50]}")
+                    row.setText(4, f"[{bld_label}] Hata: {msg[:50]}")
                     row.setForeground(4, QColor("#ff6666" if getattr(self, "_dark_mode", False) else "#cc4444"))
                     for c in range(5):
                         row.setBackground(c, self._rt_bg("error"))
-                self._add_log("ASKER", "error", f"Köy {vid} hata: {msg}")
+                self._add_log("ASKER", "error", f"[{bld_label}] Köy {vid} hata: {msg}")
 
             else:
-                st["next_fire"] = now + 15
+                bst["next_fire"] = now + 15
 
         self.browser.page().runJavaScript("window['" + js_global + "'] || 'WAITING';", on_poll)
 
