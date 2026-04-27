@@ -11,7 +11,7 @@ datas += collect_data_files('PyQt5.Qt5', include_py_files=False)
 
 # Kalici ayar dosyasi: build ciktisina kopyalanir, exe ile ayni klasorde
 import os as _os
-_cfg = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'tw_config.json')
+_cfg = _os.path.join(SPECPATH, 'tw_config.json')
 if _os.path.isfile(_cfg):
     datas += [(_cfg, '.')]
 
