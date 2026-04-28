@@ -8780,6 +8780,42 @@ class TribalWarsBot(QMainWindow):
     def _farm_round_mode_changed(self, index):
         self.farm_round_wait_time.setEnabled(index == 0)
 
+    def _farm_is_sabit_round_wait(self) -> bool:
+        """True = tur arası «Sabit süre» (combo ilk seçenek)."""
+        cb = getattr(self, "farm_round_wait_mode", None)
+        return cb is None or cb.currentIndex() == 0
+
+    def _farm_clear_for_new_round(self) -> None:
+        """Yeni tur: durum sütununu temizle (kara liste hariç), sayaçları sıfırla."""
+        dark = getattr(self, "_dark_mode", False)
+        fg = QColor("#ffffff" if dark else "#000000")
+        for i in range(self.map_barb_table.topLevelItemCount()):
+            it = self.map_barb_table.topLevelItem(i)
+            if not it or it.text(4) == "⛔ Kara liste":
+                continue
+            it.setText(4, "")
+            it.setForeground(4, fg)
+        self._farm_barb_index = 0
+        self._farm_sent_count = 0
+        self._farm_update_labels()
+
+    def _farm_finish_round_sabit_sure(self, reason: str) -> None:
+        """Sabit süre modu: tur biter, sabit süre beklenir; yeni turda liste başından."""
+        import time
+        self._farm_clear_for_new_round()
+        self._farm_round_return_times.clear()
+        wait_sec = self.farm_round_wait_time.value()
+        self._farm_round_wait_until = time.time() + wait_sec
+        self._farm_round_waiting = True
+        self._farm_last_send = 0
+        mins, secs = divmod(wait_sec, 60)
+        self.farm_status_label.setText(f"Durum: Tur bitti, {mins}dk {secs}sn bekleniyor...")
+        self.farm_status_label.setStyleSheet("font-size: 10px; color: #2d5a9e;")
+        self._add_log(
+            "FARM", "info",
+            f"⏸ {reason} — {mins}dk {secs}sn sabit bekleme; yeni tur liste başından",
+        )
+
     def _farm_record_return_time(self, tx, ty, troops):
         """Başarılı farm saldırısının tahmini dönüş zamanını kaydet."""
         import time, math
@@ -8917,6 +8953,12 @@ class TribalWarsBot(QMainWindow):
             self.farm_status_label.setStyleSheet("font-size: 10px; color: #cc2222;")
             return
 
+        # Sabit süre: köyde şablon için asker kalmadıysa kalan satırlara denemeden turu kapat
+        if self._farm_is_sabit_round_wait() and not self._farm_has_enough_troops(troops):
+            self._farm_finish_round_sabit_sure(
+                "Yetersiz asker — kalan köyler bu turda atlanıyor")
+            return
+
         # Sıradaki barbar köyü bul (mesafe limiti dahilinde, henüz gönderilmemiş)
         max_dist = self.farm_max_dist.value()
         target = None
@@ -8971,26 +9013,12 @@ class TribalWarsBot(QMainWindow):
             checked += 1
 
         if not target:
-            # Tüm köyler gönderildi — tabloyu sıfırla
-            for i in range(total):
-                it = self.map_barb_table.topLevelItem(i)
-                if it:
-                    it.setText(4, "")
-                    it.setForeground(4, QColor("#000000"))
-            self._farm_barb_index = 0
-            self._farm_sent_count = 0
-            self._farm_update_labels()
-
             mode = self.farm_round_wait_mode.currentIndex()
             if mode == 0:
-                wait_sec = self.farm_round_wait_time.value()
-                self._farm_round_wait_until = time.time() + wait_sec
-                self._farm_round_waiting = True
-                mins, secs = divmod(wait_sec, 60)
-                self.farm_status_label.setText(f"Durum: Tur bitti, {mins}dk {secs}sn bekleniyor...")
-                self.farm_status_label.setStyleSheet("font-size: 10px; color: #2d5a9e;")
-                self._add_log("FARM", "info", f"⏸ Tur tamamlandı, {mins}dk {secs}sn bekleniyor")
+                self._farm_finish_round_sabit_sure(
+                    "Tur tamamlandı (tüm uygun köylere gönderildi)")
             else:
+                self._farm_clear_for_new_round()
                 self._farm_round_waiting = True
                 if self._farm_round_return_times:
                     nearest = min(self._farm_round_return_times)
@@ -9008,7 +9036,7 @@ class TribalWarsBot(QMainWindow):
                     self.farm_status_label.setText(f"Durum: Dönüş verisi yok, {fallback}sn bekleniyor...")
                     self.farm_status_label.setStyleSheet("font-size: 10px; color: #cc8800;")
                     self._add_log("FARM", "warn", f"⏸ Dönüş verisi yok, {fallback}sn bekleniyor")
-                self._farm_round_return_times = []
+                self._farm_round_return_times.clear()
             return
 
         # Saldırı gönder
@@ -9156,8 +9184,11 @@ class TribalWarsBot(QMainWindow):
                 self._farm_sending = False
                 self._farm_barb_index = max(0, self._farm_barb_index - 1)
 
-                # Rally point'ten gerçek dönüş zamanlarını çek
-                self._farm_fetch_return_times()
+                if self._farm_is_sabit_round_wait():
+                    self._farm_finish_round_sabit_sure(
+                        "Asker yetersiz / onay alınamadı — tur sonu")
+                else:
+                    self._farm_fetch_return_times()
 
             elif result_str.startswith("ERROR"):
                 error = result_str.replace("ERROR|", "")
