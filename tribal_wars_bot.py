@@ -7838,7 +7838,10 @@ class TribalWarsBot(QMainWindow):
         self.map_barb_radius.setRange(1, 999)
         self.map_barb_radius.setValue(20)
         self.map_barb_radius.setFixedWidth(60)
-        self.map_barb_radius.setToolTip("Bu mesafeye (birim) kadar olan barbar köyleri listelenir")
+        self.map_barb_radius.setToolTip(
+            "Merkeze en fazla bu kadar kare uzaklıktaki barbarlar listelenir (satır sayısı değil); "
+            "daha uzağı görmek için değeri artırın."
+        )
         barb_filter_row.addWidget(self.map_barb_radius)
         barb_filter_btn = QPushButton("Filtrele")
         barb_filter_btn.setFixedWidth(70)
@@ -8118,6 +8121,7 @@ class TribalWarsBot(QMainWindow):
         self._farm_round_return_times = []
         # (x, y) -> beklenen_dönüş_timestamp; tablo yenilenince durumu korur
         self._farm_active_coords: dict = {}
+        self._farm_report_scan_blocking_farm = False
 
         # Harita verisi
         self._map_villages = []
@@ -8408,7 +8412,7 @@ class TribalWarsBot(QMainWindow):
         self.map_barb_table.clear()
         active = getattr(self, "_farm_active_coords", {})
         _now2 = _brt2.time()
-        for b in barb_list[:200]:
+        for b in barb_list[:500]:
             coord = f"({b['x']}|{b['y']})"
             coord_key = (int(b["x"]), int(b["y"]))
             exp = active.get(coord_key, 0)
@@ -8534,7 +8538,7 @@ class TribalWarsBot(QMainWindow):
         self.map_barb_table.clear()
         active = getattr(self, "_farm_active_coords", {})
         _now_brt = _brt.time()
-        for b in barb_list[:100]:  # İlk 100
+        for b in barb_list[:500]:
             coord = f"({b['x']}|{b['y']})"
             coord_key = (int(b["x"]), int(b["y"]))
             exp = active.get(coord_key, 0)
@@ -8871,6 +8875,7 @@ class TribalWarsBot(QMainWindow):
         self.farm_stop_btn.setEnabled(False)
         self.farm_status_label.setText("Durum: Durduruldu")
         self.farm_status_label.setStyleSheet("font-size: 10px; color: #cc4444;")
+        self._farm_report_scan_blocking_farm = False
         self._add_log("FARM", "warn", "⏹ Farm sirkülasyonu durduruldu")
 
     def _farm_template(self, template):
@@ -8937,6 +8942,13 @@ class TribalWarsBot(QMainWindow):
                 self.farm_status_label.setText("Durum: Yeni tur başlıyor...")
                 self.farm_status_label.setStyleSheet("font-size: 10px; color: #228822;")
                 self._add_log("FARM", "info", "🔄 Yeni farm turu başlıyor")
+                self._farm_begin_pre_round_report_scan()
+                return
+
+        if getattr(self, "_farm_report_scan_blocking_farm", False):
+            self.farm_status_label.setText("Durum: Raporlar taranıyor (kara liste)...")
+            self.farm_status_label.setStyleSheet("font-size: 10px; color: #2d5a9e;")
+            return
 
         # Aralık kontrolü
         interval = self.farm_interval.value()
@@ -9341,121 +9353,237 @@ class TribalWarsBot(QMainWindow):
                 item.setText(4, "⛔ Kara liste")
                 item.setForeground(4, fg)
 
-    def _farm_check_reports(self):
-        """Saldırı raporlarını tarayıp kayıplı barbar köyleri kara listeye ekle."""
+    def _farm_remove_blacklisted_from_barb_table(self):
+        """Kara listedeki koordinatların satırlarını barbar tablosundan kaldır."""
+        i = 0
+        while i < self.map_barb_table.topLevelItemCount():
+            item = self.map_barb_table.topLevelItem(i)
+            if not item:
+                i += 1
+                continue
+            coord_key = item.text(0).strip("()").replace(" ", "")
+            if coord_key in self._farm_blacklist:
+                vd = item.data(0, Qt.UserRole)
+                if isinstance(vd, dict):
+                    k = (int(vd.get("x", 0)), int(vd.get("y", 0)))
+                    self._farm_active_coords.pop(k, None)
+                self.map_barb_table.takeTopLevelItem(i)
+            else:
+                i += 1
+
+    def _farm_begin_pre_round_report_scan(self):
+        """Yeni farm turu öncesi: raporlardan kara listeyi güncelle, tabloyu temizle."""
         if not self.browser:
             return
+        self._farm_report_scan_blocking_farm = True
+        self.farm_status_label.setText("Durum: Yeni tur — raporlar taranıyor (kara liste)...")
+        self.farm_status_label.setStyleSheet("font-size: 10px; color: #2d5a9e;")
 
-        self.farm_check_reports_btn.setEnabled(False)
-        self.farm_check_reports_btn.setText("Taranıyor...")
-        self._add_log("FARM", "info", "Saldırı raporları taranıyor...")
+        def _done():
+            self._farm_report_scan_blocking_farm = False
+            self._farm_update_labels()
 
-        village_id = self._game_data.get("village", {}).get("id", "")
+        self._farm_run_report_blacklist_scan(ui_feedback=False, remove_rows=True, on_done=_done)
 
-        scan_js = f"""
-        (function() {{
-            function rowIsLossReport(row) {{
+    def _farm_run_report_blacklist_scan(
+        self, ui_feedback: bool = True, remove_rows: bool = True, on_done=None
+    ):
+        """Saldırı raporlarını (en fazla 3 sayfa) tarayıp kara listeyi güncelle."""
+        if not self.browser:
+            if callable(on_done):
+                on_done()
+            return
+
+        if ui_feedback:
+            self.farm_check_reports_btn.setEnabled(False)
+            self.farm_check_reports_btn.setText("Taranıyor...")
+        self._add_log("FARM", "info", "Saldırı raporları taranıyor (en fazla 3 sayfa)...")
+
+        village_id = str(self._game_data.get("village", {}).get("id", "") or "")
+        if not village_id:
+            self._add_log("FARM", "error", "Aktif köy ID yok; rapor taranamıyor.")
+            if ui_feedback:
+                self.farm_check_reports_btn.setEnabled(True)
+                self.farm_check_reports_btn.setText("Raporları Kontrol Et")
+            if callable(on_done):
+                on_done()
+            return
+
+        vid_j = json.dumps(village_id)
+
+        scan_js = (
+            """
+(function() {
+            function hasGreenVictory(row) {
                 var imgs = row.querySelectorAll('img[src]');
-                for (var i = 0; i < imgs.length; i++) {{
+                for (var i = 0; i < imgs.length; i++) {
+                    var s = (imgs[i].getAttribute('src') || '').toLowerCase();
+                    if (s.indexOf('dots/green') >= 0) return true;
+                    if (s.indexOf('dot') >= 0 && s.indexOf('green') >= 0) return true;
+                    var dt = (imgs[i].getAttribute('data-title') || '').toLowerCase();
+                    if (dt.indexOf('tam zafer') >= 0 || dt.indexOf('full victory') >= 0) return true;
+                }
+                return false;
+            }
+            function rowIsLossReport(row) {
+                if (hasGreenVictory(row)) return false;
+                var imgs = row.querySelectorAll('img[src]');
+                for (var i = 0; i < imgs.length; i++) {
                     var s = (imgs[i].getAttribute('src') || '').toLowerCase();
                     if (s.indexOf('dot') >= 0 && (s.indexOf('red') >= 0 || s.indexOf('yellow') >= 0))
                         return true;
                     if (s.indexOf('dots/red') >= 0 || s.indexOf('dots/yellow') >= 0) return true;
-                    if (s.indexOf('report') >= 0 && s.indexOf('red') >= 0) return true;
-                }}
+                }
                 return false;
-            }}
-            function coordPairsFromText(text) {{
-                var re = /\\(\\s*(\\d{{1,5}})\\s*\\|\\s*(\\d{{1,5}})\\s*\\)/g;
+            }
+            function coordPairsFromText(text) {
+                var re = /\\(\\s*(\\d{1,5})\\s*\\|\\s*(\\d{1,5})\\s*\\)/g;
                 var pairs = [], m;
-                while ((m = re.exec(text)) !== null) {{
+                while ((m = re.exec(text)) !== null) {
                     pairs.push(m[1] + '|' + m[2]);
-                }}
+                }
                 return pairs;
-            }}
-            function coordFromLinks(row) {{
+            }
+            function coordFromLinks(row) {
                 var as = row.querySelectorAll('a[href]');
                 var found = [];
-                for (var i = 0; i < as.length; i++) {{
+                for (var i = 0; i < as.length; i++) {
                     var h = (as[i].getAttribute('href') || '').replace(/&amp;/g, '&');
                     var m = h.match(/[?&]x=(\\d+)&y=(\\d+)/);
                     if (m) found.push(m[1] + '|' + m[2]);
-                }}
+                }
                 return found;
-            }}
-            function pickTargetCoord(pairs, linkPairs) {{
+            }
+            function pickTargetCoord(pairs, linkPairs) {
                 var all = pairs.concat(linkPairs);
                 if (all.length === 0) return null;
                 if (all.length >= 2) return all[all.length - 1];
                 return all[0];
-            }}
-
-            return fetch('/game.php?village={village_id}&screen=report&mode=attack', {{credentials: 'same-origin'}})
-            .then(function(r) {{ return r.text(); }})
-            .then(function(html) {{
+            }
+            function pickFarmBlacklistCoord(text, linkPairs) {
+                var m = text.match(/Barbar[\\s\\S]{0,180}?\\(\\s*(\\d{1,5})\\s*\\|\\s*(\\d{1,5})\\s*\\)/i);
+                if (m) return m[1] + '|' + m[2];
+                m = text.match(/barbarian[\\s\\S]{0,180}?\\(\\s*(\\d{1,5})\\s*\\|\\s*(\\d{1,5})\\s*\\)/i);
+                if (m) return m[1] + '|' + m[2];
+                var pairs = coordPairsFromText(text);
+                if (pairs.length >= 2) return pairs[0];
+                return pickTargetCoord(pairs, linkPairs);
+            }
+            function getNextFromFromHtml(html) {
+                var re = /href="([^"]*screen=report[^"]*from=(\\d+)[^"]*)"/gi;
+                var last = null;
+                var m;
+                while ((m = re.exec(html)) !== null) last = m[2];
+                return last;
+            }
+            function parseRowsFromHtml(html) {
                 var doc = new DOMParser().parseFromString(html, 'text/html');
                 var rows = doc.querySelectorAll(
                     '#report_list tr, table#report_list tbody tr, #report_list > tbody > tr, .report-list tr'
                 );
+                var seen = {};
                 var blacklist = [];
-                var seen = {{}};
-
-                rows.forEach(function(row) {{
+                rows.forEach(function(row) {
                     if (!rowIsLossReport(row)) return;
                     var text = row.textContent || '';
-                    var pairs = coordPairsFromText(text);
                     var linkPairs = coordFromLinks(row);
-                    var target = pickTargetCoord(pairs, linkPairs);
-                    if (target && !seen[target]) {{
+                    var target = pickFarmBlacklistCoord(text, linkPairs);
+                    if (target && !seen[target]) {
                         seen[target] = true;
                         blacklist.push(target);
-                    }}
-                }});
-
-                return JSON.stringify({{status: 'OK', blacklist: blacklist, rowCount: rows.length}});
-            }})
-            .catch(function(err) {{
-                return JSON.stringify({{status: 'ERROR', message: String(err)}});
-            }});
-        }})();
-        """
+                    }
+                });
+                return { blacklist: blacklist, rowCount: rows.length, nextFrom: getNextFromFromHtml(html) };
+            }
+            var villageId = """
+            + vid_j
+            + r""";
+            var base = '/game.php?village=' + villageId + '&screen=report&mode=attack';
+            function fetchChain(fromVal, depth, accSeen, accList) {
+                var url = base + (fromVal ? '&from=' + encodeURIComponent(fromVal) : '');
+                return fetch(url, {credentials: 'same-origin'})
+                    .then(function(r) { return r.text(); })
+                    .then(function(html) {
+                        var r = parseRowsFromHtml(html);
+                        r.blacklist.forEach(function(c) {
+                            if (!accSeen[c]) { accSeen[c] = 1; accList.push(c); }
+                        });
+                        var nf = r.nextFrom;
+                        if (depth >= 2 || !nf || (fromVal !== '' && String(nf) === String(fromVal))) {
+                            return JSON.stringify({
+                                status: 'OK',
+                                blacklist: accList,
+                                rowCount: r.rowCount,
+                                pages: depth + 1
+                            });
+                        }
+                        return fetchChain(nf, depth + 1, accSeen, accList);
+                    });
+            }
+            return fetchChain('', 0, {}, []).catch(function(err) {
+                return JSON.stringify({ status: 'ERROR', message: String(err) });
+            });
+        })();
+"""
+        )
 
         def on_scan(result):
-            self.farm_check_reports_btn.setEnabled(True)
-            self.farm_check_reports_btn.setText("Raporları Kontrol Et")
-
-            if not result:
-                self._add_log("FARM", "error", "Rapor tarama başarısız.")
-                return
-
             try:
-                data = json.loads(str(result))
-            except Exception:
-                self._add_log("FARM", "error", "Rapor verisi parse edilemedi.")
-                return
+                if ui_feedback:
+                    self.farm_check_reports_btn.setEnabled(True)
+                    self.farm_check_reports_btn.setText("Raporları Kontrol Et")
 
-            if data.get("status") == "ERROR":
-                self._add_log("FARM", "error", f"Hata: {data.get('message', '?')}")
-                return
+                if not result:
+                    self._add_log("FARM", "error", "Rapor tarama başarısız.")
+                    return
 
-            new_coords = data.get("blacklist", [])
-            added = 0
-            for coord in new_coords:
-                if coord not in self._farm_blacklist:
-                    self._farm_add_to_blacklist(coord)
-                    added += 1
+                try:
+                    data = json.loads(str(result))
+                except Exception:
+                    self._add_log("FARM", "error", "Rapor verisi parse edilemedi.")
+                    return
 
-            self._farm_sync_blacklist_to_barb_table()
-            rows_scanned = data.get("rowCount", "?")
-            if len(new_coords) == 0:
-                self._add_log("FARM", "warn",
-                    f"Rapor taraması: kayıplı (kırmızı/sarı) satırda hedef koordinat bulunamadı "
-                    f"(sayfada ~{rows_scanned} satır). İlk saldırı raporu sayfasında olduğunuzdan emin olun.")
-            else:
-                self._add_log("FARM", "warn",
-                    f"Rapor taraması: {len(new_coords)} hedef, {added} yeni kara listeye eklendi")
+                if data.get("status") == "ERROR":
+                    self._add_log("FARM", "error", f"Hata: {data.get('message', '?')}")
+                    return
+
+                new_coords = data.get("blacklist", [])
+                added = 0
+                for coord in new_coords:
+                    if coord not in self._farm_blacklist:
+                        self._farm_add_to_blacklist(coord)
+                        added += 1
+
+                if remove_rows:
+                    self._farm_remove_blacklisted_from_barb_table()
+                else:
+                    self._farm_sync_blacklist_to_barb_table()
+
+                pages = data.get("pages", "?")
+                rows_scanned = data.get("rowCount", "?")
+                if len(new_coords) == 0:
+                    self._add_log(
+                        "FARM",
+                        "warn",
+                        f"Rapor taraması ({pages} sayfa): kayıplı satırda hedef koordinat bulunamadı "
+                        f"(son sayfa ~{rows_scanned} satır). mode=attack ilk sayfada olduğunuzdan emin olun.",
+                    )
+                else:
+                    self._add_log(
+                        "FARM",
+                        "warn",
+                        f"Rapor taraması ({pages} sayfa): {len(new_coords)} hedef, {added} yeni kara listeye; "
+                        f"barbar tablosu güncellendi.",
+                    )
+            finally:
+                if callable(on_done):
+                    on_done()
 
         self.browser.page().runJavaScript(scan_js, on_scan)
+
+    def _farm_check_reports(self):
+        """Saldırı raporlarını tarayıp kayıplı barbar köyleri kara listeye ekle (manuel)."""
+        self._farm_run_report_blacklist_scan(ui_feedback=True, remove_rows=True, on_done=None)
 
     # ── TEMİZLİK (SCAVENGING) SEKMESİ ─────────
 
