@@ -9297,6 +9297,19 @@ class TribalWarsBot(QMainWindow):
         self._farm_blacklist.add(coord_str)
         self.farm_blacklist_label.setText(f"Kara liste: {len(self._farm_blacklist)} köy")
 
+    def _farm_sync_blacklist_to_barb_table(self):
+        """Barbar tablosunda kara listedeki satırları işaretle."""
+        dark = getattr(self, "_dark_mode", False)
+        fg = QColor("#ff8888" if dark else "#cc2222")
+        for i in range(self.map_barb_table.topLevelItemCount()):
+            item = self.map_barb_table.topLevelItem(i)
+            if not item:
+                continue
+            coord_key = item.text(0).strip("()").replace(" ", "")
+            if coord_key in self._farm_blacklist:
+                item.setText(4, "⛔ Kara liste")
+                item.setForeground(4, fg)
+
     def _farm_check_reports(self):
         """Saldırı raporlarını tarayıp kayıplı barbar köyleri kara listeye ekle."""
         if not self.browser:
@@ -9310,29 +9323,65 @@ class TribalWarsBot(QMainWindow):
 
         scan_js = f"""
         (function() {{
+            function rowIsLossReport(row) {{
+                var imgs = row.querySelectorAll('img[src]');
+                for (var i = 0; i < imgs.length; i++) {{
+                    var s = (imgs[i].getAttribute('src') || '').toLowerCase();
+                    if (s.indexOf('dot') >= 0 && (s.indexOf('red') >= 0 || s.indexOf('yellow') >= 0))
+                        return true;
+                    if (s.indexOf('dots/red') >= 0 || s.indexOf('dots/yellow') >= 0) return true;
+                    if (s.indexOf('report') >= 0 && s.indexOf('red') >= 0) return true;
+                }}
+                return false;
+            }}
+            function coordPairsFromText(text) {{
+                var re = /\\(\\s*(\\d{{1,5}})\\s*\\|\\s*(\\d{{1,5}})\\s*\\)/g;
+                var pairs = [], m;
+                while ((m = re.exec(text)) !== null) {{
+                    pairs.push(m[1] + '|' + m[2]);
+                }}
+                return pairs;
+            }}
+            function coordFromLinks(row) {{
+                var as = row.querySelectorAll('a[href]');
+                var found = [];
+                for (var i = 0; i < as.length; i++) {{
+                    var h = (as[i].getAttribute('href') || '').replace(/&amp;/g, '&');
+                    var m = h.match(/[?&]x=(\\d+)&y=(\\d+)/);
+                    if (m) found.push(m[1] + '|' + m[2]);
+                }}
+                return found;
+            }}
+            function pickTargetCoord(pairs, linkPairs) {{
+                var all = pairs.concat(linkPairs);
+                if (all.length === 0) return null;
+                if (all.length >= 2) return all[all.length - 1];
+                return all[0];
+            }}
+
             return fetch('/game.php?village={village_id}&screen=report&mode=attack', {{credentials: 'same-origin'}})
             .then(function(r) {{ return r.text(); }})
             .then(function(html) {{
                 var doc = new DOMParser().parseFromString(html, 'text/html');
-                var rows = doc.querySelectorAll('#report_list tr');
+                var rows = doc.querySelectorAll(
+                    '#report_list tr, table#report_list tbody tr, #report_list > tbody > tr, .report-list tr'
+                );
                 var blacklist = [];
+                var seen = {{}};
 
                 rows.forEach(function(row) {{
-                    // Kayipli rapor: kirmizi veya sari nokta
-                    var dot = row.querySelector('img[src*="dots/red"], img[src*="dots/yellow"]');
-                    if (!dot) return;
-
-                    // Rapor satirinin text'inden koordinatlari bul
+                    if (!rowIsLossReport(row)) return;
                     var text = row.textContent || '';
-                    var coords = text.match(/\\(\\d{{3}}\\|\\d{{3}}\\)/g);
-                    if (coords && coords.length >= 2) {{
-                        // Ikinci koordinat = hedef
-                        var target = coords[1].replace('(', '').replace(')', '');
+                    var pairs = coordPairsFromText(text);
+                    var linkPairs = coordFromLinks(row);
+                    var target = pickTargetCoord(pairs, linkPairs);
+                    if (target && !seen[target]) {{
+                        seen[target] = true;
                         blacklist.push(target);
                     }}
                 }});
 
-                return JSON.stringify({{status: 'OK', blacklist: blacklist}});
+                return JSON.stringify({{status: 'OK', blacklist: blacklist, rowCount: rows.length}});
             }})
             .catch(function(err) {{
                 return JSON.stringify({{status: 'ERROR', message: String(err)}});
@@ -9350,7 +9399,7 @@ class TribalWarsBot(QMainWindow):
 
             try:
                 data = json.loads(str(result))
-            except:
+            except Exception:
                 self._add_log("FARM", "error", "Rapor verisi parse edilemedi.")
                 return
 
@@ -9365,8 +9414,15 @@ class TribalWarsBot(QMainWindow):
                     self._farm_add_to_blacklist(coord)
                     added += 1
 
-            self._add_log("FARM", "warn",
-                f"Rapor taraması: {len(new_coords)} kayıplı rapor, {added} yeni köy kara listeye eklendi")
+            self._farm_sync_blacklist_to_barb_table()
+            rows_scanned = data.get("rowCount", "?")
+            if len(new_coords) == 0:
+                self._add_log("FARM", "warn",
+                    f"Rapor taraması: kayıplı (kırmızı/sarı) satırda hedef koordinat bulunamadı "
+                    f"(sayfada ~{rows_scanned} satır). İlk saldırı raporu sayfasında olduğunuzdan emin olun.")
+            else:
+                self._add_log("FARM", "warn",
+                    f"Rapor taraması: {len(new_coords)} hedef, {added} yeni kara listeye eklendi")
 
         self.browser.page().runJavaScript(scan_js, on_scan)
 
