@@ -75,6 +75,7 @@ import urllib.request
 import threading
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote, urlencode
+
 from PyQt5.QtCore import Qt, QUrl, QTimer, QTime, QDate, QSize, pyqtSignal, QObject, QSettings, pyqtSlot
 from PyQt5.QtGui import QFont, QColor, QBrush, QPainter, QPen, QPixmap, QIcon
 from PyQt5.QtWidgets import (
@@ -2733,6 +2734,12 @@ class TribalWarsBot(QMainWindow):
     SA_DISPATCH_MAX_BATCH = 5
     # Çok dalgada ardışık satırların gönderim zamanı farkı (oyun yaklaşık 200 ms kullanır; onay formu alanları + kuyruk).
     SA_DISPATCH_WAVE_GAP_MS = 200
+
+    # Harita barbar tablosu: yoğun bölgelerde en yakın N satır (eski 500, ~20 karede doluyordu)
+    MAP_BARB_LIST_MAX_ROWS = 4000
+
+    # InnoGames "çok sık istek" uyarısı: JS poll aralığı (runJavaScript)
+    TW_JS_POLL_MS = 520
 
     # Kami köyü eşikleri (ofansif ağırlıklı nüfus — _sa_weighted_off_pop).
     SA_KAMI_OFF_4_4 = 18000
@@ -7695,6 +7702,9 @@ class TribalWarsBot(QMainWindow):
         self.map_fetch_diplomacy_btn.setCursor(Qt.PointingHandCursor)
         self.map_fetch_diplomacy_btn.clicked.connect(self._map_fetch_diplomacy)
         ctrl_row.addWidget(self.map_fetch_diplomacy_btn)
+        self._map_diplomacy_defer = QTimer(self)
+        self._map_diplomacy_defer.setSingleShot(True)
+        self._map_diplomacy_defer.timeout.connect(self._map_fetch_diplomacy)
 
         self.map_center_me_btn = QPushButton("📍 Köyüme Git")
         self.map_center_me_btn.setCursor(Qt.PointingHandCursor)
@@ -7837,11 +7847,13 @@ class TribalWarsBot(QMainWindow):
         self.map_barb_radius = QSpinBox()
         self.map_barb_radius.setRange(1, 999)
         self.map_barb_radius.setValue(20)
-        self.map_barb_radius.setFixedWidth(60)
+        self.map_barb_radius.setFixedWidth(72)
         self.map_barb_radius.setToolTip(
-            "Merkeze en fazla bu kadar kare uzaklıktaki barbarlar listelenir (satır sayısı değil); "
-            "daha uzağı görmek için değeri artırın."
+            "Merkeze en fazla bu kadar kare uzaklıktaki barbarlar listelenir (satır sayısı değil). "
+            "Yoğun bölgelerde çok köy varsa en yakınlar önce listelenir; tablo en fazla "
+            f"{self.MAP_BARB_LIST_MAX_ROWS} satır gösterir."
         )
+        self.map_barb_radius.valueChanged.connect(self._map_on_barb_radius_changed)
         barb_filter_row.addWidget(self.map_barb_radius)
         barb_filter_btn = QPushButton("Filtrele")
         barb_filter_btn.setFixedWidth(70)
@@ -7949,7 +7961,7 @@ class TribalWarsBot(QMainWindow):
         farm_row1.addSpacing(15)
         farm_row1.addWidget(QLabel("Max mesafe:"))
         self.farm_max_dist = QSpinBox()
-        self.farm_max_dist.setRange(1, 100)
+        self.farm_max_dist.setRange(1, 999)
         self.farm_max_dist.setValue(20)
         self.farm_max_dist.setFixedWidth(55)
         farm_row1.addWidget(self.farm_max_dist)
@@ -8093,6 +8105,9 @@ class TribalWarsBot(QMainWindow):
         self.farm_round_wait_time.setRange(10, 36000)
         self.farm_round_wait_time.setValue(300)
         self.farm_round_wait_time.setSuffix(" sn")
+        self.farm_round_wait_time.setToolTip(
+            "Tur arası gerçek bekleme: bu süre ±60 saniye rastgele; en az 10 saniye."
+        )
         self.farm_round_wait_time.setFixedWidth(90)
         farm_row5.addWidget(self.farm_round_wait_time)
 
@@ -8334,7 +8349,7 @@ class TribalWarsBot(QMainWindow):
 
     def _map_poll_load(self, attempt):
         """Harita verisi yüklenene kadar polling yap."""
-        if attempt > 100:  # 100 × 200ms = 20sn
+        if attempt > 50:  # 50 × 400ms ≈ 20sn
             self.map_load_btn.setEnabled(True)
             self.map_load_btn.setText("🗺️ Haritayı Yükle")
             self._add_log("HARİTA", "error", "Zaman aşımı.")
@@ -8346,7 +8361,7 @@ class TribalWarsBot(QMainWindow):
             result_str = str(result) if result else "WAITING"
 
             if result_str in ("WAITING", "LOADING"):
-                QTimer.singleShot(200, lambda: self._map_poll_load(attempt + 1))
+                QTimer.singleShot(self.TW_JS_POLL_MS, lambda: self._map_poll_load(attempt + 1))
                 return
 
             self.map_load_btn.setEnabled(True)
@@ -8377,12 +8392,18 @@ class TribalWarsBot(QMainWindow):
                     f"✅ {len(self._map_villages)} köy + {player_count} oyuncu yüklendi!")
 
             self._map_refresh()
-            self._map_fetch_diplomacy()
+            self._map_diplomacy_defer.stop()
+            self._map_diplomacy_defer.start(5000)
 
             # Temizle
             self.browser.page().runJavaScript("window.__tw_map_data = null;")
 
         self.browser.page().runJavaScript(check_js, on_poll)
+
+    def _map_on_barb_radius_changed(self, _value: int = 0) -> None:
+        """Maks mesafe değişince tabloyu yenile (harita verisi yüklüyse)."""
+        if getattr(self, "_map_data_loaded", False):
+            self._map_refresh_barb_table()
 
     def _map_refresh_barb_table(self):
         """Sadece barbar tablosunu yenile (haritayı yeniden çizmeden)."""
@@ -8412,7 +8433,7 @@ class TribalWarsBot(QMainWindow):
         self.map_barb_table.clear()
         active = getattr(self, "_farm_active_coords", {})
         _now2 = _brt2.time()
-        for b in barb_list[:500]:
+        for b in barb_list[: self.MAP_BARB_LIST_MAX_ROWS]:
             coord = f"({b['x']}|{b['y']})"
             coord_key = (int(b["x"]), int(b["y"]))
             exp = active.get(coord_key, 0)
@@ -8538,7 +8559,7 @@ class TribalWarsBot(QMainWindow):
         self.map_barb_table.clear()
         active = getattr(self, "_farm_active_coords", {})
         _now_brt = _brt.time()
-        for b in barb_list[:500]:
+        for b in barb_list[: self.MAP_BARB_LIST_MAX_ROWS]:
             coord = f"({b['x']}|{b['y']})"
             coord_key = (int(b["x"]), int(b["y"]))
             exp = active.get(coord_key, 0)
@@ -8804,20 +8825,22 @@ class TribalWarsBot(QMainWindow):
         self._farm_update_labels()
 
     def _farm_finish_round_sabit_sure(self, reason: str) -> None:
-        """Sabit süre modu: tur biter, sabit süre beklenir; yeni turda liste başından."""
+        """Sabit süre modu: tur biter; bekleme = kullanıcı süresi + [-60, +60] sn (en az 10 sn)."""
         import time
         self._farm_clear_for_new_round()
         self._farm_round_return_times.clear()
-        wait_sec = self.farm_round_wait_time.value()
+        base = int(self.farm_round_wait_time.value())
+        wait_sec = max(10, base + random.randint(-60, 60))
         self._farm_round_wait_until = time.time() + wait_sec
         self._farm_round_waiting = True
         self._farm_last_send = 0
         mins, secs = divmod(wait_sec, 60)
-        self.farm_status_label.setText(f"Durum: Tur bitti, {mins}dk {secs}sn bekleniyor...")
+        self.farm_status_label.setText(
+            f"Durum: Tur bitti, {mins}dk {secs}sn bekleniyor (~±1 dk rastgele)...")
         self.farm_status_label.setStyleSheet("font-size: 10px; color: #2d5a9e;")
         self._add_log(
             "FARM", "info",
-            f"⏸ {reason} — {mins}dk {secs}sn sabit bekleme; yeni tur liste başından",
+            f"⏸ {reason} — {mins}dk {secs}sn bekleme (taban {base}s, ±60s); yeni tur liste başından",
         )
 
     def _farm_record_return_time(self, tx, ty, troops):
@@ -9007,11 +9030,11 @@ class TribalWarsBot(QMainWindow):
                         checked += 1
                         continue
                     _vd = item.data(0, Qt.UserRole)
-                    if _vd:
+                    if _vd and not self._farm_is_sabit_round_wait():
                         _key = (int(_vd.get("x", 0)), int(_vd.get("y", 0)))
                         import time as _fat
                         if _fat.time() < self._farm_active_coords.get(_key, 0):
-                            # Henüz dönmedi — atla, durumu güncelle
+                            # Henüz dönmedi — atla, durumu güncelle (yalnızca «En yakın dönüş»)
                             item.setText(4, "✓ Gönderildi")
                             item.setForeground(4, QColor("#228822"))
                             idx += 1
@@ -9187,7 +9210,8 @@ class TribalWarsBot(QMainWindow):
                 self.browser.page().runJavaScript(
                     f"if(window.__tw_bot_results) delete window.__tw_bot_results['{cmd_id}'];")
 
-                self._farm_record_return_time(tx, ty, troops)
+                if not self._farm_is_sabit_round_wait():
+                    self._farm_record_return_time(tx, ty, troops)
 
             elif result_str.startswith("NO_TROOPS"):
                 msg = result_str.replace("NO_TROOPS|", "")
@@ -9213,7 +9237,7 @@ class TribalWarsBot(QMainWindow):
                 self.farm_status_label.setStyleSheet("font-size: 10px; color: #cc2222;")
 
             else:
-                QTimer.singleShot(200, lambda: self._farm_poll_result(
+                QTimer.singleShot(self.TW_JS_POLL_MS, lambda: self._farm_poll_result(
                     table_item, cmd_id, tx, ty, troops, attempt + 1))
 
         self.browser.page().runJavaScript(check_js, on_poll)
@@ -9290,7 +9314,7 @@ class TribalWarsBot(QMainWindow):
             result_str = str(result) if result else "WAITING"
 
             if result_str in ("WAITING", "LOADING"):
-                QTimer.singleShot(200, lambda: self._farm_poll_returns(attempt + 1))
+                QTimer.singleShot(self.TW_JS_POLL_MS, lambda: self._farm_poll_returns(attempt + 1))
                 return
 
             try:
@@ -9517,69 +9541,134 @@ class TribalWarsBot(QMainWindow):
                                 pages: depth + 1
                             });
                         }
-                        return fetchChain(nf, depth + 1, accSeen, accList);
+                        return new Promise(function(resolve, reject) {
+                            setTimeout(function() {
+                                try {
+                                    resolve(fetchChain(nf, depth + 1, accSeen, accList));
+                                } catch (e) { reject(e); }
+                            }, 900);
+                        });
                     });
             }
-            return fetchChain('', 0, {}, []).catch(function(err) {
-                return JSON.stringify({ status: 'ERROR', message: String(err) });
+            window.__tw_farm_report_fetch = 'LOADING';
+            fetchChain('', 0, {}, []).then(function(s) {
+                window.__tw_farm_report_fetch = s;
+            }).catch(function(err) {
+                window.__tw_farm_report_fetch = JSON.stringify({ status: 'ERROR', message: String(err) });
             });
         })();
 """
         )
 
-        def on_scan(result):
+        self.browser.page().runJavaScript(scan_js)
+        QTimer.singleShot(
+            self.TW_JS_POLL_MS,
+            lambda: self._farm_report_scan_poll(0, village_id, ui_feedback, remove_rows, on_done),
+        )
+
+    def _farm_report_scan_poll(self, attempt, village_id, ui_feedback, remove_rows, on_done):
+        """QWebEngine Promise/runJavaScript uyumsuzluğu: sonucu window.__tw_farm_report_fetch üzerinden oku."""
+        max_attempts = 48
+
+        def finish():
+            if ui_feedback:
+                self.farm_check_reports_btn.setEnabled(True)
+                self.farm_check_reports_btn.setText("Raporları Kontrol Et")
+            if callable(on_done):
+                on_done()
+
+        if attempt >= max_attempts:
+            self._add_log("FARM", "error", "Rapor tarama zaman aşımı (fetch).")
+            self.browser.page().runJavaScript("window.__tw_farm_report_fetch=null;")
+            finish()
+            return
+
+        check_js = (
+            "(function(){ var x = window.__tw_farm_report_fetch; "
+            "if (x === undefined || x === null) return 'WAITING'; return x; })();"
+        )
+
+        def on_poll(result):
+            raw = result
+            if raw is None:
+                QTimer.singleShot(
+                    self.TW_JS_POLL_MS,
+                    lambda: self._farm_report_scan_poll(
+                        attempt + 1, village_id, ui_feedback, remove_rows, on_done
+                    ),
+                )
+                return
+            if isinstance(raw, str):
+                result_str = raw.strip()
+                if result_str in ("WAITING", "LOADING", ""):
+                    QTimer.singleShot(
+                        self.TW_JS_POLL_MS,
+                        lambda: self._farm_report_scan_poll(
+                            attempt + 1, village_id, ui_feedback, remove_rows, on_done
+                        ),
+                    )
+                    return
+
+            self.browser.page().runJavaScript("window.__tw_farm_report_fetch=null;")
             try:
-                if ui_feedback:
-                    self.farm_check_reports_btn.setEnabled(True)
-                    self.farm_check_reports_btn.setText("Raporları Kontrol Et")
-
-                if not result:
-                    self._add_log("FARM", "error", "Rapor tarama başarısız.")
-                    return
-
-                try:
-                    data = json.loads(str(result))
-                except Exception:
-                    self._add_log("FARM", "error", "Rapor verisi parse edilemedi.")
-                    return
-
-                if data.get("status") == "ERROR":
-                    self._add_log("FARM", "error", f"Hata: {data.get('message', '?')}")
-                    return
-
-                new_coords = data.get("blacklist", [])
-                added = 0
-                for coord in new_coords:
-                    if coord not in self._farm_blacklist:
-                        self._farm_add_to_blacklist(coord)
-                        added += 1
-
-                if remove_rows:
-                    self._farm_remove_blacklisted_from_barb_table()
-                else:
-                    self._farm_sync_blacklist_to_barb_table()
-
-                pages = data.get("pages", "?")
-                rows_scanned = data.get("rowCount", "?")
-                if len(new_coords) == 0:
-                    self._add_log(
-                        "FARM",
-                        "warn",
-                        f"Rapor taraması ({pages} sayfa): kayıplı satırda hedef koordinat bulunamadı "
-                        f"(son sayfa ~{rows_scanned} satır). mode=attack ilk sayfada olduğunuzdan emin olun.",
-                    )
-                else:
-                    self._add_log(
-                        "FARM",
-                        "warn",
-                        f"Rapor taraması ({pages} sayfa): {len(new_coords)} hedef, {added} yeni kara listeye; "
-                        f"barbar tablosu güncellendi.",
-                    )
+                self._farm_apply_report_scan_payload(
+                    raw, village_id, ui_feedback, remove_rows
+                )
             finally:
-                if callable(on_done):
-                    on_done()
+                finish()
 
-        self.browser.page().runJavaScript(scan_js, on_scan)
+        self.browser.page().runJavaScript(check_js, on_poll)
+
+    def _farm_apply_report_scan_payload(self, result, village_id, ui_feedback, remove_rows):
+        if ui_feedback:
+            self.farm_check_reports_btn.setEnabled(True)
+            self.farm_check_reports_btn.setText("Raporları Kontrol Et")
+
+        if result is None or (isinstance(result, str) and not result.strip()):
+            self._add_log("FARM", "error", "Rapor tarama başarısız.")
+            return
+
+        if isinstance(result, dict):
+            data = result
+        else:
+            try:
+                data = json.loads(str(result).strip())
+            except Exception:
+                self._add_log("FARM", "error", "Rapor verisi parse edilemedi.")
+                return
+
+        if data.get("status") == "ERROR":
+            self._add_log("FARM", "error", f"Hata: {data.get('message', '?')}")
+            return
+
+        new_coords = data.get("blacklist", [])
+        added = 0
+        for coord in new_coords:
+            if coord not in self._farm_blacklist:
+                self._farm_add_to_blacklist(coord)
+                added += 1
+
+        if remove_rows:
+            self._farm_remove_blacklisted_from_barb_table()
+        else:
+            self._farm_sync_blacklist_to_barb_table()
+
+        pages = data.get("pages", "?")
+        rows_scanned = data.get("rowCount", "?")
+        if len(new_coords) == 0:
+            self._add_log(
+                "FARM",
+                "warn",
+                f"Rapor taraması ({pages} sayfa): kayıplı satırda hedef koordinat bulunamadı "
+                f"(son sayfa ~{rows_scanned} satır). mode=attack ilk sayfada olduğunuzdan emin olun.",
+            )
+        else:
+            self._add_log(
+                "FARM",
+                "warn",
+                f"Rapor taraması ({pages} sayfa): {len(new_coords)} hedef, {added} yeni kara listeye; "
+                f"barbar tablosu güncellendi.",
+            )
 
     def _farm_check_reports(self):
         """Saldırı raporlarını tarayıp kayıplı barbar köyleri kara listeye ekle (manuel)."""
@@ -11918,10 +12007,10 @@ class TribalWarsBot(QMainWindow):
         """
 
         self.browser.page().runJavaScript(fetch_js)
-        QTimer.singleShot(120, lambda: self._incomings_poll_load(0))
+        QTimer.singleShot(self.TW_JS_POLL_MS, lambda: self._incomings_poll_load(0))
 
     def _incomings_poll_load(self, attempt):
-        max_attempts = 140
+        max_attempts = 48
         if attempt >= max_attempts:
             self.incomings_refresh_btn.setEnabled(True)
             self.incomings_refresh_btn.setText("🔄 Gelenleri Yükle")
@@ -11944,7 +12033,7 @@ class TribalWarsBot(QMainWindow):
                 result_str = str(result).strip()
 
             if result_str in ("WAITING", "LOADING", ""):
-                QTimer.singleShot(120, lambda: self._incomings_poll_load(attempt + 1))
+                QTimer.singleShot(self.TW_JS_POLL_MS, lambda: self._incomings_poll_load(attempt + 1))
                 return
 
             self.browser.page().runJavaScript("window.__tw_incomings_fetch=null;")
@@ -12317,10 +12406,10 @@ class TribalWarsBot(QMainWindow):
         """
 
         self.browser.page().runJavaScript(fetch_js)
-        QTimer.singleShot(120, lambda: self._buildings_overview_poll_load(0))
+        QTimer.singleShot(self.TW_JS_POLL_MS, lambda: self._buildings_overview_poll_load(0))
 
     def _buildings_overview_poll_load(self, attempt):
-        max_attempts = 140
+        max_attempts = 48
         if attempt >= max_attempts:
             self.buildings_ov_refresh_btn.setEnabled(True)
             self.buildings_ov_refresh_btn.setText("🔄 Yükle")
@@ -12341,7 +12430,7 @@ class TribalWarsBot(QMainWindow):
                 result_str = str(result).strip()
 
             if result_str in ("WAITING", "LOADING", ""):
-                QTimer.singleShot(120, lambda: self._buildings_overview_poll_load(attempt + 1))
+                QTimer.singleShot(self.TW_JS_POLL_MS, lambda: self._buildings_overview_poll_load(attempt + 1))
                 return
 
             self.browser.page().runJavaScript("window.__tw_buildings_ov_fetch=null;")
@@ -12633,11 +12722,11 @@ class TribalWarsBot(QMainWindow):
         """
 
         self.browser.page().runJavaScript(fetch_js)
-        QTimer.singleShot(120, lambda: self._reports_poll_load(0))
+        QTimer.singleShot(self.TW_JS_POLL_MS, lambda: self._reports_poll_load(0))
 
     def _reports_poll_load(self, attempt):
         """fetch tamamlanana kadar window.__tw_reports_fetch oku (Promise → runJavaScript uyumsuzluğu)."""
-        max_attempts = 140
+        max_attempts = 48
         if attempt >= max_attempts:
             self.reports_refresh_btn.setEnabled(True)
             self.reports_refresh_btn.setText("🔄 Raporları Yükle")
@@ -12659,7 +12748,7 @@ class TribalWarsBot(QMainWindow):
                 result_str = str(raw).strip()
 
             if result_str in ("WAITING", "LOADING", ""):
-                QTimer.singleShot(120, lambda: self._reports_poll_load(attempt + 1))
+                QTimer.singleShot(self.TW_JS_POLL_MS, lambda: self._reports_poll_load(attempt + 1))
                 return
 
             self.browser.page().runJavaScript("window.__tw_reports_fetch=null;")
@@ -13036,6 +13125,7 @@ class TribalWarsBot(QMainWindow):
         self._trusted_world_speed = None
         self._trusted_unit_speed = None
         self._game_data = {}
+        self._tw_post_login_scrape_scheduled = False
 
         # Giriş akışını başlat
         self._login_state = "navigating"
@@ -13066,8 +13156,15 @@ class TribalWarsBot(QMainWindow):
                 self.world_combo.setEnabled(False)
                 self.world_select_btn.setEnabled(False)
                 self._set_login_credentials_highlight(True)
-            # Her sayfa yüklendiğinde oyun verisini çek
-            self._scrape_game_data()
+                if not getattr(self, "_tw_post_login_scrape_scheduled", False):
+                    self._tw_post_login_scrape_scheduled = True
+                    self._add_log(
+                        "VERİ",
+                        "info",
+                        "Veriler ~12 sn sonra bir kez otomatik çekilecek; bu sürede tarayıcıda gezinebilirsiniz. "
+                        "Hemen güncellemek için araç çubuğunda «Verileri Yenile» kullanın.",
+                    )
+                    QTimer.singleShot(12000, self._tw_scrape_once_if_in_game)
             return
 
         # 1) Ana sayfa / Login sayfası → Giriş yap
@@ -13274,6 +13371,15 @@ class TribalWarsBot(QMainWindow):
                         break
                 except (TypeError, ValueError):
                     continue
+
+    def _tw_scrape_once_if_in_game(self) -> None:
+        """İlk oyun girişinde tek otomatik scrape; her sayfa yüklemesinde çağrılmaz (tarayıcı donması / rate limit)."""
+        if not self.is_running or not getattr(self, "browser", None):
+            return
+        u = self.browser.url().toString()
+        if "game.php" not in u and "/overview" not in u:
+            return
+        self._scrape_game_data()
 
     def _scrape_game_data(self):
         """game_data JS değişkeninden ve DOM'dan tüm verileri çek."""
@@ -14616,6 +14722,7 @@ class TribalWarsBot(QMainWindow):
     def _stop_bot(self):
         self.is_running = False
         self._login_state = "idle"
+        self._tw_post_login_scrape_scheduled = False
         self._set_login_credentials_highlight(False)
         self._world_settings_fetched = False
         self._world_speed_from_settings = False
@@ -14806,7 +14913,7 @@ class TribalWarsBot(QMainWindow):
 
     def _schedule_next_botprot_poll(self):
         """Bir sonraki DOM kontrolünü 4.5–9.5 sn arası rastgele gecikmeyle planla."""
-        delay_ms = random.randint(4500, 9500)
+        delay_ms = random.randint(8000, 15000)
         QTimer.singleShot(delay_ms, self._poll_bot_protection_reschedule)
 
     def _poll_bot_protection_reschedule(self):
