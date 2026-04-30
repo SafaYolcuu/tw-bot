@@ -1037,6 +1037,115 @@ QCheckBox {
 }
 """
 
+_SA_COMMAND_EDIT_DIALOG_EXTRA_LIGHT = """
+QDialog {
+    background-color: #d8d8d8;
+}
+QFrame#saCmdEditPanel {
+    background-color: #e8e8e8;
+    border: 1px solid #b0b0b0;
+    border-radius: 4px;
+}
+QLabel#saCmdEditTitle {
+    font-size: 14px;
+    font-weight: bold;
+    color: #222222;
+}
+QLabel {
+    color: #222222;
+}
+QLineEdit {
+    background-color: #ffffff;
+    color: #222222;
+    border: 1px solid #999999;
+    border-radius: 2px;
+    padding: 3px 4px;
+    min-height: 20px;
+}
+QLineEdit:read-only {
+    background-color: #f0f0f0;
+    color: #444444;
+}
+QComboBox, QSpinBox {
+    background-color: #ffffff;
+    color: #222222;
+    border: 1px solid #999999;
+    border-radius: 2px;
+    padding: 2px 4px;
+}
+QCheckBox {
+    color: #222222;
+}
+QPushButton {
+    padding: 4px 10px;
+}
+"""
+
+_SA_COMMAND_EDIT_DIALOG_EXTRA_DARK = """
+QDialog {
+    background-color: #1e1e1e;
+}
+QFrame#saCmdEditPanel {
+    background-color: #252526;
+    border: 1px solid #3f3f46;
+    border-radius: 4px;
+}
+QLabel#saCmdEditTitle {
+    font-size: 14px;
+    font-weight: bold;
+    color: #e8e8e8;
+}
+QLabel {
+    color: #d0d0d0;
+}
+QLineEdit {
+    background-color: #2d2d30;
+    color: #ececec;
+    border: 1px solid #555555;
+    border-radius: 2px;
+    padding: 3px 4px;
+    min-height: 20px;
+    selection-background-color: #264f78;
+}
+QLineEdit:focus {
+    border: 1px solid #0078d4;
+}
+QLineEdit:read-only {
+    background-color: #1e1e1e;
+    color: #a0a0a0;
+    border: 1px solid #404040;
+}
+QComboBox, QSpinBox {
+    background-color: #2d2d30;
+    color: #ececec;
+    border: 1px solid #555555;
+    border-radius: 2px;
+    padding: 2px 4px;
+}
+QComboBox QAbstractItemView {
+    background-color: #2d2d30;
+    color: #ececec;
+    selection-background-color: #264f78;
+}
+QCheckBox {
+    color: #e0e0e0;
+}
+QPushButton {
+    background-color: #3c3c3c;
+    color: #ececec;
+    border: 1px solid #555555;
+    padding: 4px 10px;
+    border-radius: 2px;
+}
+QPushButton:hover {
+    background-color: #4a4a4a;
+}
+QScrollArea {
+    border: none;
+    background: transparent;
+}
+"""
+
 
 def _army_aux_dialog_stylesheet(dark: bool) -> str:
     base = STYLESHEET_DARK if dark else STYLESHEET
@@ -1047,6 +1156,12 @@ def _army_aux_dialog_stylesheet(dark: bool) -> str:
 def _misyoner_multi_dialog_stylesheet(dark: bool) -> str:
     base = STYLESHEET_DARK if dark else STYLESHEET
     extra = _MISYONER_MULTI_DIALOG_EXTRA_DARK if dark else _MISYONER_MULTI_DIALOG_EXTRA_LIGHT
+    return base + extra
+
+
+def _sa_command_edit_dialog_stylesheet(dark: bool) -> str:
+    base = STYLESHEET_DARK if dark else STYLESHEET
+    extra = _SA_COMMAND_EDIT_DIALOG_EXTRA_DARK if dark else _SA_COMMAND_EDIT_DIALOG_EXTRA_LIGHT
     return base + extra
 
 
@@ -2119,15 +2234,41 @@ class MapArmySendDialog(QDialog):
 
 
 class SaCommandEditDialog(QDialog):
-    """Ordu Gönder kuyruğu: satıra çift tıklayınca zaman ve birim düzenleme (canlı önizleme)."""
+    """Kuyruk satırı: iki sütunlu ayar paneli; varış/gönderim senkron; ana pencere koyu modu."""
+
+    _CATAPULT_UI_TARGETS = (
+        ("(varsayılan)", ""),
+        ("Duvar", "wall"),
+        ("Merkez binası", "main"),
+        ("Depo", "storage"),
+        ("Gizli depo", "hide"),
+        ("Kışla", "barracks"),
+        ("Ahır", "stable"),
+        ("Atölye", "garage"),
+        ("Demirci", "smith"),
+        ("Oduncu", "wood"),
+        ("Taşçı", "stone"),
+        ("Demir madeni", "iron"),
+        ("Çiftlik", "farm"),
+        ("Market", "market"),
+        ("Toplanma yeri", "place"),
+        ("Gözlem kulesi", "watchtower"),
+    )
+
+    @staticmethod
+    def _sec_to_hms(sec: int) -> str:
+        sec = int(max(0, sec))
+        h, r = divmod(sec, 3600)
+        m, s = divmod(r, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
 
     def __init__(self, parent, bot, item: QTreeWidgetItem):
         super().__init__(parent)
         self._bot = bot
         self._item = item
-        self.setWindowTitle("Komutu düzenle")
-        self.setMinimumWidth(580)
-        self.resize(640, 520)
+        self.setWindowTitle("Ayarlar — komut")
+        self.setMinimumSize(720, 420)
+        self.resize(820, 460)
 
         self._block_refresh = False
 
@@ -2139,11 +2280,30 @@ class SaCommandEditDialog(QDialog):
         self._tx = int(tm.group(1))
         self._ty = int(tm.group(2))
 
-        root = QVBoxLayout(self)
-        root.setSpacing(8)
+        dark = bool(getattr(bot, "_dark_mode", False))
+        self.setStyleSheet(_sa_command_edit_dialog_stylesheet(dark))
 
-        root.addWidget(QLabel(f"Kaynak: {item.text(0)}"))
-        root.addWidget(QLabel(f"Hedef: {item.text(1)}"))
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setSpacing(8)
+
+        title = QLabel("Ayarlar")
+        title.setObjectName("saCmdEditTitle")
+        outer.addWidget(title)
+
+        main_row = QHBoxLayout()
+        main_row.setSpacing(12)
+
+        left = QFrame()
+        left.setObjectName("saCmdEditPanel")
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(10, 10, 10, 10)
+        lv.setSpacing(8)
+
+        foot = QLabel(f"{item.text(0)}\n→ {item.text(1)}")
+        foot.setWordWrap(True)
+        foot.setStyleSheet("font-size: 10px; color: #888888;" if dark else "font-size: 10px; color: #555555;")
+        lv.addWidget(foot)
 
         typ_row = QHBoxLayout()
         typ_row.addWidget(QLabel("Tür:"))
@@ -2151,124 +2311,222 @@ class SaCommandEditDialog(QDialog):
         self._cmd_combo.addItems(["Saldırı", "Destek"])
         ct = (item.text(14) or "").strip()
         self._cmd_combo.setCurrentIndex(0 if ct == "Sld" else 1)
+        self._cmd_combo.setMinimumWidth(120)
         typ_row.addWidget(self._cmd_combo)
         typ_row.addStretch()
-        root.addLayout(typ_row)
+        lv.addLayout(typ_row)
 
-        mode_row = QHBoxLayout()
-        self._radio_arrive = QRadioButton("Varışa göre (referans: varış)")
-        self._radio_send = QRadioButton("Gönderime göre (referans: gönderim)")
-        self._bg_mode = QButtonGroup(self)
-        self._bg_mode.addButton(self._radio_arrive)
-        self._bg_mode.addButton(self._radio_send)
-        mode_row.addWidget(self._radio_arrive)
-        mode_row.addWidget(self._radio_send)
-        mode_row.addStretch()
-        root.addLayout(mode_row)
+        self._chk_arrive_master = QCheckBox("Varış zamanına göre kilitle (gönderim / dönüş otomatik)")
+        self._chk_arrive_master.setChecked(True)
+        self._chk_arrive_master.setToolTip(
+            "İşaretliyken varış tarih+saatini düzenlersiniz; gönderim ve dönüş yolculuk süresine göre hesaplanır.\n"
+            "İşaretsizken gönderim zamanını düzenlersiniz; varış ve dönüş buna göre güncellenir."
+        )
+        lv.addWidget(self._chk_arrive_master)
 
-        root.addWidget(QLabel("Tarih / saat (referans):"))
-        time_row = QHBoxLayout()
-        self._ed_date = QLineEdit()
-        self._ed_date.setPlaceholderText("GG.AA")
-        self._ed_date.setFixedWidth(52)
-        self._ed_date.setAlignment(Qt.AlignCenter)
-        time_row.addWidget(self._ed_date)
-        time_row.addWidget(QLabel("'de"))
-        self._ed_clock = QLineEdit()
-        self._ed_clock.setPlaceholderText("SS:DD:SS:ms")
-        self._ed_clock.setFixedWidth(112)
-        self._ed_clock.setAlignment(Qt.AlignCenter)
-        time_row.addWidget(self._ed_clock)
-        b_srv = QPushButton("Sunucu saati")
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(4)
+
+        def _mk_time_row(label, row):
+            la = QLabel(label)
+            te = QLineEdit()
+            te.setPlaceholderText("SS:DD:SS:ms")
+            te.setFixedWidth(118)
+            de = QLineEdit()
+            de.setPlaceholderText("GG.AA")
+            de.setFixedWidth(52)
+            de.setAlignment(Qt.AlignCenter)
+            grid.addWidget(la, row, 0)
+            grid.addWidget(te, row, 1)
+            grid.addWidget(de, row, 2)
+            return de, te
+
+        self._d_send, self._t_send = _mk_time_row("Gönderim:", 0)
+        self._d_arr, self._t_arr = _mk_time_row("Varış:", 1)
+        self._d_ret, self._t_ret = _mk_time_row("Dönüş:", 2)
+
+        tl = QLabel("Yolculuk süresi:")
+        self._travel_leg = QLineEdit()
+        self._travel_leg.setReadOnly(True)
+        self._travel_leg.setPlaceholderText("HH:MM:SS")
+        self._travel_leg.setFixedWidth(118)
+        grid.addWidget(tl, 3, 0)
+        grid.addWidget(self._travel_leg, 3, 1)
+
+        lv.addLayout(grid)
+
+        srv_row = QHBoxLayout()
+        b_srv = QPushButton("Sunucu saati (referans satırına)")
         b_srv.setCursor(Qt.PointingHandCursor)
         b_srv.clicked.connect(self._fill_anchor_from_server)
-        time_row.addWidget(b_srv)
-        time_row.addStretch()
-        root.addLayout(time_row)
+        srv_row.addWidget(b_srv)
+        srv_row.addStretch()
+        lv.addLayout(srv_row)
 
-        pv = QFrame()
-        pv.setFrameShape(QFrame.StyledPanel)
-        pvl = QVBoxLayout(pv)
-        pvl.setSpacing(4)
-        self._lbl_send_prev = QLabel("—")
-        self._lbl_arrive_prev = QLabel("—")
-        self._lbl_return_prev = QLabel("—")
-        for lb in (self._lbl_send_prev, self._lbl_arrive_prev, self._lbl_return_prev):
-            lb.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        pvl.addWidget(QLabel("Gönderim (hesaplanan):"))
-        pvl.addWidget(self._lbl_send_prev)
-        pvl.addWidget(QLabel("Varış (hesaplanan):"))
-        pvl.addWidget(self._lbl_arrive_prev)
-        pvl.addWidget(QLabel("Dönüş (hesaplanan):"))
-        pvl.addWidget(self._lbl_return_prev)
-        root.addWidget(pv)
+        main_row.addWidget(left, 1)
 
-        root.addWidget(QLabel("Birimler:"))
-        troop_row = QHBoxLayout()
-        troop_row.setSpacing(4)
+        right = QFrame()
+        right.setObjectName("saCmdEditPanel")
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(10, 10, 10, 10)
+        rv.setSpacing(6)
+
+        units_wrap = QWidget()
+        ug = QGridLayout(units_wrap)
+        ug.setSpacing(4)
         self._unit_spins = {}
         for i, (key, short) in enumerate(bot.SA_UNIT_DEFS):
             try:
                 v0 = int(item.text(2 + i) or 0)
             except ValueError:
                 v0 = 0
-            box = QVBoxLayout()
             fr = QFrame()
-            fr.setLayout(box)
-            box.addWidget(QLabel(short), alignment=Qt.AlignCenter)
+            vb = QVBoxLayout(fr)
+            vb.setContentsMargins(2, 2, 2, 2)
+            vb.setSpacing(2)
+            ic = QLabel()
+            ic.setAlignment(Qt.AlignCenter)
+            ic.setFixedSize(28, 22)
+            troop_icon_mgr.apply_to_label(ic, key)
+            vb.addWidget(ic)
             sp = QSpinBox()
             sp.setRange(0, 99999)
             sp.setValue(v0)
-            sp.setFixedWidth(56)
+            sp.setFixedWidth(58)
             self._unit_spins[key] = sp
-            box.addWidget(sp, alignment=Qt.AlignCenter)
-            troop_row.addWidget(fr)
-        troop_row.addStretch()
-        tw = QWidget()
-        tw.setLayout(troop_row)
+            vb.addWidget(sp, alignment=Qt.AlignCenter)
+            r, c = divmod(i, 4)
+            ug.addWidget(fr, r, c)
         sc = QScrollArea()
         sc.setWidgetResizable(True)
-        sc.setWidget(tw)
-        sc.setMaximumHeight(120)
-        root.addWidget(sc)
+        sc.setWidget(units_wrap)
+        sc.setMinimumHeight(200)
+        rv.addWidget(sc, 1)
+
+        rv.addWidget(QLabel("Mancınık hedefi:"))
+        self._combo_catapult = QComboBox()
+        for lab, val in self._CATAPULT_UI_TARGETS:
+            self._combo_catapult.addItem(lab, val)
+        saved_cat = item.data(0, bot.SA_QUEUE_ITEM_ROLE_CATAPULT)
+        sv = (saved_cat or "").strip() if saved_cat else ""
+        for j in range(self._combo_catapult.count()):
+            if self._combo_catapult.itemData(j) == sv:
+                self._combo_catapult.setCurrentIndex(j)
+                break
+        self._combo_catapult.setMinimumWidth(180)
+        rv.addWidget(self._combo_catapult)
+
+        main_row.addWidget(right, 1)
+        outer.addLayout(main_row, 1)
 
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self._on_ok)
         bb.rejected.connect(self.reject)
-        root.addWidget(bb)
+        outer.addWidget(bb)
 
-        self._radio_arrive.toggled.connect(self._on_arrive_mode_toggled)
-        self._ed_date.textChanged.connect(self._refresh_derived)
-        self._ed_clock.textChanged.connect(self._refresh_derived)
+        self._chk_arrive_master.stateChanged.connect(self._on_anchor_mode_changed)
+        for pair in (
+            (self._d_send, self._t_send),
+            (self._d_arr, self._t_arr),
+            (self._d_ret, self._t_ret),
+        ):
+            pair[0].editingFinished.connect(self._on_time_edited)
+            pair[1].editingFinished.connect(self._on_time_edited)
         for sp in self._unit_spins.values():
-            sp.valueChanged.connect(self._refresh_derived)
-        self._cmd_combo.currentIndexChanged.connect(self._refresh_derived)
+            sp.valueChanged.connect(self._on_troops_changed)
+        self._cmd_combo.currentIndexChanged.connect(self._on_troops_changed)
 
-        arr_dt = bot._dispatch_parse_time_str(item.text(16))
-        snd_dt = bot._dispatch_parse_time_str(item.text(15))
-        self._radio_arrive.blockSignals(True)
-        self._radio_send.blockSignals(True)
-        if arr_dt:
-            self._radio_arrive.setChecked(True)
-            self._fill_anchor_fields(arr_dt)
-        elif snd_dt:
-            self._radio_send.setChecked(True)
-            self._fill_anchor_fields(snd_dt)
+        snd0 = bot._dispatch_parse_time_str(item.text(15))
+        arr0 = bot._dispatch_parse_time_str(item.text(16))
+        if arr0:
+            self._chk_arrive_master.setChecked(True)
+            self._fill_row_edits(self._d_arr, self._t_arr, arr0)
+        elif snd0:
+            self._chk_arrive_master.setChecked(False)
+            self._fill_row_edits(self._d_send, self._t_send, snd0)
         else:
-            self._radio_arrive.setChecked(True)
-        self._radio_arrive.blockSignals(False)
-        self._radio_send.blockSignals(False)
-        self._refresh_derived()
+            self._chk_arrive_master.setChecked(True)
+        self._apply_editable_mask()
+        self._full_refresh()
 
-        dark = bool(getattr(bot, "_dark_mode", False))
-        self.setStyleSheet(_misyoner_multi_dialog_stylesheet(dark))
-
-    def _fill_anchor_fields(self, dt):
-        self._ed_date.setText(f"{dt.day:02d}.{dt.month:02d}")
+    def _fill_row_edits(self, d_e: QLineEdit, t_e: QLineEdit, dt):
+        d_e.setText(f"{dt.day:02d}.{dt.month:02d}")
         ms = dt.microsecond // 1000
-        self._ed_clock.setText(
-            f"{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}:{ms:03d}"
+        t_e.setText(f"{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}:{ms:03d}")
+
+    def _read_dt(self, d_e: QLineEdit, t_e: QLineEdit):
+        return self._bot._sa_parse_time_input(d_e.text().strip(), t_e.text().strip())
+
+    def _troops_map(self):
+        return {k: self._unit_spins[k].value() for k, _ in self._bot.SA_UNIT_DEFS}
+
+    def _travel_seconds(self):
+        tm = self._troops_map()
+        keys = [k for k, _ in self._bot.SA_UNIT_DEFS if int(tm.get(k, 0) or 0) > 0]
+        if not keys:
+            return 0
+        dist = math.sqrt(
+            (float(self._tx) - float(self._sx)) ** 2 + (float(self._ty) - float(self._sy)) ** 2
         )
+        return int(self._bot._sa_calc_travel_time(dist, keys))
+
+    def _apply_editable_mask(self):
+        arr_m = self._chk_arrive_master.isChecked()
+        for e in (self._d_send, self._t_send, self._d_ret, self._t_ret):
+            e.setReadOnly(arr_m)
+        for e in (self._d_arr, self._t_arr):
+            e.setReadOnly(not arr_m)
+        self._travel_leg.setReadOnly(True)
+
+    def _on_anchor_mode_changed(self, _state=None):
+        if self._block_refresh:
+            return
+        self._apply_editable_mask()
+        self._full_refresh()
+
+    def _on_time_edited(self):
+        if self._block_refresh:
+            return
+        self._full_refresh()
+
+    def _on_troops_changed(self, *_a):
+        if self._block_refresh:
+            return
+        self._full_refresh()
+
+    def _full_refresh(self):
+        if self._block_refresh:
+            return
+        ts = self._travel_seconds()
+        self._travel_leg.setText(self._sec_to_hms(ts))
+
+        troops_map = self._troops_map()
+        total = sum(int(troops_map.get(k, 0) or 0) for k, _ in self._bot.SA_UNIT_DEFS)
+        if total <= 0:
+            return
+
+        mode = "arrive" if self._chk_arrive_master.isChecked() else "send"
+        if mode == "arrive":
+            anchor = self._read_dt(self._d_arr, self._t_arr)
+        else:
+            anchor = self._read_dt(self._d_send, self._t_send)
+        if anchor is None:
+            return
+
+        send_dt, arrive_dt, ret_dt = self._bot._sa_compute_timeline_from_anchor(
+            self._sx, self._sy, self._tx, self._ty, troops_map, mode, anchor
+        )
+        if send_dt is None:
+            return
+
+        self._block_refresh = True
+        try:
+            self._fill_row_edits(self._d_send, self._t_send, send_dt)
+            self._fill_row_edits(self._d_arr, self._t_arr, arrive_dt)
+            self._fill_row_edits(self._d_ret, self._t_ret, ret_dt)
+        finally:
+            self._block_refresh = False
 
     def _fill_anchor_from_server(self):
         text = getattr(self._bot, "_server_time_text", "") or ""
@@ -2281,75 +2539,44 @@ class SaCommandEditDialog(QDialog):
                 return
             date_part = parts[0].strip()
             time_part = parts[1].strip()
+            d_txt, t_txt = None, None
             date_match = re.match(r"(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{2,4})", date_part)
             if date_match:
-                day = date_match.group(1).zfill(2)
-                month = date_match.group(2).zfill(2)
-                self._ed_date.setText(f"{day}.{month}")
+                d_txt = f"{date_match.group(1).zfill(2)}.{date_match.group(2).zfill(2)}"
             time_match = re.match(r"(\d{1,2}):(\d{2}):(\d{2})\.?(\d{0,3})", time_part)
             if time_match:
                 h = time_match.group(1).zfill(2)
                 m = time_match.group(2)
                 s = time_match.group(3)
                 ms = (time_match.group(4) or "0")[:3].zfill(3)
-                self._ed_clock.setText(f"{h}:{m}:{s}:{ms}")
-            self._refresh_derived()
+                t_txt = f"{h}:{m}:{s}:{ms}"
+            if d_txt and t_txt:
+                if self._chk_arrive_master.isChecked():
+                    self._d_arr.setText(d_txt)
+                    self._t_arr.setText(t_txt)
+                else:
+                    self._d_send.setText(d_txt)
+                    self._t_send.setText(t_txt)
+                self._full_refresh()
         except Exception:
             pass
 
-    def _on_arrive_mode_toggled(self, checked):
-        if self._block_refresh:
-            return
-        self._block_refresh = True
-        try:
-            if checked:
-                dt = self._bot._dispatch_parse_time_str(self._item.text(16))
-            else:
-                dt = self._bot._dispatch_parse_time_str(self._item.text(15))
-            if dt:
-                self._fill_anchor_fields(dt)
-        finally:
-            self._block_refresh = False
-        self._refresh_derived()
-
-    def _refresh_derived(self):
-        if self._block_refresh:
-            return
-        mode = "arrive" if self._radio_arrive.isChecked() else "send"
-        d = self._ed_date.text().strip()
-        c = self._ed_clock.text().strip()
-        input_dt = self._bot._sa_parse_time_input(d, c)
-        troops_map = {k: self._unit_spins[k].value() for k, _ in self._bot.SA_UNIT_DEFS}
-        if not d or not c or input_dt is None:
-            self._lbl_send_prev.setText("—")
-            self._lbl_arrive_prev.setText("—")
-            self._lbl_return_prev.setText("—")
-            return
-        send_dt, arrive_dt, return_dt = self._bot._sa_compute_timeline_from_anchor(
-            self._sx, self._sy, self._tx, self._ty, troops_map, mode, input_dt
-        )
-        if send_dt is None:
-            self._lbl_send_prev.setText("—")
-            self._lbl_arrive_prev.setText("—")
-            self._lbl_return_prev.setText("—")
-            return
-        self._lbl_send_prev.setText(self._bot._sa_format_time(send_dt))
-        self._lbl_arrive_prev.setText(self._bot._sa_format_time(arrive_dt))
-        self._lbl_return_prev.setText(self._bot._sa_format_time(return_dt, ms_zero=True))
-
     def _on_ok(self):
-        d = self._ed_date.text().strip()
-        c = self._ed_clock.text().strip()
-        input_dt = self._bot._sa_parse_time_input(d, c)
-        if not d or not c or input_dt is None:
-            QMessageBox.warning(self, "Komut", "Tarih veya saat formatı geçersiz.")
-            return
-        troops_map = {k: self._unit_spins[k].value() for k, _ in self._bot.SA_UNIT_DEFS}
+        troops_map = self._troops_map()
         total = sum(int(troops_map.get(k, 0) or 0) for k, _ in self._bot.SA_UNIT_DEFS)
         if total <= 0:
             QMessageBox.warning(self, "Komut", "En az bir asker girin.")
             return
-        mode = "arrive" if self._radio_arrive.isChecked() else "send"
+
+        mode = "arrive" if self._chk_arrive_master.isChecked() else "send"
+        if mode == "arrive":
+            anchor = self._read_dt(self._d_arr, self._t_arr)
+        else:
+            anchor = self._read_dt(self._d_send, self._t_send)
+        if anchor is None:
+            QMessageBox.warning(self, "Komut", "Referans tarih/saat geçersiz (GG.AA ve SS:DD:SS:ms).")
+            return
+
         cmd_attack = self._cmd_combo.currentIndex() == 0
         violate, fake_detail = self._bot._sa_evaluate_fake_violation(
             cmd_attack, troops_map, self._sx, self._sy
@@ -2373,7 +2600,7 @@ class SaCommandEditDialog(QDialog):
                 return
 
         send_dt, arrive_dt, return_dt = self._bot._sa_compute_timeline_from_anchor(
-            self._sx, self._sy, self._tx, self._ty, troops_map, mode, input_dt
+            self._sx, self._sy, self._tx, self._ty, troops_map, mode, anchor
         )
         if send_dt is None:
             QMessageBox.warning(self, "Komut", "Zaman hesaplanamadı.")
@@ -2399,6 +2626,12 @@ class SaCommandEditDialog(QDialog):
         self._item.setText(17, return_str)
         self._item.setText(18, tid)
 
+        cv = self._combo_catapult.currentData()
+        if cv:
+            self._item.setData(0, self._bot.SA_QUEUE_ITEM_ROLE_CATAPULT, cv)
+        else:
+            self._item.setData(0, self._bot.SA_QUEUE_ITEM_ROLE_CATAPULT, None)
+
         self._bot._sa_style_sa_queue_troop_cells(self._item, troop_values)
         for col in (14, 15, 16, 17, 18):
             self._item.setTextAlignment(col, Qt.AlignCenter)
@@ -2411,7 +2644,6 @@ class SaCommandEditDialog(QDialog):
             f"Komut güncellendi: {cmd_type} → Gönderim {send_str} | Varış {arrive_str}",
         )
         self.accept()
-
 
 class MisyonerMultiWaveDialog(QDialog):
     """Çok dalgalı misyoner kuyruğu — tek gönderim zamanı; Ana «Ordu Gönder» kaynak/hedef/türünü kullanır."""
@@ -3005,6 +3237,9 @@ class TribalWarsBot(QMainWindow):
     # Arka plan (urllib) → ana iş parçacığı: test kutusu / log; QTimer worker’da kullanılamaz.
     _telegram_test_finished = pyqtSignal(bool, str, str)  # ok, err, chat_id_normalized
     _telegram_send_error = pyqtSignal(str)  # kısa hata metni (sendMessage arka planda)
+
+    # Ordu kuyruğu satırı: ek veri (mancınık hedefi — oyun `building` anahtarı, örn. wall)
+    SA_QUEUE_ITEM_ROLE_CATAPULT = Qt.UserRole + 30
 
     # Birim başına nüfus (klasik Klanlar/TW; sunucunuz farklıysa bu sözlüğü güncelleyin).
     SA_UNIT_POPULATION = {
@@ -5408,7 +5643,8 @@ class TribalWarsBot(QMainWindow):
             for i in range(self.sa_table.topLevelItemCount()):
                 it = self.sa_table.topLevelItem(i)
                 state = str(it.data(0, Qt.UserRole) or "")
-                rows.append([it.text(c) for c in range(n)] + [state])
+                catapult = str(it.data(0, self.SA_QUEUE_ITEM_ROLE_CATAPULT) or "")
+                rows.append([it.text(c) for c in range(n)] + [state, catapult])
             self._settings.setValue("army_queue/rows_json", json.dumps(rows, ensure_ascii=False))
             self._settings.sync()
         except (TypeError, ValueError):
@@ -5434,13 +5670,19 @@ class TribalWarsBot(QMainWindow):
         for row in rows:
             if not isinstance(row, list):
                 continue
-            # Geriye uyumluluk: eski kayıtlar n sütunlu, yeniler n+1 (state eklenmiş)
-            if len(row) == n + 1:
+            # Geriye uyumluluk: n | n+1 (state) | n+2 (state+catapult)
+            if len(row) >= n + 2:
                 text_cols = row[:n]
                 state = str(row[n])
+                catapult = str(row[n + 1] or "")
+            elif len(row) == n + 1:
+                text_cols = row[:n]
+                state = str(row[n])
+                catapult = ""
             elif len(row) == n:
                 text_cols = row
                 state = ""
+                catapult = ""
             else:
                 continue
             # Geçici state'leri temizle
@@ -5461,6 +5703,8 @@ class TribalWarsBot(QMainWindow):
                 if col < n:
                     item.setTextAlignment(col, Qt.AlignCenter)
             self.sa_table.addTopLevelItem(item)
+            if catapult:
+                item.setData(0, self.SA_QUEUE_ITEM_ROLE_CATAPULT, catapult)
             # Kaydedilmiş state'e göre görsel uygula
             if state == "sent":
                 self._dispatch_mark_sent(item)
