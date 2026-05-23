@@ -77,7 +77,7 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote, urlencode
 
 from PyQt5.QtCore import Qt, QUrl, QTimer, QTime, QDate, QSize, pyqtSignal, QObject, QSettings, pyqtSlot
-from PyQt5.QtGui import QFont, QColor, QBrush, QPainter, QPen, QPixmap, QIcon
+from PyQt5.QtGui import QFont, QColor, QBrush, QPainter, QPen, QPixmap, QIcon, QPalette
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QLabel, QPushButton, QLineEdit, QComboBox, QCheckBox,
@@ -105,6 +105,7 @@ SERVERS = [
     ("tribalwars.com.tr", "https://www.tribalwars.com.tr"),
     ("tribalwars.co.uk", "https://www.tribalwars.co.uk"),
     ("tribalwars.de", "https://www.die-staemme.de"),
+    ("tribalwars.nl", "https://www.tribalwars.nl"),
 ]
 
 # Planlayıcı: Chrome bookmarklet ile aynı kaynak (script src — eval/CSP uyumu).
@@ -113,6 +114,9 @@ TW_PLANNER_SCRIPT_URL = "https://safayolcuu.github.io/klanlar/arascript.js"
 # QSettings: org/app — build’e gömülü proxy yok, kullanıcı tercihleri diske gider.
 QSETTINGS_ORG = "TribalWarsBot"
 QSETTINGS_APP = "TWB"
+
+# Telegram: tw_config / QSettings'te chat_id yok veya boşsa kullanılır (yeni build / ilk kurulum).
+TW_DEFAULT_TELEGRAM_CHAT_ID = "-1003923196486"
 
 # Kalici ayar dosyasi: exe'nin yaninda tw_config.json.
 # Yeni exe dagitilsa bile bu dosya silinmez; arkadaslar sadece exe'yi gunceller.
@@ -147,6 +151,28 @@ def _tw_save_config(data: dict) -> None:
             json.dump(existing, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+def _tw_sorted_player_villages(all_villages):
+    """Oyuncu köylerini ada göre (büyük/küçük harf duyarsız), eşit ada göre koordinat ile sıralar."""
+    if not all_villages:
+        return []
+
+    def _key(v):
+        return (
+            str(v.get("name") or "").casefold(),
+            int(v.get("x", -1) or -1),
+            int(v.get("y", -1) or -1),
+        )
+
+    return sorted(all_villages, key=_key)
+
+
+# Üst bar / Ordu Gönder / Bina kuyruğu köy combobox — okunabilir yazı
+TW_VILLAGE_COMBO_STYLE = (
+    "QComboBox { font-size: 12px; min-height: 24px; padding: 2px 8px; }\n"
+    "QComboBox QAbstractItemView { font-size: 12px; padding: 2px; min-height: 22px; }"
+)
 
 
 def tw_apply_saved_proxy_environment() -> None:
@@ -204,6 +230,13 @@ def _tw_normalize_telegram_chat_id(raw: str) -> str:
     s = (raw or "").strip().replace(" ", "")
     s = s.replace("\u2013", "-").replace("\u2014", "-").replace("\u2212", "-")
     return s
+
+
+def _tw_resolved_telegram_chat_id(cfg: dict, s: QSettings) -> str:
+    """tw_config ve QSettings'ten chat_id; boşsa TW_DEFAULT_TELEGRAM_CHAT_ID."""
+    raw = (cfg.get("telegram_chat_id") or s.value("notify/telegram_chat_id", TW_DEFAULT_TELEGRAM_CHAT_ID) or "").strip()
+    raw = _tw_normalize_telegram_chat_id(raw)
+    return raw if raw else TW_DEFAULT_TELEGRAM_CHAT_ID
 
 
 def _tw_telegram_build_opener(insecure_skip_verify: bool = None):
@@ -272,6 +305,72 @@ def tw_telegram_api_send_message(
         return (False, str(e)[:500])
 
 
+# Bright Data Web Unlocker (deneme / API doğrulama). Oyun proxy'si kullanılmaz.
+BRIGHT_REQUEST_URL = "https://api.brightdata.com/request"
+BRIGHT_DEFAULT_TEST_URL = "https://geo.brdtest.com/welcome.txt?product=unlocker&method=api"
+
+
+def bright_web_unlocker_request(
+    api_token: str,
+    zone: str,
+    target_url: str,
+    response_format: str = "raw",
+    timeout_sec: int = 120,
+    insecure_ssl: bool = False,
+) -> tuple:
+    """Tek `request` çağrısı. Dönüş: (başarılı, gövde veya hata metni).
+
+    `insecure_ssl` True: kurumsal SSL tarama için sertifika doğrulaması kapalı (risk kullanıcıda).
+    """
+    api_token = (api_token or "").strip()
+    zone = (zone or "").strip()
+    target_url = (target_url or "").strip()
+    fmt = (response_format or "raw").strip().lower() or "raw"
+    if not api_token or not zone or not target_url:
+        return (False, "API token, zone ve URL boş olamaz.")
+    payload = {"zone": zone, "url": target_url, "format": fmt}
+    body_bytes = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        BRIGHT_REQUEST_URL,
+        data=body_bytes,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_token}",
+            "Content-Type": "application/json",
+        },
+    )
+    if insecure_ssl:
+        ctx = ssl._create_unverified_context()
+    else:
+        try:
+            import certifi
+
+            ctx = ssl.create_default_context(cafile=certifi.where())
+        except ImportError:
+            ctx = ssl.create_default_context()
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=ctx),
+    )
+    try:
+        with opener.open(req, timeout=timeout_sec) as resp:
+            raw = resp.read()
+        text = raw.decode("utf-8", "replace")
+        return (True, text)
+    except urllib.error.HTTPError as e:
+        try:
+            hbody = e.read().decode("utf-8", "replace")[:1200]
+        except Exception:
+            hbody = ""
+        return (False, f"HTTP {e.code} {e.reason or ''}\n{hbody}".strip())
+    except urllib.error.URLError as e:
+        r = e.reason
+        r = r if (r and str(r).strip()) else str(e)
+        return (False, str(r)[:800])
+    except Exception as e:
+        return (False, str(e)[:800])
+
+
 def _tw_telegram_msgbox_on_top(parent, is_warning, title, text) -> None:
     """Küçük pencere bazen oyun/ tarayıcının altında kaldığından üstte göster."""
     m = QMessageBox(parent)
@@ -294,7 +393,7 @@ def tw_telegram_send_message_threaded(bot, text: str) -> None:
             if not enabled:
                 return
             token = (cfg.get("telegram_bot_token") or s.value("notify/telegram_bot_token", "") or "").strip()
-            chat = (cfg.get("telegram_chat_id") or s.value("notify/telegram_chat_id", "") or "").strip()
+            chat = _tw_resolved_telegram_chat_id(cfg, s)
             if not token or not chat or not (text and str(text).strip()):
                 return
             ok, emsg = tw_telegram_api_send_message(token, chat, str(text))
@@ -394,6 +493,13 @@ class TroopIconManager:
         self._register(unit_key, label, "label")
         if unit_key in self._cache:
             label.setPixmap(self._cache[unit_key])
+
+    def refresh_label_pixmap(self, label: "QLabel", unit_key: str):
+        """Önbellekte ikon varsa tekrar uygula (diyalog stilinden sonra). Yoksa apply_to_label."""
+        if unit_key in self._cache:
+            label.setPixmap(self._cache[unit_key])
+        else:
+            self.apply_to_label(label, unit_key)
 
     def apply_to_checkbox(self, checkbox: "QCheckBox", unit_key: str):
         """QCheckBox'a ikon ata; henüz indirilmediyse abone listesine ekle."""
@@ -1051,8 +1157,19 @@ QLabel#saCmdEditTitle {
     font-weight: bold;
     color: #222222;
 }
-QLabel {
+QLabel:not(#saCmdEditUnitIcon) {
     color: #222222;
+}
+QLabel#saCmdEditUnitIcon {
+    background-color: transparent;
+    border: none;
+    padding: 2px;
+}
+QDialog QLabel#saCmdEditUnitIcon {
+    background-color: transparent;
+    border: none;
+    padding: 2px;
+    color: rgba(0, 0, 0, 0);
 }
 QLineEdit {
     background-color: #ffffff;
@@ -1079,11 +1196,41 @@ QCheckBox {
 QPushButton {
     padding: 4px 10px;
 }
+QScrollArea#saCmdEditUnitsScroll {
+    border: 1px solid #c0c0c0;
+    background-color: #f5f5f5;
+    border-radius: 3px;
+}
+QScrollArea#saCmdEditUnitsScroll QWidget#qt_scrollarea_viewport {
+    background-color: #f5f5f5;
+    border: none;
+}
+QScrollArea#saCmdEditUnitsScroll > QWidget > QWidget {
+    background-color: #f5f5f5;
+}
+QWidget#saCmdEditUnitsRoot {
+    background-color: #f5f5f5;
+}
+QFrame#saCmdEditUnitCell {
+    background-color: #ffffff;
+    border: 1px solid #d0d0d0;
+    border-radius: 4px;
+}
+QDialogButtonBox {
+    background-color: #d8d8d8;
+    border-top: 1px solid #b0b0b0;
+    padding-top: 8px;
+}
+QDialogButtonBox QPushButton {
+    padding: 6px 16px;
+    min-width: 72px;
+}
 """
 
 _SA_COMMAND_EDIT_DIALOG_EXTRA_DARK = """
 QDialog {
     background-color: #1e1e1e;
+    color: #d0d0d0;
 }
 QFrame#saCmdEditPanel {
     background-color: #252526;
@@ -1095,8 +1242,19 @@ QLabel#saCmdEditTitle {
     font-weight: bold;
     color: #e8e8e8;
 }
-QLabel {
+QLabel:not(#saCmdEditUnitIcon) {
     color: #d0d0d0;
+}
+QLabel#saCmdEditUnitIcon {
+    background-color: transparent;
+    border: none;
+    padding: 2px;
+}
+QDialog QLabel#saCmdEditUnitIcon {
+    background-color: transparent;
+    border: none;
+    padding: 2px;
+    color: rgba(0, 0, 0, 0);
 }
 QLineEdit {
     background-color: #2d2d30;
@@ -1140,9 +1298,99 @@ QPushButton {
 QPushButton:hover {
     background-color: #4a4a4a;
 }
-QScrollArea {
+QScrollArea#saCmdEditUnitsScroll {
     border: none;
-    background: transparent;
+    background-color: #252526;
+}
+QScrollArea#saCmdEditUnitsScroll QWidget#qt_scrollarea_viewport {
+    background-color: #252526;
+    border: none;
+}
+QWidget#saCmdEditUnitsViewport {
+    background-color: #252526;
+    border: none;
+}
+QScrollArea#saCmdEditUnitsScroll > QWidget > QWidget {
+    background-color: #252526;
+}
+QWidget#saCmdEditUnitsRoot {
+    background-color: #252526;
+}
+QFrame#saCmdEditUnitCell {
+    background-color: #2d2d30;
+    border: 1px solid #404040;
+    border-radius: 4px;
+}
+QDialogButtonBox {
+    background-color: #1e1e1e;
+    border-top: 1px solid #3f3f46;
+    padding-top: 8px;
+}
+QDialogButtonBox QPushButton {
+    background-color: #3c3c3c;
+    color: #ececec;
+    border: 1px solid #555555;
+    border-radius: 3px;
+    padding: 6px 18px;
+    min-width: 76px;
+    min-height: 24px;
+}
+QDialogButtonBox QPushButton:hover {
+    background-color: #4a4a4a;
+}
+QDialogButtonBox QPushButton:default {
+    background-color: #264f78;
+    border: 1px solid #5b8fd4;
+}
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 22px;
+    border-left: 1px solid #555555;
+    background-color: #3c3c3c;
+}
+QComboBox::down-arrow {
+    width: 0;
+    height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #c0c0c0;
+    margin-right: 6px;
+}
+QSpinBox::up-button, QSpinBox::down-button {
+    background-color: #3c3c3c;
+    border: 1px solid #555555;
+    width: 16px;
+}
+QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+    background-color: #4a4a4a;
+}
+QSpinBox::up-arrow {
+    image: none;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-bottom: 5px solid #c0c0c0;
+    width: 0;
+    height: 0;
+}
+QSpinBox::down-arrow {
+    image: none;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #c0c0c0;
+    width: 0;
+    height: 0;
+}
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border: 1px solid #666666;
+    border-radius: 2px;
+    background-color: #2d2d30;
+}
+QCheckBox::indicator:checked {
+    background-color: #264f78;
+    border: 1px solid #5b8fd4;
 }
 """
 
@@ -1160,9 +1408,8 @@ def _misyoner_multi_dialog_stylesheet(dark: bool) -> str:
 
 
 def _sa_command_edit_dialog_stylesheet(dark: bool) -> str:
-    base = STYLESHEET_DARK if dark else STYLESHEET
-    extra = _SA_COMMAND_EDIT_DIALOG_EXTRA_DARK if dark else _SA_COMMAND_EDIT_DIALOG_EXTRA_LIGHT
-    return base + extra
+    """Yalnızca diyalog stilleri — ana STYLESHEET_DARK birleşimi beyaz/kontrast hatalarına yol açıyordu."""
+    return _SA_COMMAND_EDIT_DIALOG_EXTRA_DARK if dark else _SA_COMMAND_EDIT_DIALOG_EXTRA_LIGHT
 
 
 # ─────────────────────────────────────────────
@@ -1807,12 +2054,14 @@ class MapArmySendDialog(QDialog):
         src_row = QHBoxLayout()
         src_row.addWidget(QLabel("Kaynak:"))
         self.src_combo = QComboBox()
-        self.src_combo.setMinimumWidth(220)
+        self.src_combo.setMinimumWidth(280)
+        self.src_combo.setStyleSheet(TW_VILLAGE_COMBO_STYLE)
         all_v = self._game_data.get("all_villages", [])
+        ordered = _tw_sorted_player_villages(all_v) if all_v else []
         current_id = self._game_data.get("village", {}).get("id", 0)
-        if all_v:
+        if ordered:
             sel = 0
-            for i, v in enumerate(all_v):
+            for i, v in enumerate(ordered):
                 name = v.get("name", "Köy")
                 coord = f"({v.get('x', '?')}|{v.get('y', '?')})"
                 self.src_combo.addItem(f"{name} {coord}", v.get("id", 0))
@@ -1830,7 +2079,7 @@ class MapArmySendDialog(QDialog):
             else:
                 villages = self._game_data.get("villages", [])
                 if villages:
-                    for vv in villages:
+                    for vv in _tw_sorted_player_villages(villages):
                         name = vv.get("name", "Köy")
                         coord = f"({vv.get('x', '?')}|{vv.get('y', '?')})"
                         self.src_combo.addItem(f"{name} {coord}", vv.get("id", 0))
@@ -2280,8 +2529,14 @@ class SaCommandEditDialog(QDialog):
         self._tx = int(tm.group(1))
         self._ty = int(tm.group(2))
 
-        dark = bool(getattr(bot, "_dark_mode", False))
+        sset = QSettings(QSETTINGS_ORG, QSETTINGS_APP)
+        dark = bool(
+            sset.value("ui/dark_mode", False, type=bool)
+            or getattr(bot, "_dark_mode", False)
+        )
         self.setStyleSheet(_sa_command_edit_dialog_stylesheet(dark))
+        if dark:
+            self.setAttribute(Qt.WA_StyledBackground, True)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 10, 10, 10)
@@ -2373,22 +2628,29 @@ class SaCommandEditDialog(QDialog):
         rv.setSpacing(6)
 
         units_wrap = QWidget()
+        units_wrap.setObjectName("saCmdEditUnitsRoot")
         ug = QGridLayout(units_wrap)
+        ug.setContentsMargins(0, 0, 0, 0)
         ug.setSpacing(4)
         self._unit_spins = {}
+        self._unit_icon_labels = []
         for i, (key, short) in enumerate(bot.SA_UNIT_DEFS):
             try:
                 v0 = int(item.text(2 + i) or 0)
             except ValueError:
                 v0 = 0
             fr = QFrame()
+            fr.setObjectName("saCmdEditUnitCell")
             vb = QVBoxLayout(fr)
             vb.setContentsMargins(2, 2, 2, 2)
             vb.setSpacing(2)
             ic = QLabel()
+            ic.setObjectName("saCmdEditUnitIcon")
             ic.setAlignment(Qt.AlignCenter)
-            ic.setFixedSize(28, 22)
+            ic.setScaledContents(True)
+            ic.setFixedSize(32, 24)
             troop_icon_mgr.apply_to_label(ic, key)
+            self._unit_icon_labels.append((key, ic))
             vb.addWidget(ic)
             sp = QSpinBox()
             sp.setRange(0, 99999)
@@ -2398,11 +2660,47 @@ class SaCommandEditDialog(QDialog):
             vb.addWidget(sp, alignment=Qt.AlignCenter)
             r, c = divmod(i, 4)
             ug.addWidget(fr, r, c)
+        units_wrap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
         sc = QScrollArea()
+        sc.setObjectName("saCmdEditUnitsScroll")
         sc.setWidgetResizable(True)
         sc.setWidget(units_wrap)
         sc.setMinimumHeight(200)
+        sc.setFrameShape(QFrame.NoFrame)
         rv.addWidget(sc, 1)
+
+        if dark:
+            fill = QColor("#252526")
+            unit_bg = "#252526"
+            # Windows: viewport genelde diyalog QSS'ini yok sayıp Base ile beyaz boyar;
+            # yerel stil + palet ikisini de zorunlu kıl.
+            sc.setAttribute(Qt.WA_StyledBackground, True)
+            sc.setAutoFillBackground(True)
+            scpal = sc.palette()
+            scpal.setColor(QPalette.Window, fill)
+            scpal.setColor(QPalette.Base, fill)
+            sc.setPalette(scpal)
+            sc.setStyleSheet(
+                f"QScrollArea#saCmdEditUnitsScroll {{ background-color: {unit_bg}; border: none; }}"
+            )
+            vp = sc.viewport()
+            vp.setObjectName("saCmdEditUnitsViewport")
+            vp.setAttribute(Qt.WA_StyledBackground, True)
+            vp.setAutoFillBackground(True)
+            vpal = vp.palette()
+            vpal.setColor(QPalette.Window, fill)
+            vpal.setColor(QPalette.Base, fill)
+            vp.setPalette(vpal)
+            vp.setStyleSheet(f"QWidget#saCmdEditUnitsViewport {{ background-color: {unit_bg}; border: none; }}")
+            units_wrap.setAttribute(Qt.WA_StyledBackground, True)
+            units_wrap.setAutoFillBackground(True)
+            upal = units_wrap.palette()
+            upal.setColor(QPalette.Window, fill)
+            upal.setColor(QPalette.Base, fill)
+            units_wrap.setPalette(upal)
+            units_wrap.setStyleSheet(
+                f"QWidget#saCmdEditUnitsRoot {{ background-color: {unit_bg}; }}"
+            )
 
         rv.addWidget(QLabel("Mancınık hedefi:"))
         self._combo_catapult = QComboBox()
@@ -2449,6 +2747,15 @@ class SaCommandEditDialog(QDialog):
             self._chk_arrive_master.setChecked(True)
         self._apply_editable_mask()
         self._full_refresh()
+        self._sa_refresh_unit_icons()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._sa_refresh_unit_icons()
+
+    def _sa_refresh_unit_icons(self):
+        for key, lbl in getattr(self, "_unit_icon_labels", ()):
+            troop_icon_mgr.refresh_label_pixmap(lbl, key)
 
     def _fill_row_edits(self, d_e: QLineEdit, t_e: QLineEdit, dt):
         d_e.setText(f"{dt.day:02d}.{dt.month:02d}")
@@ -2566,6 +2873,13 @@ class SaCommandEditDialog(QDialog):
         total = sum(int(troops_map.get(k, 0) or 0) for k, _ in self._bot.SA_UNIT_DEFS)
         if total <= 0:
             QMessageBox.warning(self, "Komut", "En az bir asker girin.")
+            return
+
+        ok_stock, stock_msg = self._bot._sa_validate_troops_within_village_stock(
+            troops_map, self._sx, self._sy
+        )
+        if not ok_stock:
+            QMessageBox.warning(self, "Komut", stock_msg)
             return
 
         mode = "arrive" if self._chk_arrive_master.isChecked() else "send"
@@ -3237,6 +3551,7 @@ class TribalWarsBot(QMainWindow):
     # Arka plan (urllib) → ana iş parçacığı: test kutusu / log; QTimer worker’da kullanılamaz.
     _telegram_test_finished = pyqtSignal(bool, str, str)  # ok, err, chat_id_normalized
     _telegram_send_error = pyqtSignal(str)  # kısa hata metni (sendMessage arka planda)
+    _bright_test_finished = pyqtSignal(bool, str)  # ok, body_or_err (log’da token yok)
 
     # Ordu kuyruğu satırı: ek veri (mancınık hedefi — oyun `building` anahtarı, örn. wall)
     SA_QUEUE_ITEM_ROLE_CATAPULT = Qt.UserRole + 30
@@ -3264,6 +3579,8 @@ class TribalWarsBot(QMainWindow):
     SA_DISPATCH_MAX_BATCH = 5
     # Çok dalgada ardışık satırların gönderim zamanı farkı (oyun yaklaşık 200 ms kullanır; onay formu alanları + kuyruk).
     SA_DISPATCH_WAVE_GAP_MS = 200
+    # Tamamlanan ordu satırları (gönderildi/hata) — ana kuyruktan ayrı; yeniden gönderilmez.
+    SA_ARMY_HISTORY_MAX_ROWS = 400
 
     # Harita barbar tablosu: yoğun bölgelerde en yakın N satır (eski 500, ~20 karede doluyordu)
     MAP_BARB_LIST_MAX_ROWS = 4000
@@ -3311,10 +3628,31 @@ class TribalWarsBot(QMainWindow):
 
         self._telegram_test_finished.connect(self._on_telegram_test_finished)
         self._telegram_send_error.connect(self._on_telegram_send_error_slot)
+        self._bright_test_finished.connect(self._on_bright_test_finished)
 
     @pyqtSlot(str)
     def _on_telegram_send_error_slot(self, m: str):
         self._add_log("SİSTEM", "warn", f"Telegram: {m}")
+
+    @pyqtSlot(bool, str)
+    def _on_bright_test_finished(self, ok: bool, body_or_err: str) -> None:
+        """Bright Web Unlocker test thread sonucu (ana thread)."""
+        text = (body_or_err or "").strip()
+        if ok:
+            prev = text[:1800] + ("…" if len(text) > 1800 else "")
+            self._add_log("AYAR", "success", f"Bright Web Unlocker: test OK (yanıt {len(text)} karakter)")
+            _tw_telegram_msgbox_on_top(
+                self,
+                False,
+                "Bright Web Unlocker",
+                "İstek başarılı.\n\n"
+                "Bu yalnızca API + zone doğrulamasıdır; gömülü tarayıcıdaki hCaptcha otomatik "
+                "çözülmez. İleride oturum köprüsü ayrı adımdır.\n\n"
+                f"Özet:\n{prev}",
+            )
+        else:
+            self._add_log("AYAR", "warn", f"Bright Web Unlocker: {text[:400]}")
+            _tw_telegram_msgbox_on_top(self, True, "Bright Web Unlocker", text[:3500])
 
     @pyqtSlot(bool, str, str)
     def _on_telegram_test_finished(self, ok: bool, err: str, nchat_norm: str) -> None:
@@ -3438,6 +3776,21 @@ class TribalWarsBot(QMainWindow):
             tg_ssl = self.settings_tg_insecure_ssl_cb.isChecked()
             self._settings.setValue("notify/telegram_insecure_ssl", tg_ssl)
             _tw_save_config({"telegram_insecure_ssl": tg_ssl})
+        if hasattr(self, "settings_bright_enable_cb"):
+            self._settings.setValue(
+                "bright/enabled", self.settings_bright_enable_cb.isChecked()
+            )
+            self._settings.setValue("bright/api_token", self.settings_bright_token.text().strip())
+            self._settings.setValue("bright/zone", self.settings_bright_zone.text().strip())
+            self._settings.setValue("bright/test_url", self.settings_bright_test_url.text().strip())
+            fmt = self.settings_bright_format.currentData() or "raw"
+            self._settings.setValue("bright/format", fmt)
+            self._settings.setValue(
+                "bright/insecure_ssl",
+                self.settings_bright_insecure_ssl_cb.isChecked()
+                if hasattr(self, "settings_bright_insecure_ssl_cb")
+                else False,
+            )
         self._settings.sync()
         self._add_log("AYAR", "info", "Ayarlar diske kaydedildi.")
         QMessageBox.information(
@@ -3445,7 +3798,8 @@ class TribalWarsBot(QMainWindow):
             "Ayarlar",
             "Ayarlar kaydedildi.\n\n"
             "Proxy değişikliğinin tarayıcıda tam uygulanması için uygulamayı kapatıp yeniden açın.\n"
-            "Proxy şifresi ve Telegram bot token’ı yalnızca bu bilgisayardaki Qt ayarlarında tutulur.",
+            "Proxy şifresi, Telegram bot token’ı ve Bright API token’ı yalnızca bu bilgisayardaki "
+            "Qt ayarlarında tutulur (tw_config.json’a yazılmaz).",
         )
 
     def _format_telegram_security_message(self, parts) -> str:
@@ -3497,6 +3851,35 @@ class TribalWarsBot(QMainWindow):
             )
             nchat = _tw_normalize_telegram_chat_id(chat)
             self._telegram_test_finished.emit(ok, err or "", nchat)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_settings_bright_test(self):
+        """Bright Web Unlocker duman testi (widget değerleri; Kaydet şart değil)."""
+        token = (self.settings_bright_token.text() or "").strip()
+        zone = (self.settings_bright_zone.text() or "").strip()
+        url = (self.settings_bright_test_url.text() or "").strip() or BRIGHT_DEFAULT_TEST_URL
+        fmt = (self.settings_bright_format.currentData() or "raw")
+        if not token or not zone:
+            _tw_telegram_msgbox_on_top(
+                self,
+                True,
+                "Bright Web Unlocker",
+                "API token ve zone adını doldurun (Bright panel — Web Unlocker zone).",
+            )
+            return
+        insecure = (
+            self.settings_bright_insecure_ssl_cb.isChecked()
+            if hasattr(self, "settings_bright_insecure_ssl_cb")
+            else False
+        )
+        self._add_log("AYAR", "info", "Bright: test isteği gönderiliyor (api.brightdata.com)…")
+
+        def work():
+            ok, msg = bright_web_unlocker_request(
+                token, zone, url, response_format=fmt, timeout_sec=120, insecure_ssl=insecure
+            )
+            self._bright_test_finished.emit(ok, msg or "")
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -3561,6 +3944,9 @@ class TribalWarsBot(QMainWindow):
             pc = "#c8c8c8" if self._dark_mode else "#555555"
             self.sa_source_points_label.setStyleSheet(f"font-size: 10px; color: {pc};")
 
+        if hasattr(self, "sa_source_combo"):
+            self._sa_apply_source_combo_list_theme()
+
         if hasattr(self, "settings_dark_cb"):
             self.settings_dark_cb.blockSignals(True)
             self.settings_dark_cb.setChecked(self._dark_mode)
@@ -3618,6 +4004,8 @@ class TribalWarsBot(QMainWindow):
                 self.sa_table.header().setStyleSheet(
                     "QHeaderView::section { font-size: 10px; padding: 3px; }"
                 )
+        if hasattr(self, "sa_history_table"):
+            self.sa_history_table.header().setStyleSheet(self.sa_table.header().styleSheet())
 
         if hasattr(self, "map_ctrl_frame"):
             if self._dark_mode:
@@ -3901,7 +4289,8 @@ class TribalWarsBot(QMainWindow):
         layout.addSpacing(6)
         layout.addWidget(QLabel("Köy:"))
         self.village_combo = QComboBox()
-        self.village_combo.setMinimumWidth(180)
+        self.village_combo.setMinimumWidth(220)
+        self.village_combo.setStyleSheet(TW_VILLAGE_COMBO_STYLE)
         self.village_combo.setEnabled(False)
         self.village_combo.addItem("— Dünyaya girin —")
         self.village_combo.currentIndexChanged.connect(self._on_village_changed)
@@ -4475,9 +4864,10 @@ class TribalWarsBot(QMainWindow):
 
         coord_row.addWidget(QLabel("Kaynak:"))
         self.sa_source_combo = QComboBox()
-        self.sa_source_combo.setMinimumWidth(200)
+        self.sa_source_combo.setMinimumWidth(280)
         self.sa_source_combo.addItem("— Köy Seçin —")
         self.sa_source_combo.currentIndexChanged.connect(self._sa_on_source_changed)
+        self._sa_apply_source_combo_list_theme()
         coord_row.addWidget(self.sa_source_combo)
         self.sa_source_points_label = QLabel("Puan: —")
         self.sa_source_points_label.setStyleSheet("font-size: 10px;")
@@ -4694,7 +5084,47 @@ class TribalWarsBot(QMainWindow):
 
         self.sa_table.itemDoubleClicked.connect(self._sa_on_army_queue_item_double_clicked)
 
-        layout.addWidget(self.sa_table, 1)
+        hist_headers = headers + ["Sonuç"]
+        self.sa_history_table = QTreeWidget()
+        self.sa_history_table.setAlternatingRowColors(True)
+        self.sa_history_table.setRootIsDecorated(False)
+        self.sa_history_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.sa_history_table.setHeaderLabels(hist_headers)
+        self.sa_history_table.setColumnCount(len(hist_headers))
+        hist_widths = col_widths + [220]
+        for i, w in enumerate(hist_widths):
+            self.sa_history_table.setColumnWidth(i, w)
+        self.sa_history_table.header().setDefaultAlignment(Qt.AlignCenter)
+        self.sa_history_table.header().setStyleSheet(self.sa_table.header().styleSheet())
+        self.sa_history_table.setStyleSheet("QTreeWidget { font-size: 11px; }")
+        self.sa_history_table.itemDoubleClicked.connect(self._sa_on_army_history_item_double_clicked)
+
+        sa_split = QSplitter(Qt.Vertical)
+        sa_split.setChildrenCollapsible(False)
+        w_top = QWidget()
+        v_top = QVBoxLayout(w_top)
+        v_top.setContentsMargins(0, 0, 0, 0)
+        v_top.setSpacing(2)
+        lbl_pending = QLabel("Bekleyen komutlar (gönderim zamanlayıcısı yalnızca bu listeyi kullanır)")
+        lbl_pending.setStyleSheet("font-size: 10px; color: #555;")
+        v_top.addWidget(lbl_pending)
+        v_top.addWidget(self.sa_table, 1)
+        sa_split.addWidget(w_top)
+        w_bot = QWidget()
+        v_bot = QVBoxLayout(w_bot)
+        v_bot.setContentsMargins(0, 0, 0, 0)
+        v_bot.setSpacing(2)
+        lbl_hist = QLabel(
+            "Tamamlanan (başarılı veya hata — yeniden gönderilmez; uygulama kapanınca ayrı kaydedilir)"
+        )
+        lbl_hist.setStyleSheet("font-size: 10px; color: #555;")
+        lbl_hist.setWordWrap(True)
+        v_bot.addWidget(lbl_hist)
+        v_bot.addWidget(self.sa_history_table, 1)
+        sa_split.addWidget(w_bot)
+        sa_split.setStretchFactor(0, 3)
+        sa_split.setStretchFactor(1, 1)
+        layout.addWidget(sa_split, 1)
 
         # ═══════════════════════════════════════════
         #  ALT ÇUBUK
@@ -4718,6 +5148,12 @@ class TribalWarsBot(QMainWindow):
         btn_clear.clicked.connect(self._sa_clear_all)
         bottom.addWidget(btn_clear)
 
+        btn_hist_clear = QPushButton("Geçmişi temizle")
+        btn_hist_clear.setCursor(Qt.PointingHandCursor)
+        btn_hist_clear.setToolTip("Tamamlanan komutlar tablosunu boşaltır (geri alınamaz).")
+        btn_hist_clear.clicked.connect(self._sa_clear_army_history)
+        bottom.addWidget(btn_hist_clear)
+
         layout.addLayout(bottom)
 
         # Gönderim anahtarı yalnızca zamanlayıcı POST'larını açar; form her zaman düzenlenebilir
@@ -4727,6 +5163,7 @@ class TribalWarsBot(QMainWindow):
         self.enable_sending_cb.toggled.connect(self._toggle_sending_army)
         self._toggle_sending_army(False)
 
+        self._sa_restore_army_history()
         self._sa_restore_army_queue()
         self.sa_tab = tab
         self.tabs.addTab(tab, "⚔️ Ordu Gönder")
@@ -4745,11 +5182,54 @@ class TribalWarsBot(QMainWindow):
             self.enable_sending_cb.setStyleSheet(
                 "font-weight: bold; font-size: 11px; color: #228822;")
             self._add_log("KOMUT", "success", "Ordu gönderimi aktif edildi.")
+            # Gönderim öncesi tek taze DOM örnekleme; sonra anchor perf ile ilerler (gezinmede bozulmaz).
+            try:
+                self._fetch_server_time(force=True)
+            except Exception:
+                pass
         else:
             self.enable_sending_cb.setStyleSheet(
                 "font-weight: bold; font-size: 11px; color: #cc4444;")
             if hasattr(self, 'log_text'):
                 self._add_log("KOMUT", "warn", "Ordu gönderimi devre dışı.")
+
+    def _sa_apply_source_combo_list_theme(self):
+        """Kaynak köy açılır listesi: zebra (zıt) satır renkleri + okunaklı yazı."""
+        if not hasattr(self, "sa_source_combo"):
+            return
+        combo = self.sa_source_combo
+        view = combo.view()
+        view.setAlternatingRowColors(True)
+        view.setMinimumWidth(max(combo.minimumWidth(), 280))
+        if self._dark_mode:
+            combo.setStyleSheet(
+                "QComboBox {\n"
+                "  font-size: 12px; min-height: 24px; padding: 2px 8px;\n"
+                "  background: #3c3c3c; color: #eeeeee; border: 1px solid #666666;\n"
+                "}\n"
+                "QComboBox QAbstractItemView {\n"
+                "  font-size: 12px; padding: 4px 8px; min-height: 24px;\n"
+                "  background: #2a2a2d; alternate-background-color: #3a3f48;\n"
+                "  color: #f0f0f0; outline: 0; border: 1px solid #555555;\n"
+                "}\n"
+                "QComboBox QAbstractItemView::item:selected {\n"
+                "  background: #2a5a9e; color: #ffffff;\n"
+                "}"
+            )
+        else:
+            combo.setStyleSheet(
+                "QComboBox {\n"
+                "  font-size: 12px; min-height: 24px; padding: 2px 8px;\n"
+                "}\n"
+                "QComboBox QAbstractItemView {\n"
+                "  font-size: 12px; padding: 4px 8px; min-height: 24px;\n"
+                "  background: #ffffff; alternate-background-color: #dde8f4;\n"
+                "  color: #1a1a1a; outline: 0;\n"
+                "}\n"
+                "QComboBox QAbstractItemView::item:selected {\n"
+                "  background: #a8c8f0; color: #000000;\n"
+                "}"
+            )
 
     def _sa_troops_for_selected_source(self):
         """Kaynak combobox'taki köyün troops sözlüğü; köy yoksa veya veri yoksa {}."""
@@ -4776,7 +5256,31 @@ class TribalWarsBot(QMainWindow):
         n = int(troops.get(unit_key, 0) or 0)
         if n <= 0:
             return
-        self.sa_troop_inputs[unit_key].setValue(n)
+            self.sa_troop_inputs[unit_key].setValue(n)
+
+    @staticmethod
+    def _sa_same_village_id(a, b):
+        """combo.currentData() ile JSON kayıtları arasında int/str farkını tolere eder."""
+        if a is None or b is None:
+            return False
+        try:
+            return int(a) == int(b)
+        except (TypeError, ValueError):
+            return str(a) == str(b)
+
+    @staticmethod
+    def _sa_points_from_village_dict(v):
+        """Köy dict'inden puan; bilinmiyorsa None (0 geçerli bir değer)."""
+        if not v or not isinstance(v, dict):
+            return None
+        raw = v.get("points")
+        if raw is None or raw == "":
+            return None
+        try:
+            s = str(raw).replace(",", "").replace("\u00a0", "").strip()
+            return int(float(s))
+        except (TypeError, ValueError):
+            return None
 
     def _sa_on_source_changed(self, index):
         """Kaynak köy seçildiğinde asker mevcutlarını ve köy puanını güncelle."""
@@ -4798,34 +5302,26 @@ class TribalWarsBot(QMainWindow):
 
         all_v = self._game_data.get("all_villages", [])
         found_troops = None
-        found_pts = 0
+        found_pts = None
         for v in all_v:
-            if v.get("id") == village_id:
+            if self._sa_same_village_id(v.get("id"), village_id):
                 found_troops = v.get("troops", {})
-                try:
-                    found_pts = int(v.get("points") or 0)
-                except (TypeError, ValueError):
-                    found_pts = 0
+                found_pts = self._sa_points_from_village_dict(v)
                 break
 
-        if found_troops is None:
-            v = self._game_data.get("village", {})
-            if v and v.get("id") == village_id:
+        gv = (self._game_data or {}).get("village") or {}
+        if self._sa_same_village_id(gv.get("id"), village_id):
+            if found_troops is None:
                 found_troops = self._game_data.get("troops", {})
-                if found_pts <= 0:
-                    try:
-                        found_pts = int(v.get("points") or 0)
-                    except (TypeError, ValueError):
-                        found_pts = 0
-            else:
-                found_troops = {}
-
+            gfp = self._sa_points_from_village_dict(gv)
+            if gfp is not None:
+                found_pts = gfp if found_pts is None else max(found_pts, gfp)
         if found_troops is None:
             found_troops = {}
 
-        self._sa_source_points_cache = max(0, found_pts)
+        self._sa_source_points_cache = int(found_pts) if found_pts is not None else 0
         if hasattr(self, "sa_source_points_label"):
-            if found_pts > 0:
+            if found_pts is not None:
                 self.sa_source_points_label.setText(f"Puan: {found_pts:,}")
             else:
                 self.sa_source_points_label.setText("Puan: —")
@@ -5013,6 +5509,12 @@ class TribalWarsBot(QMainWindow):
 
         troops_map = {k: self.sa_troop_inputs[k].value() for k, _ in self.SA_UNIT_DEFS}
         cmd_attack = self.cmd_type_combo.currentIndex() == 0
+        ok_stock, stock_msg = self._sa_validate_troops_within_village_stock(
+            troops_map, src_x, src_y
+        )
+        if not ok_stock:
+            QMessageBox.warning(self, "Uyarı", stock_msg)
+            return
         ok, err = self._sa_append_row_from_values(
             src_text, src_x, src_y, tgt_x, tgt_y, troops_map, cmd_attack,
             self._sa_time_mode, input_dt,
@@ -5023,8 +5525,12 @@ class TribalWarsBot(QMainWindow):
     def _sa_open_misyoner_multi_dialog(self):
         MisyonerMultiWaveDialog(self, self).exec_()
 
-    # Koçbaşı komutu: otomatik doldurulacak birim anahtarları (baltacı, hafif, koç, atlı okçu, casus)
-    SA_RAM_AUTO_KEYS = ("axe", "light", "ram", "marcher", "spy")
+    # Koçbaşı komutu: otomatik doldurulacak birim anahtarları (baltacı, hafif, koç, mancınık, atlı okçu, casus)
+    SA_RAM_AUTO_KEYS = ("axe", "light", "ram", "catapult", "marcher", "spy")
+    # Toplu yapıştır: [unit]axe[/unit] + saldırı — köydeki balta, hafif, atlı okçu, casus
+    SA_BULK_AXE_ATTACK_KEYS = ("axe", "light", "marcher", "spy")
+    # Toplu yapıştır: [unit]sword[/unit] + destek — köydeki mızrak, kılıç, casus, ağır
+    SA_BULK_SWORD_SUPPORT_KEYS = ("spear", "sword", "spy", "heavy")
 
     def _sa_compute_timeline_from_anchor(
         self, src_x, src_y, tgt_x, tgt_y, troops_map, time_mode, input_dt
@@ -5181,6 +5687,39 @@ class TribalWarsBot(QMainWindow):
             return v
         return None
 
+    def _sa_validate_troops_within_village_stock(self, troops_map, src_x, src_y):
+        """
+        Kaynak köyün `troops` sözlüğü biliniyorsa, komuttaki miktarların stoğu aşmamasını kontrol eder.
+        Dönüş: (True, None) veya (False, kullanıcıya gösterilecek metin).
+        Veri yoksa veya köy bulunamazsa doğrulama atlanır (True, None).
+        """
+        v = self._sa_find_village_at_coord(src_x, src_y)
+        if not v:
+            return True, None
+        avail = v.get("troops")
+        if not isinstance(avail, dict):
+            return True, None
+        over = []
+        tr = getattr(self, "INCOMINGS_UNIT_TR", None) or {}
+        for key, _ in self.SA_UNIT_DEFS:
+            want = int(troops_map.get(key, 0) or 0)
+            cap = int(avail.get(key, 0) or 0)
+            if want > cap:
+                label = tr.get(key, key)
+                over.append(f"{label}: yazdığınız {want}, köyde {cap}")
+        if not over:
+            return True, None
+        max_lines = 14
+        body = "\n".join(over[:max_lines])
+        if len(over) > max_lines:
+            body += f"\n… ve {len(over) - max_lines} birim daha"
+        return False, (
+            "Bazı birimler köydekinden fazla:\n\n"
+            + body
+            + "\n\nMiktarları düzeltin veya birlik verisini yenileyin.\n"
+            "(İngilizce sunucularda şövalye = knight.)"
+        )
+
     def _sa_troops_total_population(self, troops_map):
         """Komuttaki birliklerin toplam nüfus yükü (SA_UNIT_POPULATION)."""
         total = 0
@@ -5198,9 +5737,8 @@ class TribalWarsBot(QMainWindow):
         vt = self._sa_find_village_at_coord(src_x, src_y)
         if not vt:
             return 0
-        try:
-            p = int(vt.get("points") or 0)
-        except (TypeError, ValueError):
+        p = self._sa_points_from_village_dict(vt)
+        if p is None:
             return 0
         return p if p > 0 else 0
 
@@ -5302,11 +5840,20 @@ class TribalWarsBot(QMainWindow):
         return rows
 
     def _sa_troops_ram_full_from_village(self, village_troops):
-        """Köydeki balta, hafif, koç, atlı okçu, casus — tamamı."""
+        """Köydeki balta, hafif, koç, mancınık, atlı okçu, casus — tamamı."""
         t = {k: 0 for k, _ in self.SA_UNIT_DEFS}
         vt = village_troops or {}
         for k in self.SA_RAM_AUTO_KEYS:
             t[k] = int(vt.get(k, 0) or 0)
+        return t
+
+    def _sa_troops_copy_keys_from_village(self, village_troops, keys):
+        """Köyden yalnızca `keys` içindeki birimlerin tam sayısını alır (diğerleri 0)."""
+        t = {k: 0 for k, _ in self.SA_UNIT_DEFS}
+        vt = village_troops or {}
+        for k in keys:
+            if k in t:
+                t[k] = int(vt.get(k, 0) or 0)
         return t
 
     def _sa_troops_noble_split_wave(self, village_troops, parts, wave_index):
@@ -5349,7 +5896,7 @@ class TribalWarsBot(QMainWindow):
                 msg.setWindowTitle("Misyoner bölme")
                 msg.setText(
                     "Listede misyoner (snob) komutu var.\n\n"
-                    "Eskort birimleri (balta, hafif, koç, atlı okçu, casus) parça sayısına bölünür.\n"
+                    "Eskort birimleri (balta, hafif, koç, mancınık, atlı okçu, casus) parça sayısına bölünür.\n"
                     "Her parçaya 1 misyoner yazılır (3 parça → 3×1, 4 parça → 4×1; köyde daha az snob varsa "
                     "yalnızca ilk parçalara 1'er konur).\n\n"
                     "Kaç parça olsun?"
@@ -5394,6 +5941,46 @@ class TribalWarsBot(QMainWindow):
                 ut = r["unit"]
                 if ut == "ram":
                     troops_map = self._sa_troops_ram_full_from_village(troops_avail)
+                    ok, err = self._sa_append_row_from_values(
+                        src_text,
+                        r["sx"],
+                        r["sy"],
+                        r["tx"],
+                        r["ty"],
+                        troops_map,
+                        cmd_attack,
+                        "send",
+                        dt,
+                        fake_dialog=False,
+                    )
+                    if ok:
+                        added += 1
+                    else:
+                        skipped.append(f"{src_text}: {err}")
+                elif ut == "axe" and cmd_attack:
+                    troops_map = self._sa_troops_copy_keys_from_village(
+                        troops_avail, self.SA_BULK_AXE_ATTACK_KEYS
+                    )
+                    ok, err = self._sa_append_row_from_values(
+                        src_text,
+                        r["sx"],
+                        r["sy"],
+                        r["tx"],
+                        r["ty"],
+                        troops_map,
+                        cmd_attack,
+                        "send",
+                        dt,
+                        fake_dialog=False,
+                    )
+                    if ok:
+                        added += 1
+                    else:
+                        skipped.append(f"{src_text}: {err}")
+                elif ut == "sword" and not cmd_attack:
+                    troops_map = self._sa_troops_copy_keys_from_village(
+                        troops_avail, self.SA_BULK_SWORD_SUPPORT_KEYS
+                    )
                     ok, err = self._sa_append_row_from_values(
                         src_text,
                         r["sx"],
@@ -5643,6 +6230,8 @@ class TribalWarsBot(QMainWindow):
             for i in range(self.sa_table.topLevelItemCount()):
                 it = self.sa_table.topLevelItem(i)
                 state = str(it.data(0, Qt.UserRole) or "")
+                if state in ("sent", "error"):
+                    continue
                 catapult = str(it.data(0, self.SA_QUEUE_ITEM_ROLE_CATAPULT) or "")
                 rows.append([it.text(c) for c in range(n)] + [state, catapult])
             self._settings.setValue("army_queue/rows_json", json.dumps(rows, ensure_ascii=False))
@@ -5688,6 +6277,21 @@ class TribalWarsBot(QMainWindow):
             # Geçici state'leri temizle
             if state in _TRANSIENT:
                 state = ""
+            # Eski kayıt: tamamlananlar ana kuyrukta kalmasın (yeniden gönderim riski)
+            if state == "sent":
+                self._sa_history_append_row_from_saved(
+                    text_cols, catapult, "sent", "Gönderildi (kayıttan)"
+                )
+                continue
+            if state == "error":
+                err_txt = ""
+                if len(text_cols) > 18:
+                    err_txt = str(text_cols[18]).strip()
+                if not err_txt or err_txt == "HATA":
+                    err_txt = "Kayıtlı hata (ayrıntı yok)"
+                self._sa_history_append_row_from_saved(text_cols, catapult, "error", err_txt)
+                continue
+
             item = QTreeWidgetItem([str(x) for x in text_cols])
             troop_values = text_cols[2:14]
             for col in range(2, 14):
@@ -5705,17 +6309,153 @@ class TribalWarsBot(QMainWindow):
             self.sa_table.addTopLevelItem(item)
             if catapult:
                 item.setData(0, self.SA_QUEUE_ITEM_ROLE_CATAPULT, catapult)
-            # Kaydedilmiş state'e göre görsel uygula
-            if state == "sent":
-                self._dispatch_mark_sent(item)
-            elif state == "error":
-                self._dispatch_mark_error(item, "—")
         self._sa_update_totals()
 
     def _sa_update_totals(self):
         count = self.sa_table.topLevelItemCount()
-        self.sa_totals_label.setText(f"TOPLAM: {count} komut")
+        nh = (
+            self.sa_history_table.topLevelItemCount()
+            if hasattr(self, "sa_history_table")
+            else 0
+        )
+        self.sa_totals_label.setText(f"BEKLEYEN: {count} komut  |  GEÇMİŞ: {nh}")
         self._sa_save_army_queue()
+        self._sa_save_army_history()
+
+    def _sa_trim_army_history_overflow(self):
+        if not hasattr(self, "sa_history_table"):
+            return
+        mx = int(getattr(self, "SA_ARMY_HISTORY_MAX_ROWS", 400) or 400)
+        while self.sa_history_table.topLevelItemCount() > mx:
+            self.sa_history_table.takeTopLevelItem(self.sa_history_table.topLevelItemCount() - 1)
+
+    def _sa_history_style_row(self, item, status):
+        for col in range(item.columnCount()):
+            if status == "sent":
+                item.setBackground(col, QColor("#d4f0d4"))
+                item.setForeground(col, QColor("#2a7a2a"))
+            else:
+                item.setBackground(col, QColor("#f0d4d4"))
+                item.setForeground(col, QColor("#aa3333"))
+            item.setTextAlignment(col, Qt.AlignCenter)
+
+    def _sa_history_append_row_from_saved(self, text_cols, catapult, status, detail):
+        """Kayıt dosyasından gelen tamamlanan satırı geçmiş tabloya ekler."""
+        if not hasattr(self, "sa_history_table"):
+            return
+        n = self.sa_table.columnCount()
+        padded = [str(text_cols[i]) if i < len(text_cols) else "" for i in range(n)]
+        d = (detail or "—").strip()
+        if len(d) > 500:
+            d = d[:497] + "..."
+        hi = QTreeWidgetItem(padded + [d])
+        self._sa_history_style_row(hi, status)
+        hi.setData(0, Qt.UserRole, status)
+        if catapult:
+            hi.setData(0, self.SA_QUEUE_ITEM_ROLE_CATAPULT, catapult)
+        self.sa_history_table.insertTopLevelItem(0, hi)
+        self._sa_trim_army_history_overflow()
+
+    def _sa_move_completed_row_to_history(self, item, status, detail):
+        """Ana kuyruktan tek satırı geçmişe taşır (item zaten boyanmış olabilir)."""
+        if not hasattr(self, "sa_history_table"):
+            return
+        idx = self.sa_table.indexOfTopLevelItem(item)
+        if idx < 0:
+            return
+        it = self.sa_table.takeTopLevelItem(idx)
+        if not it:
+            return
+        d = (detail or "—").strip()
+        if len(d) > 500:
+            d = d[:497] + "..."
+        it.setText(19, d)
+        it.setData(0, Qt.UserRole, status)
+        for col in range(it.columnCount()):
+            it.setTextAlignment(col, Qt.AlignCenter)
+        self.sa_history_table.insertTopLevelItem(0, it)
+        self._sa_trim_army_history_overflow()
+
+    def _sa_move_completed_rows_batch(self, items, status, detail):
+        """Aynı anda tamamlanan birden fazla satırı güvenli indeks sırasıyla geçmişe taşır."""
+        idxs = sorted(
+            {self.sa_table.indexOfTopLevelItem(it) for it in items if it is not None},
+            reverse=True,
+        )
+        d = (detail or "—").strip()
+        if len(d) > 500:
+            d = d[:497] + "..."
+        for idx in idxs:
+            if idx < 0:
+                continue
+            it = self.sa_table.takeTopLevelItem(idx)
+            if not it:
+                continue
+            it.setText(19, d)
+            it.setData(0, Qt.UserRole, status)
+            for col in range(it.columnCount()):
+                it.setTextAlignment(col, Qt.AlignCenter)
+            self.sa_history_table.insertTopLevelItem(0, it)
+        self._sa_trim_army_history_overflow()
+        self._sa_update_totals()
+
+    def _sa_save_army_history(self):
+        if not hasattr(self, "sa_history_table") or not hasattr(self, "_settings"):
+            return
+        try:
+            n = self.sa_history_table.columnCount()
+            rows = []
+            for i in range(self.sa_history_table.topLevelItemCount()):
+                it = self.sa_history_table.topLevelItem(i)
+                catapult = str(it.data(0, self.SA_QUEUE_ITEM_ROLE_CATAPULT) or "")
+                rows.append([it.text(c) for c in range(n)] + [catapult])
+            self._settings.setValue("army_history/rows_json", json.dumps(rows, ensure_ascii=False))
+            self._settings.sync()
+        except (TypeError, ValueError):
+            pass
+
+    def _sa_restore_army_history(self):
+        if not hasattr(self, "sa_history_table") or not hasattr(self, "_settings"):
+            return
+        raw = self._settings.value("army_history/rows_json", "")
+        if not raw:
+            return
+        try:
+            rows = json.loads(str(raw))
+        except json.JSONDecodeError:
+            return
+        if not isinstance(rows, list):
+            return
+        n = self.sa_history_table.columnCount()
+        self.sa_history_table.clear()
+        for row in rows:
+            if not isinstance(row, list) or len(row) < n:
+                continue
+            text_cols = [str(x) for x in row[:n]]
+            catapult = str(row[n]) if len(row) > n else ""
+            detail = str(text_cols[-1]) if text_cols else ""
+            status = "sent" if "Gönderildi" in detail else "error"
+            hi = QTreeWidgetItem(text_cols)
+            self._sa_history_style_row(hi, status)
+            hi.setData(0, Qt.UserRole, status)
+            if catapult:
+                hi.setData(0, self.SA_QUEUE_ITEM_ROLE_CATAPULT, catapult)
+            self.sa_history_table.addTopLevelItem(hi)
+        self._sa_trim_army_history_overflow()
+
+    def _sa_clear_army_history(self):
+        if not hasattr(self, "sa_history_table"):
+            return
+        self.sa_history_table.clear()
+        self._sa_update_totals()
+
+    def _sa_on_army_history_item_double_clicked(self, item, column):
+        QMessageBox.information(
+            self,
+            "Tamamlanan komut",
+            "Geçmiş satırlar salt okunurdur.\n"
+            "Yeni komut eklemek için üstteki «Bekleyen komutlar» tablosunu kullanın.",
+        )
 
     def _sa_parse_targets_coords(self, text):
         """Metinden hedef koordinatları çıkar (sıra korunur, mükerrer atlanır)."""
@@ -6907,7 +7647,8 @@ class TribalWarsBot(QMainWindow):
 
         if attempt > 100:  # 100 × 200ms = 20sn timeout
             for it in rows:
-                self._dispatch_mark_error(it, "Zaman aşımı")
+                self._dispatch_mark_error(it, "Zaman aşımı", move_to_history=False)
+            self._sa_move_completed_rows_batch(rows, "error", "Zaman aşımı")
             self._add_log("GÖNDERİM", "error",
                 f"❌ Zaman aşımı: {src_text} → ({tgt_text})")
             return
@@ -6919,7 +7660,8 @@ class TribalWarsBot(QMainWindow):
 
             if result_str == "SENT_OK":
                 for it in rows:
-                    self._dispatch_mark_sent(it)
+                    self._dispatch_mark_sent(it, move_to_history=False)
+                self._sa_move_completed_rows_batch(rows, "sent", "Gönderildi")
                 batch_note = f" ({len(rows)} dalga)" if len(rows) > 1 else ""
                 self._add_log("GÖNDERİM", "success",
                     f"✅ Komut gönderildi{batch_note}: {src_text} → ({tgt_text}) | {cmd_type}")
@@ -6930,7 +7672,8 @@ class TribalWarsBot(QMainWindow):
             elif result_str.startswith("ERROR"):
                 error = result_str.replace("ERROR|", "")
                 for it in rows:
-                    self._dispatch_mark_error(it, error)
+                    self._dispatch_mark_error(it, error, move_to_history=False)
+                self._sa_move_completed_rows_batch(rows, "error", error or "—")
                 self._add_log("GÖNDERİM", "error",
                     f"❌ Gönderim hatası: {src_text} → ({tgt_text}) | {error}")
 
@@ -6941,8 +7684,8 @@ class TribalWarsBot(QMainWindow):
 
         self.browser.page().runJavaScript(check_js, on_poll)
 
-    def _dispatch_mark_sent(self, item):
-        """Gönderilen satırı yeşile boyar."""
+    def _dispatch_mark_sent(self, item, *, move_to_history=True):
+        """Gönderilen satırı yeşile boyar; istenirse geçmiş tabloya taşır."""
         for col in range(item.columnCount()):
             item.setBackground(col, QColor("#d4f0d4"))
             item.setForeground(col, QColor("#2a7a2a"))
@@ -6953,21 +7696,23 @@ class TribalWarsBot(QMainWindow):
                 hook(item)
             except Exception:
                 pass
+        if move_to_history:
+            self._sa_move_completed_row_to_history(item, "sent", "Gönderildi")
 
-    def _dispatch_mark_error(self, item, error_msg):
-        """Hata olan satırı kırmızıya boyar."""
+    def _dispatch_mark_error(self, item, error_msg, *, move_to_history=True):
+        """Hata satırını kırmızıya boyar; ayrıntı geçmişte «Sonuç» sütununda (ID korunur)."""
         for col in range(item.columnCount()):
             item.setBackground(col, QColor("#f0d4d4"))
             item.setForeground(col, QColor("#aa3333"))
         item.setData(0, Qt.UserRole, "error")
-        # Açıklama olarak hata mesajını ID sütununa yaz
-        item.setText(18, f"HATA")
         hook = getattr(self, "_hybrid_on_dispatch_error", None)
         if callable(hook):
             try:
                 hook(item, error_msg)
             except Exception:
                 pass
+        if move_to_history:
+            self._sa_move_completed_row_to_history(item, "error", error_msg or "—")
 
     def _build_task_queue_tab(self):
         """Bina kuyruğu: köy seç → karargah bina listesi + Ekle; alttaki kuyruk kalıcı, oyunda 2 inşaat doluysa bekler."""
@@ -6996,7 +7741,8 @@ class TribalWarsBot(QMainWindow):
         vrow = QHBoxLayout()
         vrow.addWidget(QLabel("Köy:"))
         self.bq_village_combo = QComboBox()
-        self.bq_village_combo.setMinimumWidth(240)
+        self.bq_village_combo.setMinimumWidth(260)
+        self.bq_village_combo.setStyleSheet(TW_VILLAGE_COMBO_STYLE)
         self.bq_village_combo.addItem("— Köy Seçin —", None)
         vrow.addWidget(self.bq_village_combo, 1)
         self.bq_village_refresh_btn = QPushButton("Seviyeleri yenile")
@@ -9552,6 +10298,8 @@ class TribalWarsBot(QMainWindow):
             return
         if not self._map_data_loaded:
             return
+        if self._human_verification_required:
+            return
 
         import time
         now = time.time()
@@ -11832,6 +12580,21 @@ class TribalWarsBot(QMainWindow):
             if parts:
                 row.setText(2, " | ".join(parts))
 
+    def _rt_abort_building_poll_for_human(self, vid, bld_key, js_global):
+        """Doğrulama/hCaptcha aktifken devam eden eğitim poll zincirini kes (processing + JS global)."""
+        state = self._rt_village_states.get(str(vid))
+        if state:
+            bst = state.get("buildings", {}).get(bld_key)
+            if bst:
+                bst["processing"] = False
+            row = state.get("row")
+            if row:
+                row.setText(4, "Doğrulama bekleniyor — durdu")
+                row.setForeground(4, QColor("#cc4444"))
+        if self.browser:
+            k = json.dumps(js_global)
+            self.browser.page().runJavaScript(f"try {{ window[{k}] = null; }} catch (e) {{}}")
+
     def _rt_process_building(self, vid, bld_key):
         """Belirli bir bina kuyruğunu işle (kışla/ahır/atölye bağımsız)."""
         state = self._rt_village_states.get(str(vid))
@@ -11839,6 +12602,8 @@ class TribalWarsBot(QMainWindow):
             return
         units = self._rt_get_building_units(vid, bld_key)
         if not units:
+            return
+        if self._human_verification_required:
             return
 
         bst = state["buildings"][bld_key]
@@ -11942,6 +12707,10 @@ class TribalWarsBot(QMainWindow):
         state = self._rt_village_states.get(str(vid))
         bld_label = self._RT_BUILDINGS.get(bld_key, {}).get("label", bld_key)
 
+        if self._human_verification_required:
+            self._rt_abort_building_poll_for_human(vid, bld_key, js_global)
+            return
+
         if attempt > 80 or not state:
             if state:
                 bst = state["buildings"].get(bld_key, {})
@@ -11962,6 +12731,9 @@ class TribalWarsBot(QMainWindow):
             result_str = str(result) if result else "WAITING"
 
             if result_str in ("WAITING", "CHECKING") or result_str.startswith("POSTING"):
+                if self._human_verification_required:
+                    self._rt_abort_building_poll_for_human(vid, bld_key, js_global)
+                    return
                 QTimer.singleShot(350, lambda: self._rt_poll_building(
                     vid, bld_key, js_global, unit_key, unit_name, attempt + 1))
                 return
@@ -13560,9 +14332,7 @@ class TribalWarsBot(QMainWindow):
         self.settings_tg_token.setPlaceholderText("@BotFather — bot token")
         tg_lay.addRow("Bot token:", self.settings_tg_token)
         self.settings_tg_chat_id = QLineEdit()
-        self.settings_tg_chat_id.setText(
-            (_cfg.get("telegram_chat_id") or self._settings.value("notify/telegram_chat_id", "") or "").strip()
-        )
+        self.settings_tg_chat_id.setText(_tw_resolved_telegram_chat_id(_cfg, self._settings))
         self.settings_tg_chat_id.setPlaceholderText("Sohbet veya grup chat_id (grup: genelde eksi id)")
         tg_lay.addRow("Chat ID:", self.settings_tg_chat_id)
         self.settings_tg_insecure_ssl_cb = QCheckBox(
@@ -13591,6 +14361,70 @@ class TribalWarsBot(QMainWindow):
         tg_lay.addRow(self.settings_tg_test_btn)
         tg_group.setLayout(tg_lay)
         layout.addWidget(tg_group)
+
+        bright_group = QGroupBox("Bright Data — Web Unlocker (deneme)")
+        bright_lay = QFormLayout()
+        bright_lay.setSpacing(6)
+        self.settings_bright_enable_cb = QCheckBox(
+            "Bright Web Unlocker ayarlarını kullan (şimdilik yalnızca test butonu; otomatik CAPTCHA yok)"
+        )
+        self.settings_bright_enable_cb.setChecked(
+            self._settings.value("bright/enabled", False, type=bool)
+        )
+        bright_lay.addRow(self.settings_bright_enable_cb)
+        self.settings_bright_token = QLineEdit()
+        self.settings_bright_token.setText(
+            (self._settings.value("bright/api_token", "") or "").strip()
+        )
+        self.settings_bright_token.setEchoMode(QLineEdit.Password)
+        self.settings_bright_token.setPlaceholderText("Bright — API anahtarı (Bearer)")
+        bright_lay.addRow("API token:", self.settings_bright_token)
+        self.settings_bright_zone = QLineEdit()
+        self.settings_bright_zone.setText(
+            (self._settings.value("bright/zone", "") or "").strip()
+        )
+        self.settings_bright_zone.setPlaceholderText("Web Unlocker zone adı (panel)")
+        bright_lay.addRow("Zone:", self.settings_bright_zone)
+        self.settings_bright_test_url = QLineEdit()
+        self.settings_bright_test_url.setText(
+            (self._settings.value("bright/test_url", "") or "").strip()
+            or BRIGHT_DEFAULT_TEST_URL
+        )
+        self.settings_bright_test_url.setPlaceholderText("Test URL (varsayılan: Bright duman sayfası)")
+        bright_lay.addRow("Test URL:", self.settings_bright_test_url)
+        self.settings_bright_format = QComboBox()
+        for lab, val in [("raw (metin)", "raw"), ("json", "json")]:
+            self.settings_bright_format.addItem(lab, val)
+        fmt_saved = (self._settings.value("bright/format", "raw") or "raw").strip().lower()
+        for i in range(self.settings_bright_format.count()):
+            if self.settings_bright_format.itemData(i) == fmt_saved:
+                self.settings_bright_format.setCurrentIndex(i)
+                break
+        bright_lay.addRow("Yanıt formatı:", self.settings_bright_format)
+        self.settings_bright_insecure_ssl_cb = QCheckBox(
+            "Kurumsal ağ: Bright API için SSL doğrulamasını atla"
+        )
+        self.settings_bright_insecure_ssl_cb.setChecked(
+            self._settings.value("bright/insecure_ssl", False, type=bool)
+        )
+        self.settings_bright_insecure_ssl_cb.setToolTip(
+            "Telegram’daki seçenekle aynı mantık; yalnızca api.brightdata.com isteği için."
+        )
+        bright_lay.addRow(self.settings_bright_insecure_ssl_cb)
+        self.settings_bright_help = QLabel(
+            "Önce «Bright isteği test et» ile zone + token doğrula (Bright’ın geo.brdtest duman URL’si veya "
+            "kendi URL’n). Bu, gömülü Chromium’daki oyun oturumundan bağımsız bir sunucu isteğidir; "
+            "CAPTCHA’yı tek başına ‘çözdürmez’ — ileride çerez/header köprüsü veya farklı Bright ürünü gerekir."
+        )
+        self.settings_bright_help.setWordWrap(True)
+        self.settings_bright_help.setObjectName("settingsProxyHelp")
+        bright_lay.addRow(self.settings_bright_help)
+        self.settings_bright_test_btn = QPushButton("Bright isteği test et")
+        self.settings_bright_test_btn.setCursor(Qt.PointingHandCursor)
+        self.settings_bright_test_btn.clicked.connect(self._on_settings_bright_test)
+        bright_lay.addRow(self.settings_bright_test_btn)
+        bright_group.setLayout(bright_lay)
+        layout.addWidget(bright_group)
 
         gen_group = QGroupBox("Genel Ayarlar")
         gen_layout = QFormLayout()
@@ -15067,6 +15901,7 @@ class TribalWarsBot(QMainWindow):
         """Üst paneldeki köy seçiciyi güncelle."""
         all_villages = data.get("all_villages", [])
         current_id = data.get("village", {}).get("id", 0)
+        ordered_villages = _tw_sorted_player_villages(all_villages) if all_villages else []
 
         # Combobox sinyalini geçici olarak kes
         self.village_combo.blockSignals(True)
@@ -15082,7 +15917,7 @@ class TribalWarsBot(QMainWindow):
                 )
         else:
             selected_idx = 0
-            for i, v in enumerate(all_villages):
+            for i, v in enumerate(ordered_villages):
                 coord = f"({v.get('x', '?')}|{v.get('y', '?')})"
                 label = f"{v.get('name', '?')} {coord}"
                 self.village_combo.addItem(label, v.get("id", 0))
@@ -15108,7 +15943,7 @@ class TribalWarsBot(QMainWindow):
                     )
             else:
                 sa_selected_idx = 0
-                for i, v in enumerate(all_villages):
+                for i, v in enumerate(ordered_villages):
                     coord = f"({v.get('x', '?')}|{v.get('y', '?')})"
                     label = f"{v.get('name', '?')} {coord}"
                     self.sa_source_combo.addItem(label, v.get("id", 0))
@@ -15132,7 +15967,7 @@ class TribalWarsBot(QMainWindow):
                         f"{v.get('name', '?')} ({coord})", v.get("id", 0))
             else:
                 bq_idx = 0
-                for i, v in enumerate(all_villages):
+                for i, v in enumerate(ordered_villages):
                     coord = f"({v.get('x', '?')}|{v.get('y', '?')})"
                     label = f"{v.get('name', '?')} {coord}"
                     self.bq_village_combo.addItem(label, v.get("id", 0))
@@ -15152,6 +15987,7 @@ class TribalWarsBot(QMainWindow):
             return
 
         all_villages = data.get("all_villages", [])
+        ordered_v = _tw_sorted_player_villages(all_villages)
         self.all_villages_tree.clear()
 
         UNIT_NAMES_SHORT = {
@@ -15161,7 +15997,7 @@ class TribalWarsBot(QMainWindow):
             "catapult": "Man", "knight": "Şöv", "snob": "Mis", "militia": "Mil"
         }
 
-        for v in all_villages:
+        for v in ordered_v:
             coord = f"({v.get('x', '?')}|{v.get('y', '?')})"
             farm = v.get("farm_text", "—")
 
@@ -15376,6 +16212,14 @@ class TribalWarsBot(QMainWindow):
 
     # ── YARDIMCI ───────────────────────────────
 
+    def _invalidate_server_time_sync(self):
+        """Sunucu saati güvenilmez / yok — gönderim zamanı DOM'a güvenmesin."""
+        self._server_time_synced = False
+        self._server_time_text = ""
+        self._server_time_anchor_dt = None
+        self._server_time_anchor_perf = None
+        self._anchor_timing_ms = None
+
     def _start_sync_timer(self):
         self._server_time_text = ""
 
@@ -15407,16 +16251,32 @@ class TribalWarsBot(QMainWindow):
         except Exception:
             self._show_local_time()
 
-    def _fetch_server_time(self):
+    def _fetch_server_time(self, force=False):
         """Sayfadaki sunucu saatini Timing + DOM ile örnekler.
 
         Kesir ms DOM'dan güvenilmez (özellikle içerik zaten .xxx ile bitiyorsa); tek kaynak
         Timing/sn. Takvim satırı böyle kurulunca parse edilen anchor_dt ile serverNowMs aynı anı
         temsil eder — hedef Timing hesabında yüzlerce ms sapma oluşmaz.
+
+        Ordu gönderimi açıkken ve zaten geçerli anchor varken (force değilse) DOM'dan yeniden
+        örnekleme yapılmaz; içeride gezinince yanlış serverTime/Timing ile anchor sıçraması ve
+        erken gönderim engellenir — süre perf_counter ile ilerletilir.
         """
         if not self.browser:
             self._show_local_time()
             return
+
+        if not force:
+            try:
+                if (
+                    getattr(self, "enable_sending_cb", None)
+                    and self.enable_sending_cb.isChecked()
+                    and getattr(self, "_server_time_anchor_dt", None) is not None
+                    and getattr(self, "_server_time_anchor_perf", None) is not None
+                ):
+                    return
+            except Exception:
+                pass
 
         fetch_js = """
         (function() {
@@ -15462,9 +16322,7 @@ class TribalWarsBot(QMainWindow):
 
         def on_result(result):
             if not result or not isinstance(result, str) or result == 'NONE':
-                self._server_time_anchor_dt = None
-                self._server_time_anchor_perf = None
-                self._anchor_timing_ms = None
+                self._invalidate_server_time_sync()
                 self._show_local_time()
                 return
 
@@ -15479,28 +16337,47 @@ class TribalWarsBot(QMainWindow):
                 timing_ms = None
 
             if not text:
-                self._server_time_anchor_dt = None
-                self._server_time_anchor_perf = None
-                self._anchor_timing_ms = None
+                self._invalidate_server_time_sync()
                 self._show_local_time()
                 return
 
+            old_text_snapshot = (getattr(self, "_server_time_text", None) or "")
             self._server_time_text = text
-            self._server_time_synced = True
             parsed = self._dispatch_parse_server_time()
-            if parsed is not None:
-                self._server_time_anchor_dt = parsed
-                self._server_time_anchor_perf = time.perf_counter()
-                try:
-                    tm = int(timing_ms) if timing_ms is not None else None
-                    if tm is not None and tm > 0 and tm < 10**12:
-                        tm = int(tm * 1000)
-                    self._anchor_timing_ms = tm
-                except (TypeError, ValueError):
-                    self._anchor_timing_ms = None
-            else:
-                self._server_time_anchor_dt = None
-                self._server_time_anchor_perf = None
+            if parsed is None:
+                self._invalidate_server_time_sync()
+                self._show_local_time()
+                return
+
+            # Önceki anchor ile tutarsız büyük sıçrama (forum / giriş sayfası vb.) — yok say.
+            if not force:
+                old_dt = getattr(self, "_server_time_anchor_dt", None)
+                old_pf = getattr(self, "_server_time_anchor_perf", None)
+                if old_dt is not None and old_pf is not None:
+                    try:
+                        prev_now = old_dt + datetime.timedelta(seconds=time.perf_counter() - old_pf)
+                        skew_s = abs((parsed - prev_now).total_seconds())
+                        if skew_s > 90.0:
+                            if hasattr(self, "log_text"):
+                                self._add_log(
+                                    "SİSTEM",
+                                    "warn",
+                                    f"Sunucu saati örneklemesi yok sayıldı (~{skew_s:.0f}s sapma; güvenilir oyun sayfasında olun).",
+                                )
+                            self._server_time_text = old_text_snapshot
+                            return
+                    except Exception:
+                        pass
+
+            self._server_time_synced = True
+            self._server_time_anchor_dt = parsed
+            self._server_time_anchor_perf = time.perf_counter()
+            try:
+                tm = int(timing_ms) if timing_ms is not None else None
+                if tm is not None and tm > 0 and tm < 10**12:
+                    tm = int(tm * 1000)
+                self._anchor_timing_ms = tm
+            except (TypeError, ValueError):
                 self._anchor_timing_ms = None
 
             # Dispatch aktifse (bekleyen gönderim varsa) 50ms, yoksa 2 saniye
@@ -15601,6 +16478,8 @@ class TribalWarsBot(QMainWindow):
                         "Doğrulama ekranı algılandı (" + ", ".join(parts) + "). Otomatik ordu gönderimi duraklatıldı.",
                     )
                     self._notify_telegram_security(parts)
+                    if hasattr(self, "_rt_stop"):
+                        self._rt_stop()
             else:
                 if self._human_verification_required:
                     self._human_verification_required = False
