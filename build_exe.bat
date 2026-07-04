@@ -38,8 +38,9 @@ if %errorlevel% neq 0 (
 )
 echo.
 
-echo [3/3] Kurulum dosyasi kopyalaniyor...
+echo [3/3] Kurulum dosyalari kopyalaniyor...
 copy /Y README_KURULUM.txt dist_build\TribalWarsBot\ >nul 2>&1
+copy /Y guncelle.bat dist_build\TribalWarsBot\ >nul 2>&1
 echo.
 echo ============================================
 echo   BUILD TAMAMLANDI!

@@ -14,6 +14,9 @@ import os as _os
 _cfg = _os.path.join(SPECPATH, 'tw_config.json')
 if _os.path.isfile(_cfg):
     datas += [(_cfg, '.')]
+_gunc = _os.path.join(SPECPATH, 'guncelle.bat')
+if _os.path.isfile(_gunc):
+    datas += [(_gunc, '.')]
 
 # PyQt5 alt modullerini topla
 hiddenimports = collect_submodules('PyQt5')
