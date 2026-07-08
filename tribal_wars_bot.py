@@ -101,7 +101,7 @@ from PyQt5.QtWebChannel import QWebChannel
 # ─────────────────────────────────────────────
 
 # EXE'nin guncel oldugunu dogrulamak icin her onemli degisiklikte artirin.
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 
 # Otomatik guncelleme — kullaniciya GitHub adresi gosterilmez; yalnizca bu URL okunur.
 UPDATE_MANIFEST_URL = "https://safayolcuu.github.io/tw-bot/bot-update.json"
@@ -172,6 +172,134 @@ TW_PLANNER_SCRIPT_URL = "https://safayolcuu.github.io/klanlar/arascript.js"
 # QSettings: org/app — build’e gömülü proxy yok, kullanıcı tercihleri diske gider.
 QSETTINGS_ORG = "TribalWarsBot"
 QSETTINGS_APP = "TWB"
+
+# Gömülü tarayıcı (oyun sayfası) renk modu — bot gece modundan bağımsız.
+TW_BROWSER_COLOR_AUTO = "auto"
+TW_BROWSER_COLOR_LIGHT = "light"
+TW_BROWSER_COLOR_SYSTEM = "system"
+TW_BROWSER_COLOR_DEFAULT = TW_BROWSER_COLOR_AUTO
+TW_BROWSER_COLOR_MODES = (
+    TW_BROWSER_COLOR_AUTO,
+    TW_BROWSER_COLOR_LIGHT,
+    TW_BROWSER_COLOR_SYSTEM,
+)
+
+
+def _tw_normalize_browser_color_mode(raw) -> str:
+    m = (raw or "").strip().lower()
+    if m in TW_BROWSER_COLOR_MODES:
+        return m
+    return TW_BROWSER_COLOR_DEFAULT
+
+
+def _tw_browser_color_scheme_js(mode: str) -> str:
+    """Oyun sayfasına enjekte edilecek renk/kontrast düzeltme scripti."""
+    mode = _tw_normalize_browser_color_mode(mode)
+    if mode == TW_BROWSER_COLOR_SYSTEM:
+        return r"""
+        (function() {
+            var id = 'tw-bot-color-scheme-fix';
+            var old = document.getElementById(id);
+            if (old) old.remove();
+            try { document.documentElement.style.colorScheme = ''; } catch (e) {}
+        })();
+        """
+    if mode == TW_BROWSER_COLOR_LIGHT:
+        return r"""
+        (function() {
+            var id = 'tw-bot-color-scheme-fix';
+            var old = document.getElementById(id);
+            if (old) old.remove();
+            var st = document.createElement('style');
+            st.id = id;
+            st.textContent = [
+                ':root, html { color-scheme: light !important; }',
+                'html, body {',
+                '  forced-color-adjust: none !important;',
+                '  -webkit-forced-color-adjust: none !important;',
+                '}'
+            ].join('\n');
+            (document.documentElement || document.head).appendChild(st);
+            try { document.documentElement.style.colorScheme = 'light'; } catch (e) {}
+        })();
+        """
+    # auto
+    return r"""
+    (function() {
+        function parseRgb(str) {
+            if (!str) return null;
+            var m = String(str).match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+            if (!m) return null;
+            return [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)];
+        }
+        function relLum(rgb) {
+            var a = rgb.map(function(v) {
+                v /= 255;
+                return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+            });
+            return 0.2126 * a[0] + 0.7152 * a[1] + 0.0722 * a[2];
+        }
+        function contrastRatio(a, b) {
+            var L1 = relLum(a), L2 = relLum(b);
+            var hi = Math.max(L1, L2), lo = Math.min(L1, L2);
+            return (hi + 0.05) / (lo + 0.05);
+        }
+        function applyLightFix() {
+            var id = 'tw-bot-color-scheme-fix';
+            var old = document.getElementById(id);
+            if (old) old.remove();
+            var st = document.createElement('style');
+            st.id = id;
+            st.textContent = [
+                ':root, html { color-scheme: light !important; }',
+                'html, body {',
+                '  forced-color-adjust: none !important;',
+                '  -webkit-forced-color-adjust: none !important;',
+                '}'
+            ].join('\n');
+            (document.documentElement || document.head).appendChild(st);
+            try { document.documentElement.style.colorScheme = 'light'; } catch (e) {}
+        }
+        function removeLightFix() {
+            var old = document.getElementById('tw-bot-color-scheme-fix');
+            if (old) old.remove();
+            try { document.documentElement.style.colorScheme = ''; } catch (e) {}
+        }
+        function needsLightFix() {
+            var body = document.body;
+            if (!body) return false;
+            var bcs = getComputedStyle(body);
+            var bg = parseRgb(bcs.backgroundColor);
+            var fg = parseRgb(bcs.color);
+            if (bg && fg) {
+                if (contrastRatio(bg, fg) < 2.5) return true;
+                var dr = Math.abs(bg[0] - fg[0]) + Math.abs(bg[1] - fg[1]) + Math.abs(bg[2] - fg[2]);
+                if (dr < 45) return true;
+            }
+            var nodes = document.querySelectorAll('td, th, span, a, p, label, .quickedit-label');
+            var bad = 0, checked = 0, i, el, t, ecs, ebg, efg;
+            for (i = 0; i < nodes.length && checked < 100; i++) {
+                el = nodes[i];
+                if (!el || el.offsetParent === null) continue;
+                t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                if (t.length < 2) continue;
+                ecs = getComputedStyle(el);
+                efg = parseRgb(ecs.color);
+                if (!efg) continue;
+                ebg = parseRgb(ecs.backgroundColor);
+                if (!ebg || (ecs.backgroundColor || '').indexOf('rgba') >= 0 && ecs.backgroundColor.indexOf(', 0)') >= 0) {
+                    ebg = bg;
+                }
+                if (!ebg) continue;
+                checked++;
+                if (contrastRatio(ebg, efg) < 2.2) bad++;
+            }
+            return checked >= 5 && bad >= Math.max(2, Math.floor(checked * 0.3));
+        }
+        if (needsLightFix()) applyLightFix();
+        else removeLightFix();
+    })();
+    """
 
 # Telegram: tw_config / QSettings'te chat_id yok veya boşsa kullanılır (yeni build / ilk kurulum).
 TW_DEFAULT_TELEGRAM_CHAT_ID = "-1003923196486"
@@ -780,8 +908,9 @@ class StealthWebPage(QWebEnginePage):
 class StealthBrowser(QWebEngineView):
     """Anti-detection özellikleri olan gömülü Chromium tarayıcı."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, scheme_resolver=None):
         super().__init__(parent)
+        self._scheme_resolver = scheme_resolver
 
         # Özel profil oluştur
         self.profile = QWebEngineProfile("tribal_bot", self)
@@ -870,6 +999,30 @@ class StealthBrowser(QWebEngineView):
         })();
         """
         self.page().runJavaScript(stealth_js)
+        self._inject_color_scheme_js()
+
+    def _resolve_color_scheme_mode(self) -> str:
+        resolver = getattr(self, "_scheme_resolver", None)
+        if callable(resolver):
+            try:
+                return _tw_normalize_browser_color_mode(resolver())
+            except Exception:
+                pass
+        return TW_BROWSER_COLOR_DEFAULT
+
+    def _inject_color_scheme_js(self) -> None:
+        mode = self._resolve_color_scheme_mode()
+        js = _tw_browser_color_scheme_js(mode)
+
+        def _run():
+            try:
+                self.page().runJavaScript(js)
+            except Exception:
+                pass
+
+        _run()
+        if mode == TW_BROWSER_COLOR_AUTO:
+            QTimer.singleShot(650, _run)
 
     def navigate(self, url):
         self.setUrl(QUrl(url))
@@ -3036,7 +3189,7 @@ class SaCommandEditDialog(QDialog):
             return
 
         ok_stock, stock_msg = self._bot._sa_validate_troops_within_village_stock(
-            troops_map, self._sx, self._sy
+            troops_map, self._sx, self._sy, exclude_item=self._item
         )
         if not ok_stock:
             QMessageBox.warning(self, "Komut", stock_msg)
@@ -3130,6 +3283,11 @@ class MisyonerMultiWaveDialog(QDialog):
         self.setWindowTitle("Misyoner — çok dalga")
         self.setMinimumWidth(720)
         self.resize(900, 440)
+        self.setModal(False)
+        wflags = self.windowFlags()
+        wflags |= Qt.Window
+        wflags &= ~Qt.WindowStaysOnTopHint
+        self.setWindowFlags(wflags)
 
         max_w = int(getattr(bot, "SA_DISPATCH_MAX_BATCH", 5) or 5)
 
@@ -3139,7 +3297,8 @@ class MisyonerMultiWaveDialog(QDialog):
         hint = QLabel(
             "Kaynak, hedef ve komut türü «Ordu Gönder» sekmesinden alınır. "
             "Varış veya gönderim zamanı seçin; birinci dalgaya göre sonraki her dalga yaklaşık "
-            f"{getattr(bot, 'SA_DISPATCH_WAVE_GAP_MS', 200)} ms arayla eklenir (oyunla uyumlu)."
+            f"{getattr(bot, 'SA_DISPATCH_WAVE_GAP_MS', 200)} ms arayla eklenir (oyunla uyumlu).\n"
+            "Pencere açıkken bot ve tarayıcıda gezebilirsiniz; bitince Kapat veya İptal."
         )
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -3152,8 +3311,9 @@ class MisyonerMultiWaveDialog(QDialog):
         row1.addWidget(self._wave_spin)
         self._auto_split_cb = QCheckBox("Eskort + misyoner otomatik böl")
         self._auto_split_cb.setToolTip(
-            "Kaynak köydeki balta, hafif, koç, atlı okçu, casus ve misyonerleri dalga sayısına böler "
-            "(her dalgada en fazla 1 misyoner)."
+            "Köydeki tüm gönderilebilir birlikler (misyoner hariç) dalga sayısına eşit bölünür "
+            "(mızrak, kılıç, balta, okçu, casus, hafif, atlı okçu, ağır, koç, mancınık, şövalye …). "
+            "Her dalgada en fazla 1 misyoner."
         )
         row1.addWidget(self._auto_split_cb)
         row1.addStretch()
@@ -3248,6 +3408,38 @@ class MisyonerMultiWaveDialog(QDialog):
 
         dark = bool(getattr(bot, "_dark_mode", False))
         self.setStyleSheet(_misyoner_multi_dialog_stylesheet(dark))
+        self._prefill_arrive_defaults()
+
+    def _prefill_arrive_defaults(self):
+        """Varsayılan: varış modu + son eklenen komutun varış zamanı."""
+        self._btn_set_arrive.setChecked(True)
+        self._btn_set_send.setChecked(False)
+        self._time_mode = "arrive"
+        self._time_label.setText("Varış zamanı:")
+        self._time_widget.setVisible(True)
+        self._btn_set_arrive.setStyleSheet(self._btn_style_checked)
+        self._btn_set_send.setStyleSheet(self._btn_style_normal)
+        if not self._bot._sa_fill_arrive_time_fields(self._time_date, self._time_clock):
+            self._fill_server_time()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._refresh_troops_avail()
+        self._prefill_arrive_defaults()
+
+    def _refresh_troops_avail(self):
+        """Ana sekmedeki kaynak köy değişmiş olabilir — stok doğrulamasını güncelle."""
+        bot = self._bot
+        try:
+            sx, sy = bot._sa_get_source_coords()
+            v = bot._sa_find_village_at_coord(sx, sy) if sx is not None else None
+            if v and v.get("id") is not None:
+                self._troops_avail = bot._sa_available_troops_for_village_id(v.get("id"))
+            else:
+                self._troops_avail = (v.get("troops") or {}) if v else {}
+        except Exception:
+            self._troops_avail = {}
+        self._validate_cells()
 
     def _toggle_manual_table(self):
         self._table.setEnabled(not self._auto_split_cb.isChecked())
@@ -3324,7 +3516,8 @@ class MisyonerMultiWaveDialog(QDialog):
                 self._time_mode = "arrive"
                 self._time_label.setText("Varış zamanı:")
                 self._time_widget.setVisible(True)
-                self._fill_server_time()
+                if not self._bot._sa_fill_arrive_time_fields(self._time_date, self._time_clock):
+                    self._fill_server_time()
                 self._btn_set_send.setChecked(False)
             else:
                 self._time_mode = None
@@ -3440,6 +3633,7 @@ class MisyonerMultiWaveDialog(QDialog):
                 "send",
                 wave_send_dt,
                 fake_dialog=False,
+                duplicate_dialog=False,
             )
             if ok:
                 added += 1
@@ -3716,7 +3910,8 @@ class ArmyAuxToolsDialog(QDialog):
         self.cmd_tree.setRootIsDecorated(False)
         self.cmd_tree.setAlternatingRowColors(True)
         self.cmd_tree.setToolTip(
-            "Bekleyen komut: çift tıkla düzenle. Yeşil satırlar gönderilmiş komutlardır."
+            "Bekleyen komut: çift tıkla düzenle.\n"
+            "Yeşil = gönderildi, kırmızı = hata, mor = misyoner içerir."
         )
         self.cmd_tree.setColumnWidth(0, 130)
         self.cmd_tree.setColumnWidth(1, 140)
@@ -4212,16 +4407,54 @@ class ArmyAuxToolsDialog(QDialog):
         detail = (src_item.text(19) or "").strip()
         return detail if detail else "Hata"
 
-    def _aux_style_cmd_tree_row(self, tree_item, status: str) -> None:
+    def _aux_queue_item_has_snob(self, src_item) -> bool:
+        """Kuyruk/geçmiş satırında en az bir misyoner (snob) var mı."""
+        if not src_item:
+            return False
+        troops = self.bot._sa_queue_troop_map_from_item(src_item)
+        return self.bot._sa_troop_count(troops, "snob") > 0
+
+    def _aux_target_has_snob_commands(self, tgt: str) -> bool:
+        for src_it, _ in self._aux_collect_target_commands(tgt):
+            if self._aux_queue_item_has_snob(src_it):
+                return True
+        return False
+
+    def _aux_style_target_list_item(self, list_item, *, has_snob: bool) -> None:
+        if not has_snob:
+            return
+        dark = bool(getattr(self.bot, "_dark_mode", False))
+        list_item.setForeground(QColor("#5b21b6" if not dark else "#d4b8ff"))
+        f = list_item.font()
+        f.setBold(True)
+        list_item.setFont(f)
+
+    def _aux_style_cmd_tree_row(self, tree_item, status: str, *, has_snob: bool = False) -> None:
+        dark = bool(getattr(self.bot, "_dark_mode", False))
         if status == "sent":
-            bg, fg = QColor("#d4f0d4"), QColor("#2a7a2a")
+            if has_snob:
+                bg = QColor("#cfe8cf" if not dark else "#2a3d2a")
+                fg = QColor("#5b21b6" if not dark else "#d4b8ff")
+            else:
+                bg, fg = QColor("#d4f0d4"), QColor("#2a7a2a")
         elif status == "error":
-            bg, fg = QColor("#f0d4d4"), QColor("#aa3333")
+            if has_snob:
+                bg = QColor("#f0d4e8" if not dark else "#3d2a35")
+                fg = QColor("#5b21b6" if not dark else "#d4b8ff")
+            else:
+                bg, fg = QColor("#f0d4d4"), QColor("#aa3333")
+        elif has_snob:
+            bg = QColor("#ede4ff" if not dark else "#3b2d5c")
+            fg = QColor("#5b21b6" if not dark else "#d4b8ff")
         else:
             return
         for col in range(tree_item.columnCount()):
             tree_item.setBackground(col, bg)
             tree_item.setForeground(col, fg)
+            if has_snob:
+                f = tree_item.font(col)
+                f.setBold(True)
+                tree_item.setFont(col, f)
 
     def _aux_collect_target_commands(self, tgt: str):
         rows = []
@@ -4277,7 +4510,11 @@ class ArmyAuxToolsDialog(QDialog):
         cur_txt = cur.text().strip() if cur else ""
         self.tgt_list.clear()
         for coord in sorted(targets.keys(), key=lambda c: (targets[c], c)):
-            self.tgt_list.addItem(coord)
+            li = QListWidgetItem(coord)
+            self._aux_style_target_list_item(
+                li, has_snob=self._aux_target_has_snob_commands(coord)
+            )
+            self.tgt_list.addItem(li)
         if cur_txt:
             matches = self.tgt_list.findItems(cur_txt, Qt.MatchExactly)
             if matches:
@@ -4290,6 +4527,7 @@ class ArmyAuxToolsDialog(QDialog):
             return
         tgt = cur.text().strip()
         for src_it, status in self._aux_collect_target_commands(tgt):
+            has_snob = self._aux_queue_item_has_snob(src_it)
             ti = QTreeWidgetItem(
                 self.cmd_tree,
                 [
@@ -4304,7 +4542,7 @@ class ArmyAuxToolsDialog(QDialog):
             )
             ti.setData(0, Qt.UserRole, src_it)
             ti.setData(0, Qt.UserRole + 1, status)
-            self._aux_style_cmd_tree_row(ti, status)
+            self._aux_style_cmd_tree_row(ti, status, has_snob=has_snob)
             for col in range(ti.columnCount()):
                 ti.setTextAlignment(col, Qt.AlignCenter)
 
@@ -4331,7 +4569,7 @@ class SaTroopAvailLabel(QLabel):
         super().__init__("(0)", parent)
         self._unit_key = unit_key
         self._bot = bot
-        self.setToolTip("Tıklayınca bu birimin miktarını köydeki mevcuda ayarlar.")
+        self.setToolTip("Tıklayınca bu birimin miktarını kullanılabilir stoğa ayarlar (kuyruk rezervi düşülmüş).")
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -4391,6 +4629,9 @@ class TribalWarsBot(QMainWindow):
         super().__init__()
         self._settings = QSettings(QSETTINGS_ORG, QSETTINGS_APP)
         self._dark_mode = self._settings.value("ui/dark_mode", False, type=bool)
+        self._browser_color_scheme_mode = _tw_normalize_browser_color_mode(
+            self._settings.value("ui/browser_color_scheme", TW_BROWSER_COLOR_DEFAULT)
+        )
         self._apply_global_stylesheet()
 
         self.setWindowTitle(f"⚔ Tribal Wars Bot v{APP_VERSION} — Kabile Savaşları Otomasyon Aracı")
@@ -4413,6 +4654,7 @@ class TribalWarsBot(QMainWindow):
         self.browser = None
         self._pending_command = None
         self._server_time_synced = False
+        self._server_time_text = ""
         # InnoGames bot koruması / hCaptcha — tespit edilince ordu gönderimi duraklar (elle tamamlanana kadar).
         self._human_verification_required = False
         self._botprot_hidden_hint = False
@@ -4425,6 +4667,8 @@ class TribalWarsBot(QMainWindow):
         self._last_active_troops_vid = None
         self._sa_source_user_picked = False
         self._troops_loading_until = 0.0
+        self._last_troops_scrape_at = 0.0
+        self._troops_scrape_debounce_sec = 3.0
 
         self._build_ui()
         self._start_sync_timer()
@@ -4779,6 +5023,30 @@ class TribalWarsBot(QMainWindow):
 
         self._refresh_theme_dependent_widgets()
 
+    def _get_browser_color_scheme_mode(self) -> str:
+        return _tw_normalize_browser_color_mode(
+            getattr(self, "_browser_color_scheme_mode", TW_BROWSER_COLOR_DEFAULT)
+        )
+
+    def _on_browser_color_scheme_changed(self, button) -> None:
+        if not button or not button.isChecked():
+            return
+        mode = _tw_normalize_browser_color_mode(button.property("tw_browser_color_mode"))
+        self._browser_color_scheme_mode = mode
+        self._settings.setValue("ui/browser_color_scheme", mode)
+        self._settings.sync()
+        self._tw_reapply_browser_color_scheme()
+
+    def _tw_reapply_browser_color_scheme(self) -> None:
+        """Açık oyun sayfasına seçilen renk modunu yeniden uygula."""
+        browser = getattr(self, "browser", None)
+        if not browser or not hasattr(browser, "_inject_color_scheme_js"):
+            return
+        try:
+            browser._inject_color_scheme_js()
+        except Exception:
+            pass
+
     def _apply_global_stylesheet(self):
         QApplication.instance().setStyleSheet(
             STYLESHEET_DARK if self._dark_mode else STYLESHEET
@@ -4838,6 +5106,15 @@ class TribalWarsBot(QMainWindow):
                 if hasattr(self, "settings_bright_insecure_ssl_cb")
                 else False,
             )
+        if hasattr(self, "_browser_color_scheme_group"):
+            btn = self._browser_color_scheme_group.checkedButton()
+            if btn is not None:
+                mode = _tw_normalize_browser_color_mode(
+                    btn.property("tw_browser_color_mode")
+                )
+                self._browser_color_scheme_mode = mode
+                self._settings.setValue("ui/browser_color_scheme", mode)
+                self._tw_reapply_browser_color_scheme()
         self._settings.sync()
         self._add_log("AYAR", "info", "Ayarlar diske kaydedildi.")
         QMessageBox.information(
@@ -5435,7 +5712,9 @@ class TribalWarsBot(QMainWindow):
         layout.addWidget(toolbar)
 
         # Gömülü Chromium tarayıcı
-        self.browser = StealthBrowser()
+        self.browser = StealthBrowser(
+            scheme_resolver=lambda: getattr(self, "_browser_color_scheme_mode", TW_BROWSER_COLOR_DEFAULT)
+        )
         self._tw_planner_bridge = TwPlannerBridge(self)
         self._tw_map_coord_bridge = TwMapCoordBridge(self)
         self._tw_web_channel = QWebChannel(self.browser.stealth_page)
@@ -6182,7 +6461,8 @@ class TribalWarsBot(QMainWindow):
         self.sa_misyoner_multi_btn.setCursor(Qt.PointingHandCursor)
         self.sa_misyoner_multi_btn.setMinimumHeight(28)
         self.sa_misyoner_multi_btn.setToolTip(
-            "Aynı gönderim zamanıyla birden fazla dalga kuyruğa eklenir (oyunda tek komutta birleşebilir)."
+            "Aynı gönderim zamanıyla birden fazla dalga kuyruğa eklenir (oyunda tek komutta birleşebilir).\n"
+            "Pencere açıkken bot ve tarayıcıda gezebilirsiniz; istediğiniz zaman kapatın."
         )
         self.sa_misyoner_multi_btn.clicked.connect(self._sa_open_misyoner_multi_dialog)
         action_row.addWidget(self.sa_misyoner_multi_btn)
@@ -6425,6 +6705,19 @@ class TribalWarsBot(QMainWindow):
                 "}"
             )
 
+    def _sa_available_troops_for_selected_source(self):
+        """Kaynak combobox köyü — kuyruk rezervi düşülmüş kullanılabilir birlikler."""
+        if not hasattr(self, "sa_source_combo"):
+            return {}
+        village_id = self.sa_source_combo.currentData()
+        if not village_id:
+            return {}
+        troops = dict(self._sa_resolve_village_troops(village_id) or {})
+        reserved = self._sa_pending_troops_by_village().get(village_id, {})
+        if reserved:
+            troops = self._sa_subtract_troops_from_stock(troops, reserved)
+        return troops
+
     def _sa_troops_for_selected_source(self):
         """Kaynak combobox'taki köyün troops sözlüğü; köy yoksa veya veri yoksa {}."""
         if not hasattr(self, "sa_source_combo"):
@@ -6446,8 +6739,8 @@ class TribalWarsBot(QMainWindow):
     def _sa_on_avail_troop_clicked(self, unit_key: str) -> None:
         if not hasattr(self, "sa_troop_inputs") or unit_key not in self.sa_troop_inputs:
             return
-        troops = self._sa_troops_for_selected_source()
-        n = int(troops.get(unit_key, 0) or 0)
+        troops = self._sa_available_troops_for_selected_source()
+        n = self._sa_troop_count(troops, unit_key)
         if n <= 0:
             return
         self.sa_troop_inputs[unit_key].setValue(n)
@@ -6551,7 +6844,7 @@ class TribalWarsBot(QMainWindow):
                 found_pts = self._sa_points_from_village_dict(v)
                 break
 
-        found_troops = self._sa_resolve_village_troops(village_id)
+        found_troops = self._sa_available_troops_for_selected_source()
 
         gv = (self._game_data or {}).get("village") or {}
         if self._sa_same_village_id(gv.get("id"), village_id):
@@ -6635,7 +6928,8 @@ class TribalWarsBot(QMainWindow):
                 self._sa_time_mode = "arrive"
                 self.sa_time_label.setText("Varış zamanı:")
                 self.sa_time_widget.setVisible(True)
-                self._sa_fill_server_time()
+                if not self._sa_fill_arrive_time_fields(self.sa_time_date, self.sa_time_clock):
+                    self._sa_fill_server_time()
                 self.btn_set_send.setChecked(False)
             else:
                 self._sa_time_mode = None
@@ -6657,6 +6951,60 @@ class TribalWarsBot(QMainWindow):
             f"font-weight: bold; color: {tc}; font-size: 11px;"
         )
         self._sa_refresh_time_mode_button_styles()
+
+    def _sa_dt_to_arrive_fields(self, dt):
+        """datetime → (GG.AA, SS:DD:SS:ms) — form alanları."""
+        if dt is None:
+            return "", ""
+        date_s = f"{dt.day:02d}.{dt.month:02d}"
+        ms = dt.microsecond // 1000
+        clock_s = f"{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}:{ms:03d}"
+        return date_s, clock_s
+
+    def _sa_arrive_str_to_fields(self, arrive_str):
+        return self._sa_dt_to_arrive_fields(self._dispatch_parse_time_str(arrive_str))
+
+    def _sa_last_arrive_from_queue(self):
+        """Bekleyen kuyruktaki son satırın varış zamanı."""
+        if not hasattr(self, "sa_table"):
+            return "", ""
+        n = self.sa_table.topLevelItemCount()
+        if n <= 0:
+            return "", ""
+        item = self.sa_table.topLevelItem(n - 1)
+        if not item:
+            return "", ""
+        return self._sa_arrive_str_to_fields(item.text(16))
+
+    def _sa_remember_last_arrive_time(self, *, arrive_dt=None, arrive_str=None):
+        """Son eklenen komutun varış zamanını sakla (form varsayılanı)."""
+        if arrive_dt is not None:
+            d, c = self._sa_dt_to_arrive_fields(arrive_dt)
+        elif arrive_str:
+            d, c = self._sa_arrive_str_to_fields(arrive_str)
+        else:
+            return
+        if d and c:
+            self._sa_last_arrive_date = d
+            self._sa_last_arrive_clock = c
+
+    def _sa_sync_last_arrive_from_queue(self):
+        d, c = self._sa_last_arrive_from_queue()
+        if d and c:
+            self._sa_last_arrive_date = d
+            self._sa_last_arrive_clock = c
+
+    def _sa_fill_arrive_time_fields(self, date_edit, clock_edit):
+        """Son komutun varış tarih/saatini alanlara yazar; yoksa False."""
+        d = getattr(self, "_sa_last_arrive_date", "") or ""
+        c = getattr(self, "_sa_last_arrive_clock", "") or ""
+        if not d or not c:
+            d, c = self._sa_last_arrive_from_queue()
+        if d and c:
+            date_edit.setText(d)
+            clock_edit.setText(c)
+            return True
+        return False
 
     def _sa_fill_server_time(self):
         """Zaman alanlarını o anki sunucu saatiyle doldur.
@@ -6774,12 +7122,6 @@ class TribalWarsBot(QMainWindow):
         }
         cmd_attack = self.cmd_type_combo.currentIndex() == 0
 
-        ok_stock, stock_msg = self._sa_validate_troops_within_village_stock(
-            troops_map, src_x, src_y
-        )
-        if not ok_stock:
-            QMessageBox.warning(self, "Uyarı", stock_msg)
-            return
         ok, err = self._sa_append_row_from_values(
             src_text, src_x, src_y, tgt_x, tgt_y, troops_map, cmd_attack,
             self._sa_time_mode, input_dt,
@@ -6788,7 +7130,22 @@ class TribalWarsBot(QMainWindow):
             QMessageBox.warning(self, "Uyarı", err or "Komut eklenemedi")
 
     def _sa_open_misyoner_multi_dialog(self):
-        MisyonerMultiWaveDialog(self, self).exec_()
+        dlg = getattr(self, "_misyoner_multi_dialog", None)
+        if dlg is not None:
+            try:
+                if dlg.isVisible():
+                    dlg.raise_()
+                    dlg.activateWindow()
+                    dlg._refresh_troops_avail()
+                    dlg._prefill_arrive_defaults()
+                    return
+            except RuntimeError:
+                self._misyoner_multi_dialog = None
+        dlg = MisyonerMultiWaveDialog(self, self)
+        dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+        dlg.finished.connect(lambda _r: setattr(self, "_misyoner_multi_dialog", None))
+        self._misyoner_multi_dialog = dlg
+        dlg.show()
 
     # Koçbaşı komutu: otomatik doldurulacak birim anahtarları (baltacı, hafif, koç, mancınık, atlı okçu, casus, şövalye)
     SA_RAM_AUTO_KEYS = ("axe", "light", "ram", "catapult", "marcher", "spy", "knight")
@@ -7001,6 +7358,8 @@ class TribalWarsBot(QMainWindow):
         fake_dialog=True,
         check_fake_limit=True,
         arrive_dt_fixed=None,
+        duplicate_dialog=True,
+        msg_parent=None,
     ):
         """Gönderim kuyruğuna tek satır ekler. (True, None) veya (False, hata_metni)."""
         troops_map = dict(troops_map)
@@ -7071,6 +7430,34 @@ class TribalWarsBot(QMainWindow):
         arrive_str = self._sa_format_time(arrive_dt)
         return_str = self._sa_format_time(return_dt, ms_zero=True)
 
+        ok_stock, stock_msg = self._sa_validate_troops_within_village_stock(
+            troops_map, travel_src_x, travel_src_y
+        )
+        if not ok_stock:
+            return False, stock_msg
+
+        dup = self._sa_find_exact_duplicate_queue_row(
+            src_text, tgt_x, tgt_y, troops_map, cmd_attack, send_str
+        )
+        if dup is not None:
+            dup_msg = (
+                "Bu komut zaten kuyrukta (aynı köy, hedef, tür, zaman ve birlikler).\n\n"
+                "Yine de eklemek istiyor musunuz?"
+            )
+            if duplicate_dialog:
+                parent = _tw_aux_msgbox_parent(msg_parent or self)
+                r = QMessageBox.question(
+                    parent,
+                    "Mükerrer komut",
+                    dup_msg,
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if r != QMessageBox.Yes:
+                    return False, "Mükerrer komut — iptal edildi"
+            else:
+                return False, "Kuyrukta aynı komut zaten var"
+
         cmd_type = "Sld" if cmd_attack else "Dst"
         task_id = str(self.sa_table.topLevelItemCount() + 1)
 
@@ -7092,6 +7479,7 @@ class TribalWarsBot(QMainWindow):
 
         self.sa_table.addTopLevelItem(item)
         self._sa_update_totals()
+        self._sa_remember_last_arrive_time(arrive_dt=arrive_dt)
 
         travel_min = travel_sec / 60
         self._add_log(
@@ -7152,15 +7540,65 @@ class TribalWarsBot(QMainWindow):
                 return v.get("id")
         return None
 
+    def _sa_queue_item_is_pending(self, item) -> bool:
+        """Bekleyen kuyruk satırı — gönderilmiş veya hatalı değil."""
+        if not item:
+            return False
+        state = str(item.data(0, Qt.UserRole) or "")
+        return state not in ("sent", "error")
+
+    def _sa_pending_troops_by_village(self, *, exclude_item=None, exclude_items=None):
+        """Bekleyen satırlardaki asker toplamı (köy id → birim → adet)."""
+        # QTreeWidgetItem hashlenemez — id() ile hariç tut.
+        exclude_ids = set()
+        if exclude_item is not None:
+            exclude_ids.add(id(exclude_item))
+        for it in exclude_items or ():
+            if it is not None:
+                exclude_ids.add(id(it))
+
+        by_vid = {}
+        if not hasattr(self, "sa_table"):
+            return by_vid
+        for i in range(self.sa_table.topLevelItemCount()):
+            item = self.sa_table.topLevelItem(i)
+            if not item or id(item) in exclude_ids or not self._sa_queue_item_is_pending(item):
+                continue
+            vid = self._sa_village_id_from_queue_src(item.text(0))
+            if vid is None:
+                continue
+            troops = self._sa_queue_troop_map_from_item(item)
+            if not troops:
+                continue
+            acc = by_vid.setdefault(vid, {})
+            for key, raw in troops.items():
+                n = int(raw or 0)
+                if n > 0:
+                    acc[key] = acc.get(key, 0) + n
+        return by_vid
+
+    def _sa_available_troops_for_village_id(self, village_id, *, exclude_item=None, exclude_items=None):
+        """Köy stoğu eksi bekleyen kuyruk rezervi (gönderilebilir home birlikler)."""
+        stock = self._sa_resolve_village_troops(village_id)
+        if not isinstance(stock, dict) or self._sa_troops_sum(stock) <= 0:
+            for v in (self._game_data or {}).get("all_villages") or []:
+                if self._sa_same_village_id(v.get("id"), village_id):
+                    t = v.get("troops")
+                    if isinstance(t, dict):
+                        stock = dict(t)
+                    break
+        stock = dict(stock or {})
+        reserved = self._sa_pending_troops_by_village(
+            exclude_item=exclude_item, exclude_items=exclude_items
+        ).get(village_id, {})
+        return self._sa_subtract_troops_from_stock(stock, reserved)
+
     def _sa_support_reserved_from_queue(self):
-        """Bekleyen destek kuyruğundaki köy ID'leri — sonraki planlarda tekrar seçilmez."""
+        """Eski API — bekleyen destek satırlarındaki köy ID'leri (geriye uyumluluk)."""
         reserved = set()
         for i in range(self.sa_table.topLevelItemCount()):
             item = self.sa_table.topLevelItem(i)
-            if not item:
-                continue
-            state = item.data(0, Qt.UserRole)
-            if state in ("sent", "error"):
+            if not item or not self._sa_queue_item_is_pending(item):
                 continue
             if (item.text(14) or "").strip() != "Dst":
                 continue
@@ -7168,6 +7606,41 @@ class TribalWarsBot(QMainWindow):
             if vid is not None:
                 reserved.add(vid)
         return reserved
+
+    def _sa_find_exact_duplicate_queue_row(
+        self,
+        src_text,
+        tgt_x,
+        tgt_y,
+        troops_map,
+        cmd_attack,
+        send_str,
+        *,
+        exclude_item=None,
+    ):
+        """Kazara çift eklenen birebir aynı bekleyen satır."""
+        tgt = f"{int(tgt_x)}|{int(tgt_y)}"
+        cmd_type = "Sld" if cmd_attack else "Dst"
+        send_norm = (send_str or "").strip()
+        new_vals = self._sa_queue_format_troop_values(troops_map)
+        if not hasattr(self, "sa_table"):
+            return None
+        for i in range(self.sa_table.topLevelItemCount()):
+            item = self.sa_table.topLevelItem(i)
+            if not item or item is exclude_item or not self._sa_queue_item_is_pending(item):
+                continue
+            if (item.text(0) or "").strip() != (src_text or "").strip():
+                continue
+            if self._dispatch_target_coords_key(item.text(1)) != (str(int(tgt_x)), str(int(tgt_y))):
+                continue
+            if (item.text(14) or "").strip() != cmd_type:
+                continue
+            if (item.text(15) or "").strip() != send_norm:
+                continue
+            old_vals = [item.text(2 + j) for j in range(len(SA_QUEUE_TABLE_TROOP_KEYS))]
+            if old_vals == new_vals:
+                return item
+        return None
 
     def _sa_find_village_at_coord(self, x, y):
         """all_villages veya aktif köyde koordinata göre köy sözlüğü."""
@@ -7182,26 +7655,49 @@ class TribalWarsBot(QMainWindow):
             return v
         return None
 
-    def _sa_validate_troops_within_village_stock(self, troops_map, src_x, src_y):
+    def _sa_validate_troops_within_village_stock(
+        self, troops_map, src_x, src_y, *, exclude_item=None, exclude_items=None
+    ):
         """
-        Kaynak köyün `troops` sözlüğü biliniyorsa, komuttaki miktarların stoğu aşmamasını kontrol eder.
+        Komuttaki miktarların köy stoğunu (bekleyen kuyruk rezervi düşülmüş) aşmamasını kontrol eder.
+        Aynı köyden farklı hedeflere birden fazla komut serbest; toplam rezerv stoğu geçemez.
         Dönüş: (True, None) veya (False, kullanıcıya gösterilecek metin).
-        Veri yoksa veya köy bulunamazsa doğrulama atlanır (True, None).
         """
         v = self._sa_find_village_at_coord(src_x, src_y)
         if not v:
             return True, None
-        avail = v.get("troops")
+        vid = v.get("id")
+        if vid is None:
+            avail = v.get("troops")
+            if not isinstance(avail, dict):
+                return True, None
+            reserved = {}
+        else:
+            avail = self._sa_available_troops_for_village_id(
+                vid, exclude_item=exclude_item, exclude_items=exclude_items
+            )
+            reserved = self._sa_pending_troops_by_village(
+                exclude_item=exclude_item, exclude_items=exclude_items
+            ).get(vid, {})
         if not isinstance(avail, dict):
             return True, None
         over = []
         tr = getattr(self, "INCOMINGS_UNIT_TR", None) or {}
         for key, _ in self.SA_UNIT_DEFS:
             want = int(troops_map.get(key, 0) or 0)
-            cap = int(avail.get(key, 0) or 0)
+            if want <= 0:
+                continue
+            cap = self._sa_troop_count(avail, key)
             if want > cap:
                 label = tr.get(key, key)
-                over.append(f"{label}: yazdığınız {want}, köyde {cap}")
+                res = self._sa_troop_count(reserved, key)
+                if res > 0:
+                    over.append(
+                        f"{label}: yazdığınız {want}, kullanılabilir {cap} "
+                        f"({res} başka satırda rezerve)"
+                    )
+                else:
+                    over.append(f"{label}: yazdığınız {want}, kullanılabilir {cap}")
         if not over:
             return True, None
         max_lines = 14
@@ -7209,10 +7705,11 @@ class TribalWarsBot(QMainWindow):
         if len(over) > max_lines:
             body += f"\n… ve {len(over) - max_lines} birim daha"
         return False, (
-            "Bazı birimler köydekinden fazla:\n\n"
+            "Bazı birimler kullanılabilir stoktan fazla:\n\n"
             + body
-            + "\n\nMiktarları düzeltin veya birlik verisini yenileyin.\n"
-            "(İngilizce sunucularda şövalye = knight.)"
+            + "\n\nAynı köyden farklı hedeflere komut yazabilirsiniz; "
+            "bekleyen satırların toplamı köy stoğunu aşmamalı.\n"
+            "Miktarları düzeltin veya kuyruktaki çakışan satırları silin."
         )
 
     def _sa_troops_total_population(self, troops_map):
@@ -7461,16 +7958,21 @@ class TribalWarsBot(QMainWindow):
                 t[k] = int(vt.get(k, 0) or 0)
         return t
 
+    def _sa_noble_split_unit_keys(self):
+        """Misyoner dalgasında eşit bölünecek birimler (snob hariç — dalga başına 1)."""
+        return [k for k, _ in self._sa_sendable_unit_defs() if k != "snob"]
+
     def _sa_troops_noble_split_wave(self, village_troops, parts, wave_index):
-        """Misyoner bölme: eskort eşit parçalara; her parçada 1 misyoner (köyde yeterli yoksa önceki parçalara)."""
+        """Misyoner bölme: tüm gönderilebilir birlikler eşit parçalara; dalga başına 1 snob."""
         t = {k: 0 for k, _ in self.SA_UNIT_DEFS}
         vt = village_troops or {}
-        for k in self.SA_RAM_AUTO_KEYS:
-            tot = int(vt.get(k, 0) or 0)
-            t[k] = tot // parts + (1 if wave_index < (tot % parts) else 0)
-        total_snob = int(vt.get("snob", 0) or 0)
-        # 3 parça → her satırda 1 snob; 4 parça → yine her satırda 1 (köydeki snob yetmezse kalan parçalar 0)
-        t["snob"] = 1 if wave_index < total_snob and wave_index < parts else 0
+        parts = max(1, int(parts or 1))
+        wi = max(0, int(wave_index or 0))
+        for k in self._sa_noble_split_unit_keys():
+            tot = self._sa_troop_count(vt, k)
+            t[k] = tot // parts + (1 if wi < (tot % parts) else 0)
+        total_snob = self._sa_troop_count(vt, "snob")
+        t["snob"] = 1 if wi < total_snob and wi < parts else 0
         return t
 
     def _sa_bulk_import_text(self, raw, msg_parent=None):
@@ -7512,7 +8014,7 @@ class TribalWarsBot(QMainWindow):
                 msg.setWindowTitle("Misyoner bölme")
                 msg.setText(
                     "Listede misyoner (snob) komutu var.\n\n"
-                    "Eskort birimleri (balta, hafif, koç, mancınık, atlı okçu, casus) parça sayısına bölünür.\n"
+                    "Köydeki tüm gönderilebilir birlikler (misyoner hariç) parça sayısına eşit bölünür.\n"
                     "Her parçaya 1 misyoner yazılır (3 parça → 3×1, 4 parça → 4×1; köyde daha az snob varsa "
                     "yalnızca ilk parçalara 1'er konur).\n\n"
                     "Kaç parça olsun?"
@@ -7561,7 +8063,11 @@ class TribalWarsBot(QMainWindow):
 
                 src_name = v.get("name", "?")
                 src_text = f"{src_name} ({r['sx']}|{r['sy']})"
-                troops_avail = v.get("troops") or {}
+                troops_avail = (
+                    self._sa_available_troops_for_village_id(v.get("id"))
+                    if v.get("id") is not None
+                    else (v.get("troops") or {})
+                )
 
                 ut = r["unit"]
                 if ut == "ram":
@@ -7578,6 +8084,8 @@ class TribalWarsBot(QMainWindow):
                         dt,
                         fake_dialog=False,
                         arrive_dt_fixed=arrive_fixed,
+                        duplicate_dialog=False,
+                        msg_parent=parent,
                     )
                     if ok:
                         added += 1
@@ -7599,6 +8107,8 @@ class TribalWarsBot(QMainWindow):
                         dt,
                         fake_dialog=False,
                         arrive_dt_fixed=arrive_fixed,
+                        duplicate_dialog=False,
+                        msg_parent=parent,
                     )
                     if ok:
                         added += 1
@@ -7620,6 +8130,8 @@ class TribalWarsBot(QMainWindow):
                         dt,
                         fake_dialog=False,
                         arrive_dt_fixed=arrive_fixed,
+                        duplicate_dialog=False,
+                        msg_parent=parent,
                     )
                     if ok:
                         added += 1
@@ -7646,6 +8158,8 @@ class TribalWarsBot(QMainWindow):
                             "send",
                             wave_dt,
                             fake_dialog=False,
+                            duplicate_dialog=False,
+                            msg_parent=parent,
                         )
                         if ok:
                             added += 1
@@ -7668,6 +8182,8 @@ class TribalWarsBot(QMainWindow):
                         dt,
                         fake_dialog=False,
                         arrive_dt_fixed=arrive_fixed,
+                        duplicate_dialog=False,
+                        msg_parent=parent,
                     )
                     if ok:
                         added += 1
@@ -7962,6 +8478,7 @@ class TribalWarsBot(QMainWindow):
                 item.setData(0, self.SA_QUEUE_ITEM_ROLE_CATAPULT, catapult)
         if getattr(self, "_unit_speeds_fetched", False):
             self._sa_refresh_all_queue_timelines()
+        self._sa_sync_last_arrive_from_queue()
         self._sa_update_totals()
 
     def _sa_update_totals(self):
@@ -7974,6 +8491,8 @@ class TribalWarsBot(QMainWindow):
         self.sa_totals_label.setText(f"BEKLEYEN: {count} komut  |  GEÇMİŞ: {nh}")
         self._sa_save_army_queue()
         self._sa_save_army_history()
+        if hasattr(self, "sa_source_combo") and self.sa_source_combo.currentIndex() >= 0:
+            self._sa_on_source_changed(self.sa_source_combo.currentIndex())
 
     def _sa_trim_army_history_overflow(self):
         if not hasattr(self, "sa_history_table"):
@@ -8164,30 +8683,30 @@ class TribalWarsBot(QMainWindow):
         return out
 
     def _sa_resolve_village_troops(self, village_id):
-        """Ordu Gönder stok etiketi — all_villages + tarayıcıdaki aktif köy yedeği."""
+        """Ordu Gönder stok etiketi — gönderilebilir (home) birlikler; destek dahil değil."""
+        gv = (self._game_data or {}).get("village") or {}
+        if self._sa_same_village_id(gv.get("id"), village_id):
+            active = (self._game_data or {}).get("troops") or {}
+            if self._sa_troops_sum(active) > 0:
+                stale = None
+                for v in (self._game_data or {}).get("all_villages") or []:
+                    if self._sa_same_village_id(v.get("id"), village_id):
+                        t = v.get("troops")
+                        if isinstance(t, dict):
+                            stale = t
+                        break
+                return self._sa_merge_troops_max_snob(dict(active), stale)
+
         stale = None
         for v in (self._game_data or {}).get("all_villages") or []:
             if not self._sa_same_village_id(v.get("id"), village_id):
                 continue
             t = v.get("troops")
             if isinstance(t, dict) and self._sa_troops_sum(t) > 0:
-                result = dict(t)
-                gv = (self._game_data or {}).get("village") or {}
-                if self._sa_same_village_id(gv.get("id"), village_id):
-                    active = (self._game_data or {}).get("troops") or {}
-                    result = self._sa_merge_troops_max_snob(result, active)
-                return result
+                return dict(t)
             if isinstance(t, dict):
                 stale = dict(t)
             break
-
-        gv = (self._game_data or {}).get("village") or {}
-        if self._sa_same_village_id(gv.get("id"), village_id):
-            active = (self._game_data or {}).get("troops") or {}
-            if self._sa_troops_sum(active) > 0:
-                if isinstance(stale, dict) and stale:
-                    return self._sa_merge_troops_max_snob(stale, active)
-                return dict(active)
 
         return stale if isinstance(stale, dict) else {}
 
@@ -8345,6 +8864,73 @@ class TribalWarsBot(QMainWindow):
             out[k] = max(0, self._sa_troop_count(out, k) - n)
         return out
 
+    def _sa_apply_troop_delta(self, village_id, troops_delta, *, subtract=True) -> None:
+        """Köy stoğunu anında güncelle (sunucu isteği yok). subtract=False miktar ekler."""
+        if not troops_delta:
+            return
+        try:
+            vid = int(village_id)
+        except (TypeError, ValueError):
+            return
+        if vid <= 0:
+            return
+        sign = -1 if subtract else 1
+        gd = self._game_data if isinstance(getattr(self, "_game_data", None), dict) else {}
+        if not gd:
+            self._game_data = {}
+            gd = self._game_data
+
+        def _apply_to_stock(stock):
+            out = dict(stock or {})
+            for k, raw in troops_delta.items():
+                try:
+                    n = int(raw or 0)
+                except (TypeError, ValueError):
+                    continue
+                if n <= 0:
+                    continue
+                out[k] = max(0, self._sa_troop_count(out, k) + sign * n)
+            return out
+
+        updated = False
+        for v in gd.get("all_villages") or []:
+            if not self._sa_same_village_id(v.get("id"), vid):
+                continue
+            v["troops"] = _apply_to_stock(v.get("troops"))
+            v["troops_fresh"] = True
+            updated = True
+            break
+
+        if self._sa_same_village_id((gd.get("village") or {}).get("id"), vid):
+            gd["troops"] = _apply_to_stock(gd.get("troops"))
+        elif updated:
+            for v in gd.get("all_villages") or []:
+                if self._sa_same_village_id(v.get("id"), vid):
+                    gd["troops"] = dict(v.get("troops") or {})
+                    break
+
+        if not updated:
+            entry = {
+                "id": vid,
+                "troops": _apply_to_stock({}),
+                "troops_fresh": True,
+            }
+            gv = gd.get("village") or {}
+            if self._sa_same_village_id(gv.get("id"), vid):
+                for k in ("name", "x", "y", "coord", "points"):
+                    if gv.get(k) is not None:
+                        entry[k] = gv[k]
+            gd.setdefault("all_villages", []).append(entry)
+            if self._sa_same_village_id(gv.get("id"), vid):
+                gd["troops"] = dict(entry.get("troops") or {})
+
+        self._last_active_troops_fp = None
+        self._last_active_troops_vid = None
+        self._update_troops(gd)
+        self._update_troop_available()
+        if hasattr(self, "all_villages_tree"):
+            self._update_villages_list(gd)
+
     def _sa_plan_mass_fakes_with(
         self,
         targets_text,
@@ -8415,7 +9001,7 @@ class TribalWarsBot(QMainWindow):
             if sx is None or vid is None:
                 n_no_coord += 1
                 continue
-            stock0 = v.get("troops") or {}
+            stock0 = self._sa_available_troops_for_village_id(vid)
             if not self._sa_village_has_siege_stock(stock0, selected_unit_keys):
                 n_no_siege += 1
                 continue
@@ -8454,7 +9040,10 @@ class TribalWarsBot(QMainWindow):
             return
 
         usage = {}
-        remaining = {p["vid"]: dict(p["v"].get("troops") or {}) for p in pool}
+        remaining = {
+            p["vid"]: dict(self._sa_available_troops_for_village_id(p["vid"]))
+            for p in pool
+        }
         target_hits = {(tx, ty): 0 for tx, ty in targets}
         added = 0
         skipped = []
@@ -8582,6 +9171,8 @@ class TribalWarsBot(QMainWindow):
                         base_arrive,
                         fake_dialog=False,
                         check_fake_limit=enforce_fake_limit,
+                        duplicate_dialog=False,
+                        msg_parent=parent,
                     )
                 finally:
                     self._sa_source_points_cache = old_cache
@@ -8728,8 +9319,8 @@ class TribalWarsBot(QMainWindow):
             )
             return
 
-        reserved_vids = self._sa_support_reserved_from_queue()
-        n_reserved_skip = 0
+        pending_by_vid = self._sa_pending_troops_by_village()
+        n_partial_reserve = 0
 
         pool = []
         n_no_coord = 0
@@ -8740,10 +9331,9 @@ class TribalWarsBot(QMainWindow):
             if sx is None or vid is None:
                 n_no_coord += 1
                 continue
-            if vid in reserved_vids:
-                n_reserved_skip += 1
-                continue
-            stock0 = v.get("troops") or {}
+            stock0 = self._sa_available_troops_for_village_id(vid)
+            if not stock0 and pending_by_vid.get(vid):
+                n_partial_reserve += 1
             if not self._sa_build_troops_from_template(stock0, template):
                 n_no_stock += 1
                 continue
@@ -8761,7 +9351,7 @@ class TribalWarsBot(QMainWindow):
                 parent,
                 "Şablonlu destek",
                 f"Uygun kaynak köy yok ({len(villages)} köy grupta).\n\n"
-                f"• Kuyrukta rezerve: {n_reserved_skip}\n"
+                f"• Kuyrukta kısmen/tamamen dolu: {n_partial_reserve}\n"
                 f"• Koordinatsız: {n_no_coord}\n"
                 f"• Şablona uygun stok yok: {n_no_stock}\n\n"
                 "Tarayıcıdan birlikleri yenileyin, şablonu düşürün veya kuyruğu kontrol edin.",
@@ -8769,7 +9359,10 @@ class TribalWarsBot(QMainWindow):
             return
 
         usage = {}
-        remaining = {p["vid"]: dict(p["v"].get("troops") or {}) for p in pool}
+        remaining = {
+            p["vid"]: dict(self._sa_available_troops_for_village_id(p["vid"]))
+            for p in pool
+        }
         target_hits = {(tx, ty): 0 for tx, ty in targets}
         added = 0
         skipped = []
@@ -8788,8 +9381,6 @@ class TribalWarsBot(QMainWindow):
                 for p in pool:
                     vid = p["vid"]
                     if usage.get(vid, 0) >= 1:
-                        continue
-                    if vid in reserved_vids:
                         continue
                     stock = remaining.get(vid) or {}
                     troops_map = self._sa_build_troops_from_template(stock, template)
@@ -8866,12 +9457,13 @@ class TribalWarsBot(QMainWindow):
                     base_arrive,
                     fake_dialog=False,
                     check_fake_limit=False,
+                    duplicate_dialog=False,
+                    msg_parent=parent,
                 )
 
                 if ok:
                     added += 1
                     usage[vid] = usage.get(vid, 0) + 1
-                    reserved_vids.add(vid)
                     target_hits[coord] = target_hits.get(coord, 0) + 1
                     remaining[vid] = self._sa_subtract_troops_from_stock(
                         stock, troops_map
@@ -8903,8 +9495,8 @@ class TribalWarsBot(QMainWindow):
             f"Kuyruğa eklenen destek: {added} / hedef başına {villages_per_target}\n"
             f"Grup «{group_name}»: {len(pool)} uygun köy (toplam {len(villages)} grupta)"
         )
-        if n_reserved_skip:
-            msg += f"\n• Kuyrukta rezerve olduğu için hariç: {n_reserved_skip} köy"
+        if n_partial_reserve:
+            msg += f"\n• Kuyrukta asker rezervi olan köy: {n_partial_reserve}"
         if n_late or n_no_template:
             msg += (
                 f"\n• Varış çok yakın / geçmiş (sunucu saati): {n_late} köy–hedef denemesi"
@@ -8930,6 +9522,36 @@ class TribalWarsBot(QMainWindow):
         self._dispatch_timer.timeout.connect(self._dispatch_check)
         self._dispatch_timer.start(10)  # 10ms — hassas zamanlama
 
+
+    def _sa_validate_dispatch_stock(self, item, row_idx):
+        """Gönderim öncesi stok — dalga grubu ve kuyruk rezervi dahil."""
+        if not item:
+            return True, None
+        src_match = re.search(r"\((\d+)\|(\d+)\)", item.text(0) or "")
+        if not src_match:
+            return True, None
+        src_x, src_y = int(src_match.group(1)), int(src_match.group(2))
+        batch_indices = self._dispatch_batch_indices_from(row_idx)
+        batch_items = [
+            self.sa_table.topLevelItem(j)
+            for j in batch_indices
+            if self.sa_table.topLevelItem(j)
+        ]
+        combined = {}
+        for it in batch_items:
+            for key, n in self._sa_queue_troop_map_from_item(it).items():
+                combined[key] = combined.get(key, 0) + int(n or 0)
+        if not combined:
+            return False, "Asker yok"
+        ok, msg = self._sa_validate_troops_within_village_stock(
+            combined,
+            src_x,
+            src_y,
+            exclude_items=batch_items,
+        )
+        if ok:
+            return True, None
+        return False, msg or "Yetersiz asker (kuyruk/stok)"
 
     def _dispatch_check(self):
         """Tablodaki komutları tara:
@@ -8977,6 +9599,12 @@ class TribalWarsBot(QMainWindow):
 
             # 6 saniye kala: rally point token'ını önceden cache'le (fetch bitene kadar süre)
             if 0 < diff_ms <= 6000 and state not in ("cached", "confirmed", "confirming"):
+                ok_stock, stock_err = self._sa_validate_dispatch_stock(item, i)
+                if not ok_stock:
+                    self._dispatch_mark_error(
+                        item, stock_err or "Yetersiz asker (kuyruk/stok)"
+                    )
+                    continue
                 item.setData(0, Qt.UserRole, "caching")
                 self._dispatch_precache(item, i)
 
@@ -9169,8 +9797,9 @@ class TribalWarsBot(QMainWindow):
 
             # Yılı sunucu tarihinden al
             year = datetime.datetime.now().year
-            if self._server_time_text:
-                ym = re.search(r'(\d{4})', self._server_time_text)
+            srv_txt = getattr(self, "_server_time_text", "") or ""
+            if srv_txt:
+                ym = re.search(r'(\d{4})', srv_txt)
                 if ym:
                     year = int(ym.group(1))
 
@@ -9589,6 +10218,11 @@ class TribalWarsBot(QMainWindow):
             self._dispatch_mark_error(item, "Asker yok")
             return
 
+        ok_stock, stock_err = self._sa_validate_dispatch_stock(item, row_idx)
+        if not ok_stock:
+            self._dispatch_mark_error(item, stock_err or "Yetersiz asker (kuyruk/stok)")
+            return
+
         csrf = self._game_data.get("csrf", "")
         attack_type = "attack" if cmd_type == "Sld" else "support"
 
@@ -9913,6 +10547,11 @@ class TribalWarsBot(QMainWindow):
 
     def _dispatch_mark_sent(self, item, *, move_to_history=True):
         """Gönderilen satırı yeşile boyar; istenirse geçmiş tabloya taşır."""
+        src_text = item.text(0) if item else ""
+        vid = self._sa_village_id_from_queue_src(src_text)
+        troops = self._sa_queue_troop_map_from_item(item) if item else {}
+        if vid and troops:
+            self._sa_apply_troop_delta(vid, troops, subtract=True)
         for col in range(item.columnCount()):
             item.setBackground(col, QColor("#d4f0d4"))
             item.setForeground(col, QColor("#2a7a2a"))
@@ -18304,13 +18943,13 @@ class TribalWarsBot(QMainWindow):
         self.refresh_troops_bulk_btn = QPushButton("⚔ Birlikleri toplu oku")
         self.refresh_troops_bulk_btn.setCursor(Qt.PointingHandCursor)
         self.refresh_troops_bulk_btn.setToolTip(
-            "Genel Bakış → Birlikler (overview_villages&mode=units) sayfasından tüm köylerin "
-            "askerlerini arka planda çeker. Tarayıcıda Birlikler ekranındayken otomatik de tetiklenir."
+            "Tüm köy birliklerini hızlı modda okur (Birlikler ekranında DOM, diğer ekranlarda az XHR). "
+            "Tarayıcıda Birlikler ekranındayken otomatik de tetiklenir."
         )
         self.refresh_troops_bulk_btn.clicked.connect(self._scrape_troops_bulk)
         game_data_lay.addWidget(self.refresh_troops_bulk_btn)
         game_data_hint = QLabel(
-            "Oyuna girdikten sonra veriler ~12 sn içinde otomatik çekilir; "
+            "Oyuna girdikten sonra birlikler ~1.5 sn içinde, tam veri ~8 sn içinde otomatik çekilir; "
             "hemen güncellemek için bu düğmeyi kullanın."
         )
         game_data_hint.setWordWrap(True)
@@ -18326,6 +18965,40 @@ class TribalWarsBot(QMainWindow):
         self.settings_dark_cb.setChecked(self._dark_mode)
         self.settings_dark_cb.toggled.connect(self._on_settings_dark_mode_toggled)
         gen_layout.addRow(self.settings_dark_cb)
+
+        browser_color_wrap = QWidget()
+        browser_color_lay = QVBoxLayout(browser_color_wrap)
+        browser_color_lay.setContentsMargins(0, 0, 0, 0)
+        browser_color_lay.setSpacing(4)
+        browser_color_lay.addWidget(
+            QLabel("Oyun sayfası görünümü (gömülü tarayıcı — bot gece modundan ayrı):")
+        )
+        self._browser_color_scheme_group = QButtonGroup(self)
+        saved_browser_color = self._get_browser_color_scheme_mode()
+        for label, mode in [
+            ("Otomatik (önerilen) — düşük kontrastta açık tema", TW_BROWSER_COLOR_AUTO),
+            ("Her zaman açık — Tribal Wars varsayılanı", TW_BROWSER_COLOR_LIGHT),
+            ("Sistemi takip et — Windows karanlık modu", TW_BROWSER_COLOR_SYSTEM),
+        ]:
+            rb = QRadioButton(label)
+            rb.setProperty("tw_browser_color_mode", mode)
+            self._browser_color_scheme_group.addButton(rb)
+            browser_color_lay.addWidget(rb)
+            if mode == saved_browser_color:
+                rb.setChecked(True)
+        if self._browser_color_scheme_group.checkedButton() is None:
+            self._browser_color_scheme_group.buttons()[0].setChecked(True)
+        self._browser_color_scheme_group.buttonClicked.connect(
+            self._on_browser_color_scheme_changed
+        )
+        browser_color_hint = QLabel(
+            "Yazılar silikse «Otomatik» veya «Her zaman açık» deneyin. Bot paneli gece modu bu ayarı etkilemez."
+        )
+        browser_color_hint.setWordWrap(True)
+        browser_color_hint.setObjectName("settingsProxyHelp")
+        browser_color_lay.addWidget(browser_color_hint)
+        gen_layout.addRow(browser_color_wrap)
+
         for label, default in [
             ("Farm mesafesi (max):", "20"),
             ("Min. kaynak:", "500"),
@@ -18501,10 +19174,11 @@ class TribalWarsBot(QMainWindow):
                     self._add_log(
                         "VERİ",
                         "info",
-                        "Veriler ~12 sn sonra bir kez otomatik çekilecek; bu sürede tarayıcıda gezinebilirsiniz. "
+                        "Birlikler ~1.5 sn, tam veri (gruplar/puan) ~8 sn içinde otomatik çekilecek. "
                         "Hemen güncellemek için Ayarlar sekmesinde «Verileri Yenile» kullanın.",
                     )
-                    QTimer.singleShot(12000, self._tw_scrape_once_if_in_game)
+                    QTimer.singleShot(1500, self._scrape_troops_only)
+                    QTimer.singleShot(8000, self._tw_scrape_once_if_in_game)
             QTimer.singleShot(300, self._poll_bot_protection)
             QTimer.singleShot(100, self._schedule_village_change_troops_refresh)
             QTimer.singleShot(200, lambda: self._refresh_active_village_troops_fast())
@@ -18877,6 +19551,45 @@ class TribalWarsBot(QMainWindow):
                 except (TypeError, ValueError):
                     continue
 
+    def _merge_troops_only_villages(self, data: dict, prev: dict) -> None:
+        """Hafif birlik scrape sonucunu mevcut köy meta verisiyle birleştir."""
+        prev_by_id = {}
+        for v in prev.get("all_villages") or []:
+            vid = v.get("id")
+            if vid is None:
+                continue
+            try:
+                prev_by_id[int(vid)] = v
+            except (TypeError, ValueError):
+                continue
+        merged = []
+        seen = set()
+        for nv in data.get("all_villages") or []:
+            if not nv or nv.get("id") is None:
+                continue
+            try:
+                vid = int(nv.get("id"))
+            except (TypeError, ValueError):
+                continue
+            seen.add(vid)
+            pv = prev_by_id.get(vid)
+            if pv:
+                m = dict(pv)
+                m["troops"] = dict(nv.get("troops") or {})
+                if nv.get("troops_fresh"):
+                    m["troops_fresh"] = True
+                for k in ("name", "x", "y", "points", "selected", "farm_text"):
+                    if nv.get(k) is not None and nv.get(k) != "":
+                        m[k] = nv[k]
+                merged.append(m)
+            else:
+                merged.append(dict(nv))
+        for vid, pv in prev_by_id.items():
+            if vid not in seen:
+                merged.append(dict(pv))
+        data["all_villages"] = merged
+        data["village_groups"] = prev.get("village_groups") or data.get("village_groups") or []
+
     def _tw_scrape_once_if_in_game(self) -> None:
         """İlk oyun girişinde tek otomatik scrape; her sayfa yüklemesinde çağrılmaz (tarayıcı donması / rate limit)."""
         if not self.is_running or not getattr(self, "browser", None):
@@ -18890,7 +19603,7 @@ class TribalWarsBot(QMainWindow):
         u = (url or "").lower()
         return "overview_villages" in u and ("mode=units" in u or "mode%3dunits" in u)
 
-    def _schedule_units_overview_scrape(self, delay_ms: int = 900) -> None:
+    def _schedule_units_overview_scrape(self, delay_ms: int = 300) -> None:
         """Birlikler ekranı yüklendiğinde toplu asker okumasını gecikmeli tetikle."""
         if not self.is_running or self._login_state != "in_game":
             return
@@ -18906,20 +19619,37 @@ class TribalWarsBot(QMainWindow):
         self._units_overview_scrape_timer = t
         t.start(max(200, int(delay_ms)))
 
-    def _scrape_troops_bulk(self) -> None:
-        """Tüm köy birliklerini overview_villages&mode=units üzerinden toplu çek."""
+    def _scrape_troops_only(self) -> None:
+        """Hızlı birlik güncelleme — gruplar/puan/combined XHR yok."""
         if not self.is_running or not getattr(self, "browser", None):
+            return
+        u = self.browser.url().toString()
+        if "game.php" not in u and "/overview" not in u:
+            return
+        self._scrape_game_data(force_troops_refresh=True, troops_only=True)
+
+    def _scrape_troops_bulk(self) -> None:
+        """Tüm köy birliklerini hızlı modda oku (Birlikler DOM veya az XHR)."""
+        if not self.is_running or not getattr(self, "browser", None):
+            return
+        now = time.time()
+        debounce = float(getattr(self, "_troops_scrape_debounce_sec", 3.0) or 3.0)
+        last = float(getattr(self, "_last_troops_scrape_at", 0) or 0)
+        if now - last < debounce:
             return
         u = self.browser.url().toString()
         if "game.php" not in u and "/overview" not in u:
             self._add_log("VERİ", "warn", "Birlikler okunamadı: oyun sayfasında değilsiniz.")
             return
+        on_units = self._url_is_units_overview(u)
         self._add_log(
             "VERİ",
             "info",
-            "Birlikler toplu okunuyor (Genel Bakış → Birlikler / XHR)...",
+            "Birlikler hızlı okunuyor"
+            + (" (DOM)…" if on_units else " (XHR)…"),
         )
-        self._scrape_game_data(force_troops_refresh=True)
+        self._last_troops_scrape_at = now
+        self._scrape_game_data(force_troops_refresh=True, troops_only=True)
 
     def _schedule_village_change_troops_refresh(self) -> None:
         """Köy değişiminde hızlı game_data okuması (tam scrape yok)."""
@@ -18942,14 +19672,14 @@ class TribalWarsBot(QMainWindow):
             self._sa_source_user_picked = False
             self._last_active_troops_fp = None
             self._last_active_troops_vid = None
-            self._troops_loading_until = time.time() + 2.0
+            self._troops_loading_until = time.time() + 0.5
             t = getattr(self, "_village_troops_refresh_timer", None)
             if t is not None:
                 try:
                     t.stop()
                 except Exception:
                     pass
-            self._refresh_active_village_troops_fast()
+            QTimer.singleShot(100, self._refresh_active_village_troops_fast)
 
         self.browser.page().runJavaScript(
             "(typeof game_data !== 'undefined' && game_data.village) ? game_data.village.id : 0",
@@ -18994,7 +19724,7 @@ class TribalWarsBot(QMainWindow):
         return screen in ("place", "barracks", "train", "overview_villages")
 
     def _active_village_troops_read_js(self) -> str:
-        """Aktif köy birlikleri: game_data.village.units, köy özeti widget, VillageOverview."""
+        """Aktif köy gönderilebilir birlikleri: home_unit, place input, game_data.village.units."""
         return r"""
         (function() {
             if (typeof game_data === 'undefined' || !game_data.village) {
@@ -19033,17 +19763,6 @@ class TribalWarsBot(QMainWindow):
                     if (!isNaN(n)) troops[k] = n;
                 }
                 return troops;
-            }
-            function mergeTroopsMax(into, from) {
-                if (!from || typeof from !== 'object') return into;
-                var k, n, cur;
-                for (k in from) {
-                    if (!Object.prototype.hasOwnProperty.call(from, k)) continue;
-                    n = parseInt(from[k], 10) || 0;
-                    cur = parseInt(into[k], 10) || 0;
-                    if (n > cur) into[k] = n;
-                }
-                return into;
             }
             function readSnobFromUnitsObject(uobj) {
                 if (uobj == null) return NaN;
@@ -19093,8 +19812,8 @@ class TribalWarsBot(QMainWindow):
                 var out = {};
                 var table = document.getElementById('unit_overview_table');
                 if (!table) return out;
-                var rows = table.querySelectorAll('tr.all_unit');
-                if (!rows.length) rows = table.querySelectorAll('tr.home_unit');
+                // Yalnızca home_unit — all_unit destek dahil toplam (gönderilemez).
+                var rows = table.querySelectorAll('tr.home_unit');
                 var ri, row, link, strong, key, txt, m, n;
                 for (ri = 0; ri < rows.length; ri++) {
                     row = rows[ri];
@@ -19121,19 +19840,17 @@ class TribalWarsBot(QMainWindow):
                 var out = {};
                 if (typeof VillageOverview === 'undefined' || !VillageOverview.units) return out;
                 var packs = VillageOverview.units;
-                var pi, pack, k, raw, n, cur;
-                for (pi = 0; pi < packs.length; pi++) {
-                    pack = packs[pi];
-                    if (!pack || typeof pack !== 'object') continue;
-                    for (k in pack) {
-                        if (!Object.prototype.hasOwnProperty.call(pack, k)) continue;
-                        raw = pack[k];
-                        if (raw != null && typeof raw === 'object') continue;
-                        n = parseInt(raw, 10);
-                        if (isNaN(n)) continue;
-                        cur = parseInt(out[k], 10) || 0;
-                        if (n > cur) out[k] = n;
-                    }
+                if (!packs || !packs.length) return out;
+                // packs[0] = köyün kendi birlikleri; sonraki paketler destek olabilir.
+                var pack = packs[0];
+                var k, raw, n;
+                if (!pack || typeof pack !== 'object') return out;
+                for (k in pack) {
+                    if (!Object.prototype.hasOwnProperty.call(pack, k)) continue;
+                    raw = pack[k];
+                    if (raw != null && typeof raw === 'object') continue;
+                    n = parseInt(raw, 10);
+                    if (!isNaN(n)) out[k] = n;
                 }
                 return out;
             }
@@ -19154,18 +19871,27 @@ class TribalWarsBot(QMainWindow):
                 }
                 return out;
             }
-            var troops = unitsObjectToTroops(gv.units);
-            if (sumTroops(troops) === 0 && unitNames.length) {
+            var gdHome = unitsObjectToTroops(gv.units);
+            if (sumTroops(gdHome) === 0 && unitNames.length) {
                 var uk, tmp = {};
                 for (uk = 0; uk < unitNames.length; uk++) {
                     var un = unitNames[uk];
                     if (un && gv[un] != null) tmp[un] = parseInt(gv[un], 10) || 0;
                 }
-                if (sumTroops(tmp) > 0) troops = tmp;
+                if (sumTroops(tmp) > 0) gdHome = tmp;
             }
-            troops = mergeTroopsMax(troops, readTroopsFromOverviewWidget());
-            troops = mergeTroopsMax(troops, readTroopsFromVillageOverviewUnits());
-            troops = mergeTroopsMax(troops, readTroopsFromPlaceInputs());
+            var placeTroops = readTroopsFromPlaceInputs();
+            var homeWidget = readTroopsFromOverviewWidget();
+            var voHome = readTroopsFromVillageOverviewUnits();
+            var troops = {};
+            var sendableSources = [placeTroops, homeWidget, voHome, gdHome];
+            var si;
+            for (si = 0; si < sendableSources.length; si++) {
+                if (sumTroops(sendableSources[si]) > 0) {
+                    troops = sendableSources[si];
+                    break;
+                }
+            }
             troops = patchSnob(troops, gv.units);
             if (gv.snob != null) {
                 var gn = parseInt(gv.snob, 10);
@@ -19286,8 +20012,8 @@ class TribalWarsBot(QMainWindow):
 
         self.browser.page().runJavaScript(self._active_village_troops_read_js(), on_result)
 
-    def _apply_active_village_troops(self, village_id: int, troops: dict) -> None:
-        """Aktif köy stokunu _game_data ve UI'a yaz (replace, Math.max yok)."""
+    def _apply_active_village_troops(self, village_id: int, troops: dict, *, force_replace: bool = False) -> None:
+        """Aktif köy stokunu _game_data ve UI'a yaz."""
         if not getattr(self, "_game_data", None):
             self._game_data = {}
         gd = self._game_data
@@ -19315,7 +20041,11 @@ class TribalWarsBot(QMainWindow):
         for v in gd.get("all_villages") or []:
             try:
                 if int(v.get("id", 0)) == village_id:
-                    if self._sa_troops_sum(clean) == 0 and self._sa_troops_sum(v.get("troops")) > 0:
+                    if (
+                        not force_replace
+                        and self._sa_troops_sum(clean) == 0
+                        and self._sa_troops_sum(v.get("troops")) > 0
+                    ):
                         clean = dict(v.get("troops") or {})
                         gd["troops"] = dict(clean)
                     v["troops"] = dict(clean)
@@ -19351,9 +20081,9 @@ class TribalWarsBot(QMainWindow):
             and ("game.php" in self.browser.url().toString() or "/overview" in self.browser.url().toString())
         )
         if in_game and self._url_is_troops_sensitive(self.browser.url().toString()):
-            delay_ms = random.randint(6000, 10000)
+            delay_ms = random.randint(2000, 3000)
         elif in_game:
-            delay_ms = random.randint(18000, 28000)
+            delay_ms = random.randint(5000, 8000)
         else:
             delay_ms = random.randint(20000, 30000)
         QTimer.singleShot(delay_ms, self._troops_watch_poll_reschedule)
@@ -19368,12 +20098,14 @@ class TribalWarsBot(QMainWindow):
             self._poll_active_village_troops()
         self._schedule_next_troops_watch_poll()
 
-    def _scrape_game_data(self, *, force_troops_refresh: bool = False):
+    def _scrape_game_data(self, *, force_troops_refresh: bool = False, troops_only: bool = False):
         """game_data JS değişkeninden ve DOM'dan tüm verileri çek."""
         force_troops_js = "true" if force_troops_refresh else "false"
+        troops_only_js = "true" if troops_only else "false"
         scrape_js = """
         (function() {
             var forceTroopsRefresh = """ + force_troops_js + """;
+            var troopsOnly = """ + troops_only_js + """;
             if (forceTroopsRefresh) {
                 try { delete window.__tw_bot_units_cache; } catch(e) {}
             }
@@ -19382,7 +20114,7 @@ class TribalWarsBot(QMainWindow):
                 return JSON.stringify({status: 'NO_GAME_DATA'});
             }
 
-            var result = {status: 'OK'};
+            var result = {status: 'OK', scrape_mode: troopsOnly ? 'troops_only' : 'full'};
 
             // Oyuncu bilgisi
             if (game_data.player) {
@@ -19773,6 +20505,24 @@ class TribalWarsBot(QMainWindow):
 
             function enrichTroopsFromGameDataUnits(arr) {
                 if (!arr || !arr.length) return;
+                function capTroopsToHome(home, table) {
+                    var out = {}, ck, tv, hv;
+                    table = table || {};
+                    home = home || {};
+                    for (ck in table) {
+                        if (!Object.prototype.hasOwnProperty.call(table, ck)) continue;
+                        tv = parseInt(table[ck], 10) || 0;
+                        hv = parseInt(home[ck], 10) || 0;
+                        out[ck] = hv > 0 ? Math.min(tv, hv) : tv;
+                    }
+                    for (ck in home) {
+                        if (!Object.prototype.hasOwnProperty.call(home, ck)) continue;
+                        if (!Object.prototype.hasOwnProperty.call(out, ck)) {
+                            out[ck] = parseInt(home[ck], 10) || 0;
+                        }
+                    }
+                    return out;
+                }
                 var vi, v, vid, uobj, fromGd, gv = game_data.village;
                 for (vi = 0; vi < arr.length; vi++) {
                     v = arr[vi];
@@ -19804,6 +20554,7 @@ class TribalWarsBot(QMainWindow):
                     }
                     if (!fromGd || sumTroops(fromGd) === 0) continue;
                     if (v.troops_fresh === true) {
+                        v.troops = capTroopsToHome(fromGd, v.troops || {});
                         if (uobj) {
                             var snFresh = readSnobFromUnitsObject(uobj);
                             if (!isNaN(snFresh)) {
@@ -19818,12 +20569,7 @@ class TribalWarsBot(QMainWindow):
                     if (sumTroops(v.troops) === 0) {
                         v.troops = fromGd;
                     } else {
-                        var ck, cur;
-                        for (ck in fromGd) {
-                            if (!Object.prototype.hasOwnProperty.call(fromGd, ck)) continue;
-                            cur = parseInt(v.troops[ck], 10) || 0;
-                            v.troops[ck] = Math.max(cur, fromGd[ck]);
-                        }
+                        v.troops = capTroopsToHome(fromGd, v.troops);
                     }
                 }
             }
@@ -20103,7 +20849,7 @@ class TribalWarsBot(QMainWindow):
                 var unitsSeenFetch = {};
                 paginateUnitsOverviewTable(document, window.location.href, unitsSeenFetch);
                 var expectedUnitsVc = parseInt(result.player && result.player.villages, 10) || 0;
-                if (onUnitsOverviewPage && expectedUnitsVc > result.all_villages.length) {
+                if (onUnitsOverviewPage && expectedUnitsVc > result.all_villages.length && !troopsOnly) {
                     var uUnitsSweep = new URL(window.location.href);
                     uUnitsSweep.searchParams.set('screen', 'overview_villages');
                     uUnitsSweep.searchParams.set('mode', 'units');
@@ -20131,7 +20877,7 @@ class TribalWarsBot(QMainWindow):
 
             var table = document.getElementById('combined_table');
             var hasCombinedTableOnPage = !!table;
-            if (table) {
+            if (!troopsOnly && table) {
                 mergeVillagesById(result.all_villages, parseCombinedTableRows(table));
 
                 var pager = document.querySelectorAll('a.paged-nav-item[href*="page="]');
@@ -20221,7 +20967,7 @@ class TribalWarsBot(QMainWindow):
             // Birleşik tablo bu sayfada yoksa (ör. köy ana ekranı): overview_villages/combined XHR ile çek.
             // Bazı dünyalarda tüm köyler page=-1 veya page_size=500 ile tek istekte gelir.
             var expectedVcTotal = parseInt(result.player && result.player.villages, 10) || 0;
-            if (!hasCombinedTableOnPage && (result.all_villages.length === 0 || expectedVcTotal > result.all_villages.length)) {
+            if (!troopsOnly && !hasCombinedTableOnPage && (result.all_villages.length === 0 || expectedVcTotal > result.all_villages.length)) {
                 var seenOv = {};
                 var curH = window.location.href;
                 function mergeOverviewHtml(html) {
@@ -20297,7 +21043,7 @@ class TribalWarsBot(QMainWindow):
 
             // Köy grupları: overview_villages mode=groups (statik üyelik + dinamik gruplar)
             result.village_groups = [];
-            try {
+            if (!troopsOnly) try {
                 var groupByVid = {};
                 var catalog = [];
                 var seenGHtml = {};
@@ -20364,12 +21110,12 @@ class TribalWarsBot(QMainWindow):
             } catch (eg) {}
 
             var prodTableEl = document.getElementById('production_table');
-            if (prodTableEl) {
+            if (!troopsOnly && prodTableEl) {
                 mergeVillagesById(result.all_villages, parseProductionTableRows(prodTableEl));
             }
 
             // Köy puanları: overview_villages mode=prod (üretim tablosu — «Puan» sütunu).
-            try {
+            if (!troopsOnly) try {
                 var _ptsNow = Date.now();
                 var _ptsTtl = 5 * 60 * 1000;
                 var _ptsCached = window.__tw_bot_prod_cache;
@@ -20450,7 +21196,9 @@ class TribalWarsBot(QMainWindow):
                     var _snobTtl = 5 * 60 * 1000;
                     var _unitsSeen = {};
                     var _expectedU = parseInt(result.player && result.player.villages, 10) || result.all_villages.length || 0;
-                    var _maxUP = Math.min(80, Math.max(4, Math.ceil(_expectedU / 5) + 4));
+                    var _maxUP = troopsOnly
+                        ? Math.min(3, Math.max(1, Math.ceil(_expectedU / 200) + 1))
+                        : Math.min(80, Math.max(4, Math.ceil(_expectedU / 5) + 4));
                     var _up, _uUnits = new URL(window.location.href);
                     _uUnits.searchParams.set('screen', 'overview_villages');
                     _uUnits.searchParams.set('mode', 'units');
@@ -20500,8 +21248,12 @@ class TribalWarsBot(QMainWindow):
                 } catch(exU) {}
             }
 
-            if (forceTroopsRefresh || onUnitsOverviewPage || !unitsTableEl || villagesTroopsLookEmpty(result.all_villages)) {
+            var skipUnitsXhr = troopsOnly && onUnitsOverviewPage && unitsTableEl
+                && result.all_villages.length > 0;
+            if (!skipUnitsXhr && (forceTroopsRefresh || onUnitsOverviewPage || !unitsTableEl || villagesTroopsLookEmpty(result.all_villages))) {
                 fetchUnitsOverviewIntoVillages();
+                enrichTroopsFromGameDataUnits(result.all_villages);
+            } else if (troopsOnly) {
                 enrichTroopsFromGameDataUnits(result.all_villages);
             }
 
@@ -20662,6 +21414,18 @@ class TribalWarsBot(QMainWindow):
                 self._add_log("VERİ", "warn", "game_data bulunamadı. Oyun sayfasında değilsiniz.")
                 return
 
+            is_troops_only = data.get("scrape_mode") == "troops_only" or troops_only
+            prev_gd = self._game_data or {}
+            if is_troops_only and prev_gd:
+                self._merge_troops_only_villages(data, prev_gd)
+                for k in (
+                    "village_groups", "features", "world_speed", "unit_speed",
+                    "world_display", "fake_limit", "buildings",
+                ):
+                    if k not in data or data.get(k) in (None, "", [], {}):
+                        if prev_gd.get(k) not in (None, "", [], {}):
+                            data[k] = prev_gd[k]
+
             self._merge_all_villages_troops_with_previous(data)
 
             gv_id = (data.get("village") or {}).get("id")
@@ -20702,8 +21466,9 @@ class TribalWarsBot(QMainWindow):
             vgroups = data.get("village_groups") or []
             n_with_groups = sum(1 for v in all_v if v.get("group_names"))
             n_with_troops = data.get("troops_villages_with_stock", 0)
+            mode_tag = " [hızlı birlik]" if is_troops_only else ""
             self._add_log("VERİ", "success",
-                f"Veri güncellendi: {village.get('name', '?')} ({village.get('coord', '?')}) | "
+                f"Veri güncellendi{mode_tag}: {village.get('name', '?')} ({village.get('coord', '?')}) | "
                 f"Puan: {village.get('points', 0)} | Köyler: {len(all_v)} | "
                 f"Askerli köy: {n_with_troops} | "
                 f"Gruplar: {len(vgroups)} | Köy+grup: {n_with_groups} | "

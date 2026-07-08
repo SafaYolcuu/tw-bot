@@ -1,5 +1,5 @@
 {
-  "version": "1.2.1",
-  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.2.1/TribalWarsBot-1.2.1.zip",
-  "changelog_tr": "Hedefler sekmesi: komutlar varis saatine gore sirali.\nGonderilmis komutlar Hedefler'de yesil kalir (silinmez).\nBekleyen komutlara cift tikla duzenleme.\nHedef listesi en erken varisa gore siralanir."
+  "version": "1.2.2",
+  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.2.2/TribalWarsBot-1.2.2.zip",
+  "changelog_tr": "Kuyruk rezervasyonu: ayni koyden farkli hedeflere komut; toplam stok asilamaz.\nGonderim oncesi stok kontrolu (ch token / yetersiz asker hatasi onlemi).\nDestek birlikleri stok duzeltmesi (yalnizca home birlikler).\nOrdu Gonder yesil etiket: kullanilabilir stok (rezerv dusulmus).\nVaris zamani varsayilan: son eklenen komut (Ordu Gonder + Misyoner ekle).\nMisyoner ekle penceresi: modal degil, bot/tarayicide gezinilebilir.\nHedefler: misyoner komutlari mor renk.\nGiris sonrasi cokme duzeltmesi.\nMisyoner bolme: tum gonderilebilir birlikler esit dagilir.\nPerformans: birlik scrape hafifletme, anlik stok dusumu."
 }
