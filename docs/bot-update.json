@@ -1,5 +1,5 @@
 {
-  "version": "1.2.2",
-  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.2.2/TribalWarsBot-1.2.2.zip",
-  "changelog_tr": "Kuyruk rezervasyonu: ayni koyden farkli hedeflere komut; toplam stok asilamaz.\nGonderim oncesi stok kontrolu (ch token / yetersiz asker hatasi onlemi).\nDestek birlikleri stok duzeltmesi (yalnizca home birlikler).\nOrdu Gonder yesil etiket: kullanilabilir stok (rezerv dusulmus).\nVaris zamani varsayilan: son eklenen komut (Ordu Gonder + Misyoner ekle).\nMisyoner ekle penceresi: modal degil, bot/tarayicide gezinilebilir.\nHedefler: misyoner komutlari mor renk.\nGiris sonrasi cokme duzeltmesi.\nMisyoner bolme: tum gonderilebilir birlikler esit dagilir.\nPerformans: birlik scrape hafifletme, anlik stok dusumu."
+  "version": "1.2.3",
+  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.2.3/TribalWarsBot-1.2.3.zip",
+  "changelog_tr": "Altın Para sekmesi: depo geri sayımı, bayrak+envanter indirim (çarpımsal), tek PP ile maksimum altın için tüccar dönüşümü.\nTüccar dönüşümü: PP/kaynak doğrulama (yanlış HTTP_200 hatası giderildi).\nOrdu gönderimi yaklaşırken Altın Para otomatik duraklatma.\nToplu yapıştır misyoner: 4 dalgada doğru snob dağıtımı, kuyruk stok rezervi, fake atlama.\nMisyoner ekle diyalogu: güncel köy stoğu ile bölme."
 }

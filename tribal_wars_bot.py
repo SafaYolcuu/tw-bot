@@ -101,7 +101,7 @@ from PyQt5.QtWebChannel import QWebChannel
 # ─────────────────────────────────────────────
 
 # EXE'nin guncel oldugunu dogrulamak icin her onemli degisiklikte artirin.
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 
 # Otomatik guncelleme — kullaniciya GitHub adresi gosterilmez; yalnizca bu URL okunur.
 UPDATE_MANIFEST_URL = "https://safayolcuu.github.io/tw-bot/bot-update.json"
@@ -3588,8 +3588,14 @@ class MisyonerMultiWaveDialog(QDialog):
             if not v:
                 QMessageBox.warning(self, "Uyarı", "Kaynak köy veri içinde bulunamadı.")
                 return
-            troops_avail = v.get("troops") or {}
-            troops_list = [bot._sa_troops_noble_split_wave(troops_avail, n, w) for w in range(n)]
+            troops_avail = bot._sa_bulk_source_troops(v)
+            snob_waves = min(n, bot._sa_troop_count(troops_avail, "snob"))
+            troops_list = [
+                bot._sa_troops_noble_split_wave(
+                    troops_avail, n, w, max_snob_waves=snob_waves
+                )
+                for w in range(n)
+            ]
         else:
             troops_list = [self._read_troops_from_row(r) for r in range(n)]
 
@@ -4625,6 +4631,14 @@ class TribalWarsBot(QMainWindow):
     # InnoGames "çok sık istek" uyarısı: JS poll aralığı (runJavaScript)
     TW_JS_POLL_MS = 520
 
+    # Altın para — taban maliyet (indirim % ile ölçeklenir)
+    GOLD_BASE_COST = {"wood": 28000, "stone": 30000, "iron": 25000}
+    GOLD_PP_PER_EXCHANGE = 10
+    GOLD_RES_KEYS = ("wood", "stone", "iron")
+    GOLD_RES_LABEL = {"wood": "Odun", "stone": "Kil", "iron": "Demir"}
+    # Ordu gönderimi yaklaşırken Altın Para duraklatma (ms) — precache 6sn + pay
+    GOLD_DISPATCH_BLOCK_MS = 9000
+
     def __init__(self):
         super().__init__()
         self._settings = QSettings(QSETTINGS_ORG, QSETTINGS_APP)
@@ -5010,6 +5024,7 @@ class TribalWarsBot(QMainWindow):
         self._build_task_queue_tab()
         self._build_map_tab()
         self._build_scavenge_tab()
+        self._build_altin_para_tab()
         self._build_recruit_train_tab()
         self._build_incomings_tab()
         self._build_buildings_overview_tab()
@@ -7360,6 +7375,7 @@ class TribalWarsBot(QMainWindow):
         arrive_dt_fixed=None,
         duplicate_dialog=True,
         msg_parent=None,
+        exclude_items=None,
     ):
         """Gönderim kuyruğuna tek satır ekler. (True, None) veya (False, hata_metni)."""
         troops_map = dict(troops_map)
@@ -7431,7 +7447,10 @@ class TribalWarsBot(QMainWindow):
         return_str = self._sa_format_time(return_dt, ms_zero=True)
 
         ok_stock, stock_msg = self._sa_validate_troops_within_village_stock(
-            troops_map, travel_src_x, travel_src_y
+            troops_map,
+            travel_src_x,
+            travel_src_y,
+            exclude_items=exclude_items,
         )
         if not ok_stock:
             return False, stock_msg
@@ -7962,7 +7981,7 @@ class TribalWarsBot(QMainWindow):
         """Misyoner dalgasında eşit bölünecek birimler (snob hariç — dalga başına 1)."""
         return [k for k, _ in self._sa_sendable_unit_defs() if k != "snob"]
 
-    def _sa_troops_noble_split_wave(self, village_troops, parts, wave_index):
+    def _sa_troops_noble_split_wave(self, village_troops, parts, wave_index, *, max_snob_waves=None):
         """Misyoner bölme: tüm gönderilebilir birlikler eşit parçalara; dalga başına 1 snob."""
         t = {k: 0 for k, _ in self.SA_UNIT_DEFS}
         vt = village_troops or {}
@@ -7972,8 +7991,24 @@ class TribalWarsBot(QMainWindow):
             tot = self._sa_troop_count(vt, k)
             t[k] = tot // parts + (1 if wi < (tot % parts) else 0)
         total_snob = self._sa_troop_count(vt, "snob")
-        t["snob"] = 1 if wi < total_snob and wi < parts else 0
+        if max_snob_waves is not None:
+            snob_cap = max(0, min(parts, int(max_snob_waves), total_snob))
+        else:
+            snob_cap = min(parts, total_snob)
+        t["snob"] = 1 if wi < snob_cap else 0
         return t
+
+    def _sa_bulk_source_troops(self, village):
+        """Toplu misyoner: köy stoğu (snob birleştirmeli) eksi kuyruk rezervi."""
+        if not village:
+            return {}
+        vid = village.get("id")
+        stock = self._sa_resolve_village_troops(vid) if vid is not None else {}
+        stock = self._sa_merge_troops_max_snob(stock, village.get("troops") or {})
+        reserved = {}
+        if vid is not None:
+            reserved = self._sa_pending_troops_by_village().get(vid, {})
+        return self._sa_subtract_troops_from_stock(dict(stock or {}), reserved)
 
     def _sa_bulk_import_text(self, raw, msg_parent=None):
         """Toplu forum/BB metnini kuyruğa ekler. msg_parent: QMessageBox için (ör. diyalog)."""
@@ -8063,11 +8098,7 @@ class TribalWarsBot(QMainWindow):
 
                 src_name = v.get("name", "?")
                 src_text = f"{src_name} ({r['sx']}|{r['sy']})"
-                troops_avail = (
-                    self._sa_available_troops_for_village_id(v.get("id"))
-                    if v.get("id") is not None
-                    else (v.get("troops") or {})
-                )
+                troops_avail = self._sa_bulk_source_troops(v)
 
                 ut = r["unit"]
                 if ut == "ram":
@@ -8139,12 +8170,23 @@ class TribalWarsBot(QMainWindow):
                         skipped.append(f"{src_text}: {err}")
                 elif ut == "snob":
                     gap_ms = int(getattr(self, "SA_DISPATCH_WAVE_GAP_MS", 200) or 200)
+                    snob_waves = min(
+                        noble_parts, self._sa_troop_count(troops_avail, "snob")
+                    )
+                    batch_items = []
                     for w in range(noble_parts):
                         troops_map = self._sa_troops_noble_split_wave(
-                            troops_avail, noble_parts, w
+                            troops_avail,
+                            noble_parts,
+                            w,
+                            max_snob_waves=snob_waves,
                         )
-                        totw = sum(int(troops_map.get(k, 0) or 0) for k, _ in self.SA_UNIT_DEFS)
-                        if totw <= 0:
+                        has_snob = int(troops_map.get("snob", 0) or 0) > 0
+                        escort_sum = sum(
+                            int(troops_map.get(k, 0) or 0)
+                            for k in self._sa_noble_split_unit_keys()
+                        )
+                        if not has_snob and escort_sum <= 0:
                             continue
                         wave_dt = dt + datetime.timedelta(milliseconds=w * gap_ms)
                         ok, err = self._sa_append_row_from_values(
@@ -8158,11 +8200,19 @@ class TribalWarsBot(QMainWindow):
                             "send",
                             wave_dt,
                             fake_dialog=False,
+                            check_fake_limit=False,
+                            arrive_dt_fixed=arrive_fixed,
                             duplicate_dialog=False,
                             msg_parent=parent,
+                            exclude_items=batch_items,
                         )
                         if ok:
                             added += 1
+                            last_item = self.sa_table.topLevelItem(
+                                self.sa_table.topLevelItemCount() - 1
+                            )
+                            if last_item is not None:
+                                batch_items.append(last_item)
                         else:
                             skipped.append(f"{src_text} snob parça {w + 1}: {err}")
                             break
@@ -16634,6 +16684,892 @@ class TribalWarsBot(QMainWindow):
             self.scav_status_label.setText(f"Durum: ~{idle_wait}sn sonra tekrar kontrol")
             self.scav_status_label.setStyleSheet("font-size: 10px; color: #aa6600;")
 
+    # ── ALTIN PARA SEKMESİ ─────────────────────
+
+    def _build_altin_para_tab(self):
+        tab = QWidget()
+        tab.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        row1 = QHBoxLayout()
+        row1.setSpacing(6)
+
+        self.gold_start_btn = QPushButton("▶ Başlat")
+        self.gold_start_btn.setObjectName("startBtn")
+        self.gold_start_btn.setCursor(Qt.PointingHandCursor)
+        self.gold_start_btn.clicked.connect(self._gold_start)
+        row1.addWidget(self.gold_start_btn)
+
+        self.gold_stop_btn = QPushButton("⏹ Durdur")
+        self.gold_stop_btn.setObjectName("stopBtn")
+        self.gold_stop_btn.setCursor(Qt.PointingHandCursor)
+        self.gold_stop_btn.setEnabled(False)
+        self.gold_stop_btn.clicked.connect(self._gold_stop)
+        row1.addWidget(self.gold_stop_btn)
+
+        row1.addSpacing(10)
+        row1.addWidget(QLabel("Köy:"))
+        self.gold_village_combo = QComboBox()
+        self.gold_village_combo.setMinimumWidth(220)
+        self.gold_village_combo.setStyleSheet(TW_VILLAGE_COMBO_STYLE)
+        self.gold_village_combo.addItem("— Köy Seçin —", None)
+        row1.addWidget(self.gold_village_combo)
+
+        row1.addSpacing(10)
+        row1.addWidget(QLabel("Bayrak %:"))
+        self.gold_discount_flag_spin = QSpinBox()
+        self.gold_discount_flag_spin.setRange(0, 99)
+        _legacy_disc = int(self._settings.value("gold/discount_pct", 0, type=int) or 0)
+        self.gold_discount_flag_spin.setValue(
+            int(self._settings.value("gold/discount_flag", _legacy_disc, type=int) or 0)
+        )
+        self.gold_discount_flag_spin.setToolTip("Bayrak altın para indirimi (taban üzerine)")
+        row1.addWidget(self.gold_discount_flag_spin)
+
+        row1.addWidget(QLabel("Envanter %:"))
+        self.gold_discount_inv_spin = QSpinBox()
+        self.gold_discount_inv_spin.setRange(0, 99)
+        self.gold_discount_inv_spin.setValue(
+            int(self._settings.value("gold/discount_inv", 0, type=int) or 0)
+        )
+        self.gold_discount_inv_spin.setToolTip("Envanter altın para indirimi (taban üzerine, çarpımsal)")
+        row1.addWidget(self.gold_discount_inv_spin)
+
+        row1.addWidget(QLabel("PP üst sınır:"))
+        self.gold_pp_cap_spin = QSpinBox()
+        self.gold_pp_cap_spin.setRange(0, 999999)
+        self.gold_pp_cap_spin.setValue(
+            int(self._settings.value("gold/pp_cap", 0, type=int) or 0)
+        )
+        self.gold_pp_cap_spin.setToolTip("0 = sınırsız (oturum harcaması)")
+        row1.addWidget(self.gold_pp_cap_spin)
+
+        row1.addStretch()
+        layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(6)
+        row2.addWidget(QLabel("Güvenlik payı:"))
+        self.gold_safety_spin = QSpinBox()
+        self.gold_safety_spin.setRange(0, 500000)
+        self.gold_safety_spin.setSingleStep(500)
+        self.gold_safety_spin.setValue(
+            int(self._settings.value("gold/safety_margin", 1000, type=int) or 1000)
+        )
+        row2.addWidget(self.gold_safety_spin)
+
+        row2.addWidget(QLabel("Başlangıç tamponu (sn):"))
+        self.gold_buf_start_spin = QSpinBox()
+        self.gold_buf_start_spin.setRange(0, 3600)
+        self.gold_buf_start_spin.setValue(
+            int(self._settings.value("gold/buffer_start", 45, type=int) or 45)
+        )
+        row2.addWidget(self.gold_buf_start_spin)
+
+        row2.addWidget(QLabel("Bitiş tamponu (sn):"))
+        self.gold_buf_end_spin = QSpinBox()
+        self.gold_buf_end_spin.setRange(0, 3600)
+        self.gold_buf_end_spin.setValue(
+            int(self._settings.value("gold/buffer_end", 90, type=int) or 90)
+        )
+        row2.addWidget(self.gold_buf_end_spin)
+
+        row2.addWidget(QLabel("Pencere oranı:"))
+        self.gold_window_frac_spin = QDoubleSpinBox()
+        self.gold_window_frac_spin.setRange(0.05, 0.95)
+        self.gold_window_frac_spin.setSingleStep(0.05)
+        self.gold_window_frac_spin.setDecimals(2)
+        self.gold_window_frac_spin.setValue(
+            float(self._settings.value("gold/window_fraction", 0.55, type=float) or 0.55)
+        )
+        self.gold_window_frac_spin.setToolTip(
+            "Depo dolmadan önceki pencerede dönüşüm zamanı (0.55 = ortaya yakın)"
+        )
+        row2.addWidget(self.gold_window_frac_spin)
+
+        row2.addStretch()
+        layout.addLayout(row2)
+
+        info_row = QHBoxLayout()
+        self.gold_status_label = QLabel("Durum: Bekliyor")
+        self.gold_status_label.setStyleSheet("font-size: 10px; color: #888;")
+        info_row.addWidget(self.gold_status_label, 1)
+        self.gold_pp_spent_label = QLabel("Harcanan PP: 0")
+        self.gold_pp_spent_label.setStyleSheet("font-size: 10px; color: #888;")
+        info_row.addWidget(self.gold_pp_spent_label)
+        layout.addLayout(info_row)
+
+        self.gold_res_label = QLabel("Kaynaklar: —")
+        self.gold_res_label.setStyleSheet("font-size: 10px;")
+        layout.addWidget(self.gold_res_label)
+
+        self.gold_timer_label = QLabel("Depo dolma: —")
+        self.gold_timer_label.setStyleSheet("font-size: 10px;")
+        layout.addWidget(self.gold_timer_label)
+
+        self.gold_decision_label = QLabel("Karar: —")
+        self.gold_decision_label.setStyleSheet("font-size: 10px; color: #2d5a9e;")
+        layout.addWidget(self.gold_decision_label)
+
+        self.gold_log = QTextEdit()
+        self.gold_log.setReadOnly(True)
+        self.gold_log.setMaximumHeight(160)
+        self.gold_log.setStyleSheet("font-size: 10px; font-family: Consolas, monospace;")
+        layout.addWidget(self.gold_log)
+
+        self.gold_tab = tab
+        self.tabs.addTab(tab, "🪙 Altın Para")
+
+        self._gold_timer = QTimer(self)
+        self._gold_timer.timeout.connect(self._gold_tick)
+        self._gold_timer.start(1000)
+        self._gold_active = False
+        self._gold_busy = False
+        self._gold_pp_spent = int(self._settings.value("gold/pp_spent_session", 0, type=int) or 0)
+        self._gold_next_action = 0.0
+        self._gold_scheduled_at = 0.0
+        self._gold_last_state = {}
+        self._gold_pending_exchange = None
+        self._gold_nav_wait_until = 0.0
+        self._gold_exchange_snapshot = None
+        self._gold_update_pp_label()
+
+    def _gold_save_settings(self):
+        self._settings.setValue("gold/discount_flag", int(self.gold_discount_flag_spin.value()))
+        self._settings.setValue("gold/discount_inv", int(self.gold_discount_inv_spin.value()))
+        self._settings.setValue("gold/pp_cap", int(self.gold_pp_cap_spin.value()))
+        self._settings.setValue("gold/safety_margin", int(self.gold_safety_spin.value()))
+        self._settings.setValue("gold/buffer_start", int(self.gold_buf_start_spin.value()))
+        self._settings.setValue("gold/buffer_end", int(self.gold_buf_end_spin.value()))
+        self._settings.setValue("gold/window_fraction", float(self.gold_window_frac_spin.value()))
+        self._settings.setValue("gold/pp_spent_session", int(self._gold_pp_spent))
+        self._settings.sync()
+
+    def _gold_update_pp_label(self):
+        cap = int(self.gold_pp_cap_spin.value()) if hasattr(self, "gold_pp_cap_spin") else 0
+        txt = f"Harcanan PP: {self._gold_pp_spent}"
+        if cap > 0:
+            txt += f" / {cap}"
+        self.gold_pp_spent_label.setText(txt)
+
+    def _gold_append_log(self, msg: str):
+        if not hasattr(self, "gold_log"):
+            return
+        from datetime import datetime
+        line = datetime.now().strftime("%H:%M:%S") + " — " + str(msg)
+        self.gold_log.append(line)
+        doc = self.gold_log.document()
+        if doc.blockCount() > 120:
+            cursor = self.gold_log.textCursor()
+            cursor.movePosition(cursor.Start)
+            cursor.select(cursor.LineUnderCursor)
+            cursor.removeSelectedText()
+            cursor.deleteChar()
+        self._add_log("ALTIN", "info", str(msg))
+
+    def _gold_start(self):
+        if not self.browser or self._login_state != "in_game":
+            QMessageBox.warning(self, "Altın Para", "Önce oyuna giriş yapın.")
+            return
+        vid = self.gold_village_combo.currentData()
+        if not vid:
+            QMessageBox.warning(self, "Altın Para", "Hedef köy seçin.")
+            return
+        self._gold_save_settings()
+        self._gold_active = True
+        self._gold_next_action = 0.0
+        self._gold_scheduled_at = 0.0
+        self._gold_pending_exchange = None
+        self._gold_nav_wait_until = 0.0
+        self.gold_start_btn.setEnabled(False)
+        self.gold_stop_btn.setEnabled(True)
+        self.gold_status_label.setText("Durum: Çalışıyor")
+        self.gold_status_label.setStyleSheet("font-size: 10px; color: #228822;")
+        self._gold_append_log(f"Başlatıldı — köy {vid}")
+
+    def _gold_stop(self):
+        self._gold_active = False
+        self._gold_busy = False
+        self._gold_pending_exchange = None
+        self.gold_start_btn.setEnabled(True)
+        self.gold_stop_btn.setEnabled(False)
+        self.gold_status_label.setText("Durum: Durduruldu")
+        self.gold_status_label.setStyleSheet("font-size: 10px; color: #888;")
+        self._gold_save_settings()
+        self._gold_append_log("Durduruldu")
+
+    def _gold_costs(self, flag_pct: int = 0, inv_pct: int = 0):
+        """Taban maliyet × (1-bayrak%) × (1-envanter%) — indirimler ayrı uygulanır."""
+        f1 = max(0.01, (100 - int(flag_pct)) / 100.0)
+        f2 = max(0.01, (100 - int(inv_pct)) / 100.0)
+        factor = f1 * f2
+        return {k: max(1, round(self.GOLD_BASE_COST[k] * factor)) for k in self.GOLD_RES_KEYS}
+
+    def _gold_costs_from_ui(self):
+        return self._gold_costs(
+            int(self.gold_discount_flag_spin.value()),
+            int(self.gold_discount_inv_spin.value()),
+        )
+
+    def _gold_max_coins(self, res, cost):
+        return min(res[k] // cost[k] for k in self.GOLD_RES_KEYS)
+
+    def _gold_coins_after_exchange(self, res, cost, sell_res: str, buy_res: str, amount: int) -> int:
+        amount = max(0, int(amount))
+        r = {k: int(res[k]) for k in self.GOLD_RES_KEYS}
+        r[sell_res] = max(0, r[sell_res] - amount)
+        r[buy_res] = r[buy_res] + amount
+        return self._gold_max_coins(r, cost)
+
+    def _gold_find_best_exchange(self, res, cost, safety_margin, storage_max):
+        """Tek 10 PP ile mint edilebilecek maksimum altın için en iyi dönüşümü bul."""
+        safety = max(0, int(safety_margin))
+        sm = max(1, int(storage_max or 0))
+        best = None
+
+        for sell_res in self.GOLD_RES_KEYS:
+            for buy_res in self.GOLD_RES_KEYS:
+                if sell_res == buy_res:
+                    continue
+                other = next(k for k in self.GOLD_RES_KEYS if k not in (sell_res, buy_res))
+                rs = int(res[sell_res])
+                rb = int(res[buy_res])
+                ro = int(res[other])
+                cs, cb, co = cost[sell_res], cost[buy_res], cost[other]
+                x_max = max(0, rs - safety)
+                if x_max < 1:
+                    continue
+
+                denom = cs + cb
+                if denom <= 0:
+                    continue
+                x_ideal = (rs * cb - rb * cs) / denom
+                if x_ideal < 1:
+                    continue
+
+                candidates = set()
+                candidates.add(min(int(x_ideal), x_max))
+                candidates.add(x_max)
+                n_other = ro // co if co > 0 else 0
+                if n_other > 0:
+                    x_need = n_other * cb - rb
+                    x_cap = rs - n_other * cs
+                    if x_need >= 1:
+                        candidates.add(min(int(x_need), x_max))
+                    if x_cap >= 1:
+                        candidates.add(min(int(x_cap), x_max))
+                overflow_x = max(0, rs - sm + safety)
+                if overflow_x >= 1:
+                    candidates.add(min(int(overflow_x), x_max))
+
+                for x in candidates:
+                    if x < 1 or x > x_max:
+                        continue
+                    n = self._gold_coins_after_exchange(res, cost, sell_res, buy_res, x)
+                    if n < 1:
+                        continue
+                    if best is None or n > best["coins"] or (n == best["coins"] and x > best["sell_amount"]):
+                        best = {
+                            "sell_res": sell_res,
+                            "buy_res": buy_res,
+                            "sell_amount": x,
+                            "coins": n,
+                        }
+        return best
+
+    def _gold_schedule_time(self, seconds_left, buffer_start, buffer_end, fraction):
+        import time
+        now = time.time()
+        if seconds_left is None:
+            return now + 25.0
+        window = float(seconds_left) - float(buffer_start) - float(buffer_end)
+        if window <= 0:
+            return now + 2.0
+        return now + float(buffer_start) + window * float(fraction)
+
+    def _gold_decide(self, res, cost, seconds_left, safety_margin, buffer_start, buffer_end, fraction):
+        coins = self._gold_max_coins(res, cost)
+        if coins >= 1:
+            return {
+                "action": "idle",
+                "reason": f"mint hazır ({coins} altın) — akademi basar, 0 PP",
+                "coins": coins,
+            }
+
+        storage_max = max(1, int(res.get("storage_max") or 0))
+        best = self._gold_find_best_exchange(res, cost, safety_margin, storage_max)
+        if not best:
+            return {
+                "action": "idle",
+                "reason": "uygun dönüşüm yok — bekleniyor",
+            }
+
+        sell_res = best["sell_res"]
+        buy_res = best["buy_res"]
+        sell_amount = int(best["sell_amount"])
+        planned_coins = int(best["coins"])
+
+        scheduled_at = self._gold_schedule_time(
+            seconds_left, buffer_start, buffer_end, fraction
+        )
+        reason = (
+            f"{self.GOLD_RES_LABEL[sell_res]}→{self.GOLD_RES_LABEL[buy_res]} "
+            f"{sell_amount:,} (10 PP) → ~{planned_coins} altın".replace(",", ".")
+        )
+        if seconds_left is not None:
+            reason += f" — depo ~{int(seconds_left)}sn"
+
+        return {
+            "action": "exchange",
+            "sell_res": sell_res,
+            "buy_res": buy_res,
+            "sell_amount": sell_amount,
+            "planned_coins": planned_coins,
+            "scheduled_at": scheduled_at,
+            "reason": reason,
+            "pp_needed": self.GOLD_PP_PER_EXCHANGE,
+        }
+
+    def _gold_can_spend_pp(self, state_pp: int) -> bool:
+        if state_pp < self.GOLD_PP_PER_EXCHANGE:
+            return False
+        cap = int(self.gold_pp_cap_spin.value())
+        if cap > 0 and self._gold_pp_spent + self.GOLD_PP_PER_EXCHANGE > cap:
+            return False
+        return True
+
+    def _gold_army_dispatch_blocks(self):
+        """Ordu Gönder kuyruğu aktifken Altın Para işlemlerini duraklat."""
+        if not getattr(self, "enable_sending_cb", None) or not self.enable_sending_cb.isChecked():
+            return False, ""
+        if not self._server_time_synced or not self._server_time_text:
+            return False, ""
+        if not hasattr(self, "sa_table"):
+            return False, ""
+
+        active_states = frozenset(
+            {"caching", "cached", "confirming", "confirmed", "sending"}
+        )
+        offset_ms = self.sa_offset_input.value() if hasattr(self, "sa_offset_input") else 0
+        block_ms = int(self.GOLD_DISPATCH_BLOCK_MS)
+
+        for i in range(self.sa_table.topLevelItemCount()):
+            item = self.sa_table.topLevelItem(i)
+            if not item:
+                continue
+            state = item.data(0, Qt.UserRole)
+            if state in active_states:
+                src = (item.text(0) or "—")[:40]
+                return True, f"ordu gönderimi devam ediyor ({state}) — {src}"
+
+        for i in range(self.sa_table.topLevelItemCount()):
+            item = self.sa_table.topLevelItem(i)
+            if not item:
+                continue
+            if not self._dispatch_is_batch_leader(i):
+                continue
+
+            state = item.data(0, Qt.UserRole)
+            if state in ("sent", "error"):
+                continue
+
+            send_str = item.text(15)
+            if not send_str or send_str == "—":
+                continue
+
+            send_dt = self._dispatch_parse_time_str(send_str)
+            if send_dt is None:
+                continue
+
+            adjusted_send_dt = send_dt + datetime.timedelta(milliseconds=offset_ms)
+            diff_ms = self._dispatch_diff_until_send_ms(adjusted_send_dt)
+            if diff_ms is None:
+                continue
+
+            src = (item.text(0) or "—")[:40]
+            if 0 < diff_ms <= block_ms:
+                rem = max(1, int(diff_ms / 1000))
+                return True, f"ordu gönderimi ~{rem}sn sonra — {src}"
+            if diff_ms <= 0:
+                return True, f"ordu gönderim zamanı — {src}"
+
+        return False, ""
+
+    def _gold_tick(self):
+        import time
+        on_tab = self.tabs.currentWidget() is getattr(self, "gold_tab", None)
+        if not self._gold_active:
+            return
+        if self._human_verification_required:
+            self.gold_status_label.setText("Durum: Doğrulama bekleniyor")
+            self.gold_status_label.setStyleSheet("font-size: 10px; color: #cc4444;")
+            return
+        blocked, block_reason = self._gold_army_dispatch_blocks()
+        if blocked:
+            self.gold_status_label.setText(f"Durum: Duraklatıldı — {block_reason}")
+            self.gold_status_label.setStyleSheet("font-size: 10px; color: #aa6600;")
+            return
+        if self._gold_busy:
+            return
+        if not self.browser:
+            return
+        now = time.time()
+        if self._gold_nav_wait_until > now:
+            rem = int(self._gold_nav_wait_until - now)
+            self.gold_status_label.setText(f"Durum: Sayfa yükleniyor ~{rem}sn")
+            return
+        if self._gold_pending_exchange:
+            if now >= self._gold_scheduled_at:
+                self._gold_execute_exchange()
+            else:
+                rem = int(self._gold_scheduled_at - now)
+                self.gold_status_label.setText(f"Durum: Dönüşüm ~{rem}sn sonra")
+            return
+        if now < self._gold_next_action:
+            if on_tab:
+                rem = int(self._gold_next_action - now)
+                self.gold_status_label.setText(f"Durum: Sonraki kontrol ~{rem}sn")
+            return
+        self._gold_step()
+
+    def _gold_target_village_id(self):
+        vid = self.gold_village_combo.currentData()
+        if vid:
+            return int(vid)
+        v = (self._game_data.get("village") or {}).get("id")
+        return int(v) if v else 0
+
+    def _gold_step(self):
+        import time
+        self._gold_busy = True
+        target_vid = self._gold_target_village_id()
+        if not target_vid:
+            self._gold_busy = False
+            self._gold_next_action = time.time() + 10
+            self.gold_status_label.setText("Durum: Köy seçilmedi")
+            return
+
+        nav_js = f"""
+        (function() {{
+            var vid = {int(target_vid)};
+            try {{
+                var u = new URL(window.location.href);
+                var cur = parseInt(u.searchParams.get('village') || '0', 10);
+                var screen = u.searchParams.get('screen') || '';
+                if (cur === vid && screen === 'overview') return 'OK';
+                u.searchParams.set('village', String(vid));
+                u.searchParams.set('screen', 'overview');
+                window.location.href = u.toString();
+                return 'NAV';
+            }} catch (e) {{
+                window.location.href = window.location.origin +
+                    '/game.php?village=' + vid + '&screen=overview';
+                return 'NAV';
+            }}
+        }})();
+        """
+
+        def on_nav(result):
+            res_str = str(result or "").strip()
+            if res_str == "NAV":
+                self._gold_nav_wait_until = time.time() + 2.8
+                self._gold_busy = False
+                self._gold_next_action = time.time() + 1
+                return
+            self._gold_read_state(target_vid)
+
+        self.browser.page().runJavaScript(nav_js, on_nav)
+
+    def _gold_read_state(self, target_vid: int):
+        read_js = """
+        (function() {
+            if (typeof game_data === 'undefined' || !game_data.village) {
+                return JSON.stringify({status:'ERROR', message:'game_data yok'});
+            }
+            var v = game_data.village;
+            var serverNow = (typeof Timing !== 'undefined' && Timing.getCurrentServerTime)
+                ? Timing.getCurrentServerTime()
+                : Math.floor(Date.now() / 1000);
+            var secLeft = null;
+            var endTime = null;
+            var timerEl = document.querySelector('.visual-label-storage .timer[data-endtime]');
+            if (timerEl) {
+                endTime = parseInt(timerEl.getAttribute('data-endtime'), 10);
+                if (!isNaN(endTime)) secLeft = Math.max(0, endTime - serverNow);
+            }
+            var screen = game_data.screen ||
+                (new URLSearchParams(location.search).get('screen') || '');
+            var urlVid = parseInt(new URLSearchParams(location.search).get('village') || '0', 10);
+            return JSON.stringify({
+                status: 'OK',
+                villageId: parseInt(v.id, 10) || 0,
+                urlVillageId: urlVid,
+                screen: screen,
+                wood: Math.floor(Number(v.wood) || 0),
+                stone: Math.floor(Number(v.stone) || 0),
+                iron: Math.floor(Number(v.iron) || 0),
+                storageMax: Math.floor(Number(v.storage_max) || 0),
+                pp: Math.floor(Number(game_data.player && game_data.player.pp) || 0),
+                secondsLeft: secLeft,
+                storageEndTime: endTime,
+                serverNow: serverNow
+            });
+        })();
+        """
+
+        def on_read(result):
+            import time
+            self._gold_busy = False
+            self._gold_next_action = time.time() + 8
+            raw = str(result or "").strip()
+            try:
+                data = json.loads(raw) if raw.startswith("{") else {}
+            except Exception:
+                data = {}
+            if data.get("status") != "OK":
+                self.gold_status_label.setText("Durum: Veri okunamadı")
+                return
+
+            if int(data.get("urlVillageId") or 0) != int(target_vid):
+                self._gold_nav_wait_until = time.time() + 2.0
+                self._gold_next_action = time.time() + 1
+                return
+
+            self._gold_last_state = data
+            res = {
+                "wood": int(data.get("wood") or 0),
+                "stone": int(data.get("stone") or 0),
+                "iron": int(data.get("iron") or 0),
+                "storage_max": int(data.get("storageMax") or 0),
+            }
+            cost = self._gold_costs_from_ui()
+            flag_p = int(self.gold_discount_flag_spin.value())
+            inv_p = int(self.gold_discount_inv_spin.value())
+            safety = int(self.gold_safety_spin.value())
+            buf_start = int(self.gold_buf_start_spin.value())
+            buf_end = int(self.gold_buf_end_spin.value())
+            frac = float(self.gold_window_frac_spin.value())
+            sec_left = data.get("secondsLeft")
+
+            self.gold_res_label.setText(
+                f"Kaynaklar: O {res['wood']:,} | K {res['stone']:,} | D {res['iron']:,} "
+                f"/ {res['storage_max']:,} | Maliyet: {cost['wood']}/{cost['stone']}/{cost['iron']} "
+                f"(bayrak %{flag_p} + env %{inv_p})"
+                .replace(",", ".")
+            )
+            if sec_left is not None:
+                mins, secs = divmod(int(sec_left), 60)
+                hrs, mins = divmod(mins, 60)
+                self.gold_timer_label.setText(
+                    f"Depo dolma: {hrs:02d}:{mins:02d}:{secs:02d}"
+                )
+            else:
+                self.gold_timer_label.setText(
+                    "Depo dolma: — (genel bakış ekranında timer gerekli)"
+                )
+
+            decision = self._gold_decide(
+                res, cost, sec_left, safety, buf_start, buf_end, frac
+            )
+            self.gold_decision_label.setText("Karar: " + decision.get("reason", "—"))
+
+            action = decision.get("action")
+            if action == "idle":
+                self.gold_status_label.setText("Durum: Beklemede (0 PP)")
+                self.gold_status_label.setStyleSheet("font-size: 10px; color: #228822;")
+                return
+
+            if action == "exchange":
+                if not self._gold_can_spend_pp(int(data.get("pp") or 0)):
+                    self.gold_status_label.setText("Durum: PP yetersiz / üst sınır")
+                    self.gold_status_label.setStyleSheet("font-size: 10px; color: #cc4444;")
+                    return
+                self._gold_pending_exchange = {
+                    "sell_res": decision["sell_res"],
+                    "buy_res": decision["buy_res"],
+                    "sell_amount": int(decision["sell_amount"]),
+                    "village_id": int(target_vid),
+                }
+                self._gold_scheduled_at = float(decision.get("scheduled_at") or time.time())
+                self._gold_append_log(decision.get("reason", "dönüşüm planlandı"))
+                rem = max(0, int(self._gold_scheduled_at - time.time()))
+                self.gold_status_label.setText(f"Durum: Dönüşüm planlandı ~{rem}sn")
+
+        self.browser.page().runJavaScript(read_js, on_read)
+
+    def _gold_read_resources_js(self) -> str:
+        """Aktif köy kaynakları + PP (game_data ve DOM)."""
+        return """
+        (function() {
+            function num(v) {
+                v = Math.floor(Number(v) || 0);
+                return isNaN(v) ? 0 : v;
+            }
+            function domRes(id) {
+                var el = document.getElementById(id);
+                if (!el) return null;
+                var t = (el.textContent || '').replace(/\\./g, '').replace(/,/g, '').trim();
+                var n = parseInt(t, 10);
+                return isNaN(n) ? null : n;
+            }
+            var out = { wood: 0, stone: 0, iron: 0, pp: 0 };
+            if (typeof game_data !== 'undefined' && game_data.village) {
+                var v = game_data.village;
+                out.wood = num(v.wood);
+                out.stone = num(v.stone);
+                out.iron = num(v.iron);
+            }
+            var dw = domRes('wood');
+            var ds = domRes('stone');
+            var di = domRes('iron');
+            if (dw != null) out.wood = dw;
+            if (ds != null) out.stone = ds;
+            if (di != null) out.iron = di;
+            if (typeof game_data !== 'undefined' && game_data.player) {
+                out.pp = num(game_data.player.pp);
+            }
+            var ppEl = document.getElementById('premium_points');
+            if (ppEl) {
+                var pt = (ppEl.textContent || '').replace(/\\./g, '').replace(/,/g, '').trim();
+                var pn = parseInt(pt, 10);
+                if (!isNaN(pn)) out.pp = pn;
+            }
+            return JSON.stringify(out);
+        })();
+        """
+
+    def _gold_exchange_verified(self, before: dict, after: dict, sell_res: str, buy_res: str, amount: int) -> bool:
+        """PP ve kaynak farkı ile gerçek başarıyı doğrula."""
+        if not before or not after:
+            return False
+        pp_drop = int(before.get("pp") or 0) - int(after.get("pp") or 0)
+        sell_drop = int(before.get(sell_res) or 0) - int(after.get(sell_res) or 0)
+        buy_gain = int(after.get(buy_res) or 0) - int(before.get(buy_res) or 0)
+        min_amt = max(1, int(amount * 0.92))
+        if pp_drop < self.GOLD_PP_PER_EXCHANGE or sell_drop < min_amt:
+            return False
+        if buy_gain >= min_amt:
+            return True
+        # Alınan kaynak üst barda gecikmeli güncellenebilir; PP + satış düştüyse yeterli
+        return sell_drop >= max(min_amt, int(amount * 0.98))
+
+    def _gold_on_exchange_success(self, ex: dict):
+        import time
+        self._gold_pp_spent += self.GOLD_PP_PER_EXCHANGE
+        self._gold_update_pp_label()
+        self._gold_save_settings()
+        msg = (
+            f"Tüccar OK: {ex['sell_res']}→{ex['buy_res']} "
+            f"{ex['sell_amount']} (+{self.GOLD_PP_PER_EXCHANGE} PP)"
+        )
+        self._gold_append_log(msg)
+        self.gold_status_label.setText("Durum: Dönüşüm tamam — yeniden planlanıyor")
+        self.gold_status_label.setStyleSheet("font-size: 10px; color: #228822;")
+        self._gold_next_action = time.time() + 15
+
+    def _gold_on_exchange_failure(self, err: str, cooldown_sec: int = 25):
+        import time
+        self._gold_append_log(f"Tüccar hata: {err}")
+        self.gold_status_label.setText(f"Durum: Hata — {err[:60]}")
+        self.gold_status_label.setStyleSheet("font-size: 10px; color: #cc4444;")
+        self._gold_next_action = time.time() + cooldown_sec
+
+    def _gold_finish_exchange(self, cmd_id: str):
+        self._gold_busy = False
+        self._gold_pending_exchange = None
+        self._gold_exchange_snapshot = None
+        if self.browser:
+            self.browser.page().runJavaScript(
+                f"delete window.__tw_bot_results[{json.dumps(cmd_id)}];"
+            )
+
+    def _gold_execute_exchange(self):
+        import uuid
+        if not self._gold_pending_exchange or not self.browser:
+            self._gold_pending_exchange = None
+            return
+        ex = self._gold_pending_exchange
+        cmd_id = "gold_" + uuid.uuid4().hex[:12]
+        self._gold_busy = True
+        vid = int(ex["village_id"])
+        sell_res = str(ex["sell_res"])
+        buy_res = str(ex["buy_res"])
+        amount = int(ex["sell_amount"])
+
+        snap_js = self._gold_read_resources_js()
+
+        def on_snapshot(snap_raw):
+            try:
+                snap = json.loads(str(snap_raw or "{}"))
+            except Exception:
+                snap = {}
+            self._gold_exchange_snapshot = snap
+            ex["_snapshot"] = snap
+
+            js = f"""
+            (function() {{
+                var cmdId = {json.dumps(cmd_id)};
+                var vid = {vid};
+                var resSell = {json.dumps(sell_res)};
+                var resBuy = {json.dumps(buy_res)};
+                var amount = {amount};
+                if (!window.__tw_bot_results) window.__tw_bot_results = {{}};
+                if (window.__tw_bot_results[cmdId]) return;
+                window.__tw_bot_results[cmdId] = 'SENDING';
+
+                function parseJsonResponse(data) {{
+                    if (!data || typeof data !== 'object') return false;
+                    if (data.error || data.errors) return false;
+                    if (data.success === true || data.success === 1) return true;
+                    if (data.response === 'success' || data.result === 'success') return true;
+                    if (data.village && (data.village.wood != null || data.village.stone != null)) {{
+                        return true;
+                    }}
+                    return false;
+                }}
+
+                function htmlShowsExchangeError(text) {{
+                    var low = (text || '').toLowerCase();
+                    var needles = [
+                        'yeterli premium', 'not enough premium', 'nicht genug premium',
+                        'yeterli odun', 'yeterli ta', 'yeterli demir',
+                        'not enough wood', 'not enough stone', 'not enough iron',
+                        'nicht genug holz', 'nicht genug lehm', 'nicht genug eisen'
+                    ];
+                    for (var i = 0; i < needles.length; i++) {{
+                        if (low.indexOf(needles[i]) >= 0) return needles[i];
+                    }}
+                    return '';
+                }}
+
+                var csrf = (typeof csrf_token !== 'undefined' && csrf_token) ? csrf_token :
+                    ((typeof game_data !== 'undefined' && game_data.csrf) ? game_data.csrf : '');
+                if (!csrf) {{
+                    window.__tw_bot_results[cmdId] = 'ERROR|CSRF yok';
+                    return;
+                }}
+
+                var url = '/game.php?village=' + vid +
+                    '&screen=market&mode=other_offer&action=merchantexchange';
+                var body = 'res_buy=' + encodeURIComponent(resBuy) +
+                    '&res_sell=' + encodeURIComponent(resSell) +
+                    '&sell=' + encodeURIComponent(String(amount)) +
+                    '&h=' + encodeURIComponent(csrf);
+
+                fetch(url, {{
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: {{
+                        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+                    }},
+                    body: body
+                }}).then(function(r) {{
+                    return r.text().then(function(text) {{
+                        if (!r.ok) {{
+                            window.__tw_bot_results[cmdId] = 'ERROR|HTTP_' + r.status;
+                            return;
+                        }}
+                        var data = null;
+                        try {{ data = JSON.parse(text); }} catch (e) {{ data = null; }}
+                        if (parseJsonResponse(data)) {{
+                            window.__tw_bot_results[cmdId] = 'OK';
+                            return;
+                        }}
+                        var htmlErr = htmlShowsExchangeError(text);
+                        if (htmlErr) {{
+                            window.__tw_bot_results[cmdId] = 'ERROR|' + htmlErr;
+                            return;
+                        }}
+                        // HTML 200: kaynak/PP farkı ile doğrula (false negative önleme)
+                        window.__tw_bot_results[cmdId] = 'VERIFY';
+                    }});
+                }}).catch(function(e) {{
+                    window.__tw_bot_results[cmdId] = 'ERROR|' + String(e);
+                }});
+            }})();
+            """
+            self.browser.page().runJavaScript(js)
+            QTimer.singleShot(
+                self.TW_JS_POLL_MS, lambda: self._gold_poll_exchange(cmd_id, 0, ex)
+            )
+
+        self.browser.page().runJavaScript(snap_js, on_snapshot)
+
+    def _gold_verify_exchange(self, cmd_id: str, ex: dict, attempt: int):
+        if attempt >= 12:
+            self._gold_finish_exchange(cmd_id)
+            self._gold_on_exchange_failure("doğrulama zaman aşımı")
+            return
+
+        verify_js = self._gold_read_resources_js()
+
+        def on_after(after_raw):
+            import time
+            try:
+                after = json.loads(str(after_raw or "{}"))
+            except Exception:
+                after = {}
+            before = ex.get("_snapshot") or self._gold_exchange_snapshot or {}
+            sell_res = str(ex["sell_res"])
+            buy_res = str(ex["buy_res"])
+            amount = int(ex["sell_amount"])
+            if self._gold_exchange_verified(before, after, sell_res, buy_res, amount):
+                self._gold_finish_exchange(cmd_id)
+                self._gold_on_exchange_success(ex)
+                return
+            if attempt + 1 >= 12:
+                self._gold_finish_exchange(cmd_id)
+                self._gold_on_exchange_failure("kaynak/PP değişmedi")
+                return
+            QTimer.singleShot(
+                700,
+                lambda: self._gold_verify_exchange(cmd_id, ex, attempt + 1),
+            )
+
+        self.browser.page().runJavaScript(verify_js, on_after)
+
+    def _gold_poll_exchange(self, cmd_id: str, attempt: int, ex: dict):
+        if attempt >= 50:
+            self._gold_finish_exchange(cmd_id)
+            self.gold_status_label.setText("Durum: Dönüşüm zaman aşımı")
+            self._gold_append_log("Tüccar dönüşümü zaman aşımı")
+            return
+
+        check_js = (
+            f"(function(){{ var x = window.__tw_bot_results && "
+            f"window.__tw_bot_results[{json.dumps(cmd_id)}]; "
+            f"return x === undefined || x === null ? 'WAITING' : x; }})();"
+        )
+
+        def on_poll(result):
+            res_str = str(result or "").strip()
+            if res_str in ("WAITING", "SENDING", ""):
+                QTimer.singleShot(
+                    self.TW_JS_POLL_MS,
+                    lambda: self._gold_poll_exchange(cmd_id, attempt + 1, ex),
+                )
+                return
+
+            if res_str == "VERIFY":
+                QTimer.singleShot(
+                    600, lambda: self._gold_verify_exchange(cmd_id, ex, 0)
+                )
+                return
+
+            if res_str == "OK":
+                self._gold_finish_exchange(cmd_id)
+                self._gold_on_exchange_success(ex)
+                return
+
+            err = res_str.split("|", 1)[-1] if "|" in res_str else res_str
+            self._gold_finish_exchange(cmd_id)
+            self._gold_on_exchange_failure(err)
+
+        self.browser.page().runJavaScript(check_js, on_poll)
+
     # ── ASKER TOPLAMA (screen=train) ──────────────────────────
 
     RT_UNIT_SHORT = {
@@ -22088,6 +23024,32 @@ class TribalWarsBot(QMainWindow):
             new_bq_vid = self.bq_village_combo.currentData()
             if hasattr(self, "_bq_switch_village_queue"):
                 self._bq_switch_village_queue(new_bq_vid)
+
+        # Altın Para sekmesi köy seçicisi
+        if hasattr(self, "gold_village_combo"):
+            prev_gold_vid = self.gold_village_combo.currentData()
+            self.gold_village_combo.blockSignals(True)
+            self.gold_village_combo.clear()
+            self.gold_village_combo.addItem("— Köy Seçin —", None)
+            if not all_villages:
+                v = data.get("village", {})
+                if v:
+                    coord = v.get("coord", f"{v.get('x', '?')}|{v.get('y', '?')}")
+                    self.gold_village_combo.addItem(
+                        f"{v.get('name', '?')} ({coord})", v.get("id", 0)
+                    )
+            else:
+                gold_idx = 0
+                for i, v in enumerate(ordered_villages):
+                    coord = f"({v.get('x', '?')}|{v.get('y', '?')})"
+                    label = f"{v.get('name', '?')} {coord}"
+                    self.gold_village_combo.addItem(label, v.get("id", 0))
+                    if prev_gold_vid and v.get("id") == prev_gold_vid:
+                        gold_idx = i + 1
+                    elif not prev_gold_vid and (v.get("id") == current_id or v.get("selected")):
+                        gold_idx = i + 1
+                self.gold_village_combo.setCurrentIndex(gold_idx)
+            self.gold_village_combo.blockSignals(False)
 
         # Asker toplama sekmesi: köy tablosunu güncelle
         if hasattr(self, 'rt_table'):
