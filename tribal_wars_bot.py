@@ -8,23 +8,58 @@ Gereksinimler:
 
 import os
 import sys
+import traceback
+from pathlib import Path
 
 
-def _tw_add_pyqt_dll_paths():
-    """Windows: Qt DLL'leri bulunamadiginda ImportError azaltir (os.add_dll_directory)."""
+def _tw_app_base_dir() -> Path:
+    try:
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable).resolve().parent
+        return Path(__file__).resolve().parent
+    except Exception:
+        return Path.cwd()
+
+
+def _tw_boot_log(msg: str) -> None:
+    """Konsolsuz EXE'de sessiz kapanmayı izlemek için."""
+    try:
+        p = _tw_app_base_dir() / "boot.log"
+        from datetime import datetime
+
+        line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {msg}\n"
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+    except Exception:
+        pass
+
+
+def _tw_native_msg(title: str, text: str) -> None:
+    """Qt yüklenemeden önce Windows mesaj kutusu."""
     if sys.platform != "win32":
         return
     try:
-        import os
-        from pathlib import Path
+        import ctypes
 
+        ctypes.windll.user32.MessageBoxW(0, str(text)[:1500], str(title)[:120], 0x10)
+    except Exception:
+        pass
+
+
+def _tw_add_pyqt_dll_paths():
+    """Windows: Qt DLL + frozen WebEngine yollari (import oncesi)."""
+    if sys.platform != "win32":
+        return
+    try:
         candidates = []
+        frozen_base = None
         if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-            base = Path(sys._MEIPASS)
+            frozen_base = Path(sys._MEIPASS)
             candidates.extend(
                 [
-                    base / "PyQt5" / "Qt5" / "bin",
-                    base / "PyQtWebEngine" / "Qt5" / "bin",
+                    frozen_base / "PyQt5" / "Qt5" / "bin",
+                    frozen_base / "PyQtWebEngine" / "Qt5" / "bin",
                 ]
             )
         else:
@@ -57,51 +92,107 @@ def _tw_add_pyqt_dll_paths():
                 pass
         if seen:
             os.environ["PATH"] = os.pathsep.join(seen) + os.pathsep + os.environ.get("PATH", "")
-    except Exception:
-        pass
+
+        if frozen_base is not None:
+            qt5 = frozen_base / "PyQt5" / "Qt5"
+            proc = qt5 / "bin" / "QtWebEngineProcess.exe"
+            if proc.is_file():
+                os.environ.setdefault("QTWEBENGINEPROCESS_PATH", str(proc))
+            res = qt5 / "resources"
+            if res.is_dir():
+                os.environ.setdefault("QTWEBENGINE_RESOURCES_PATH", str(res))
+            loc = qt5 / "translations" / "qtwebengine_locales"
+            if loc.is_dir():
+                os.environ.setdefault("QTWEBENGINE_LOCALES_PATH", str(loc))
+            # Dagitim build: GPU/WebGL/sandbox — bazi PC'lerde navigate aninda sessiz cokme
+            if not os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS"):
+                os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
+                    "--disable-gpu --disable-gpu-compositing --no-sandbox "
+                    "--disable-software-rasterizer --disable-webgl --disable-3d-apis "
+                    "--disable-features=VizDisplayCompositor,WebRtcHideLocalIpsWithMdns "
+                    "--disable-dev-shm-usage --in-process-gpu"
+                )
+            os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+    except Exception as ex:
+        _tw_boot_log(f"dll_paths_warn: {ex}")
 
 
+_tw_boot_log(f"boot start frozen={getattr(sys, 'frozen', False)} exe={sys.executable}")
 _tw_add_pyqt_dll_paths()
 
-import re
-import json
-import math
-import random
-import ssl
-import time
-import datetime
-import shutil
-import subprocess
-import zipfile
-import urllib.error
-import urllib.request
-import threading
-from dataclasses import dataclass, field
-from pathlib import Path
-from urllib.parse import urlparse, parse_qs, quote, urlencode
+try:
+    import re
+    import json
+    import math
+    import random
+    import ssl
+    import time
+    import datetime
+    import shutil
+    import subprocess
+    import zipfile
+    import urllib.error
+    import urllib.request
+    import threading
+    from dataclasses import dataclass, field
+    from urllib.parse import urlparse, parse_qs, quote, urlencode
 
-from PyQt5.QtCore import Qt, QUrl, QTimer, QTime, QDate, QSize, pyqtSignal, QObject, QSettings, pyqtSlot
-from PyQt5.QtGui import QFont, QColor, QBrush, QPainter, QPen, QPixmap, QIcon, QPalette
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QTabWidget, QLabel, QPushButton, QLineEdit, QComboBox, QCheckBox,
-    QSpinBox, QTreeWidget, QTreeWidgetItem, QTextEdit, QSplitter,
-    QListWidget, QListWidgetItem,
-    QFrame, QGroupBox, QGridLayout, QHeaderView, QStatusBar, QScrollArea,
-    QSizePolicy, QFormLayout, QMessageBox, QTableWidget, QTableWidgetItem,
-    QTimeEdit, QDateEdit, QAbstractItemView, QDoubleSpinBox, QSlider,
-    QDialog, QDialogButtonBox, QRadioButton, QButtonGroup, QInputDialog,
-    QMenuBar, QAction, QProgressDialog,
+    from PyQt5.QtCore import Qt, QUrl, QTimer, QTime, QDate, QSize, pyqtSignal, QObject, QSettings, pyqtSlot
+    from PyQt5.QtGui import QFont, QColor, QBrush, QPainter, QPen, QPixmap, QIcon, QPalette
+    from PyQt5.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+        QTabWidget, QLabel, QPushButton, QLineEdit, QComboBox, QCheckBox,
+        QSpinBox, QTreeWidget, QTreeWidgetItem, QTextEdit, QSplitter,
+        QListWidget, QListWidgetItem,
+        QFrame, QGroupBox, QGridLayout, QHeaderView, QStatusBar, QScrollArea,
+        QSizePolicy, QFormLayout, QMessageBox, QTableWidget, QTableWidgetItem,
+        QTimeEdit, QDateEdit, QAbstractItemView, QDoubleSpinBox, QSlider,
+        QDialog, QDialogButtonBox, QRadioButton, QButtonGroup, QInputDialog,
+        QMenuBar, QAction, QProgressDialog,
+    )
+    from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage, QWebEngineProfile, QWebEngineSettings
+    from PyQt5.QtWebChannel import QWebChannel
+except Exception as _tw_imp_ex:
+    _err = traceback.format_exc()
+    _tw_boot_log(f"IMPORT FAIL:\n{_err}")
+    try:
+        (_tw_app_base_dir() / "crash.log").write_text(_err, encoding="utf-8")
+    except Exception:
+        pass
+    _tw_native_msg(
+        "Tribal Wars Bot — baslatilamadi",
+        "Qt / DLL yuklenemedi.\n\n"
+        "1) ZIP'i klasore TAM cikartin (_internal gerekli)\n"
+        "2) ZIP icinden / Temp'ten calistirmayin\n"
+        "3) VC++ x64 kurun: aka.ms/vs/17/release/vc_redist.x64.exe\n"
+        "4) baslat.bat ile acin; boot.log / crash.log gonderin\n\n"
+        f"{_tw_imp_ex}",
+    )
+    sys.exit(1)
+
+_tw_boot_log("imports ok")
+
+_tw_dir = Path(__file__).resolve().parent
+if str(_tw_dir) not in sys.path:
+    sys.path.insert(0, str(_tw_dir))
+from license_client import (  # noqa: E402
+    LicenseState,
+    DEFAULT_LICENSE_API_BASE,
+    HEARTBEAT_INTERVAL_SECONDS,
+    VALIDATE_INTERVAL_HOURS,
+    activate_license,
+    deactivate_this_device,
+    get_machine_id,
+    send_heartbeat,
+    validate_license,
 )
-from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage, QWebEngineProfile, QWebEngineSettings
-from PyQt5.QtWebChannel import QWebChannel
 
 # ─────────────────────────────────────────────
 #  SABİTLER
 # ─────────────────────────────────────────────
 
 # EXE'nin guncel oldugunu dogrulamak icin her onemli degisiklikte artirin.
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.4.3"
 
 # Otomatik guncelleme — kullaniciya GitHub adresi gosterilmez; yalnizca bu URL okunur.
 UPDATE_MANIFEST_URL = "https://safayolcuu.github.io/tw-bot/bot-update.json"
@@ -922,25 +1013,59 @@ class StealthBrowser(QWebEngineView):
 
         # Anti-detection JS enjeksiyonu
         self.stealth_page.loadFinished.connect(self._inject_stealth_js)
+        try:
+            self.stealth_page.renderProcessTerminated.connect(self._on_render_process_terminated)
+        except Exception:
+            pass
 
     def _configure_profile(self):
         """Profili normal bir tarayıcı gibi yapılandır."""
+        # Qt 5.15.x WebEngine ≈ Chromium 83 — UA'yı gerçek motorla hizala
+        # (Chrome/120 spoof hCaptcha'da sürekli yeniden doğrulama tetikler).
         ua = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
+            "Chrome/83.0.4103.122 Safari/537.36"
         )
         self.profile.setHttpUserAgent(ua)
         self.profile.setHttpAcceptLanguage("tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7")
         self.profile.setPersistentCookiesPolicy(QWebEngineProfile.AllowPersistentCookies)
 
+        # Önbellek: EXE yanında (OneDrive/Masaüstü) Chromium sık çöker → LocalAppData
+        try:
+            local = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or ""
+            if local:
+                data_dir = Path(local) / "TribalWarsBot" / "webengine_data"
+            elif getattr(sys, "frozen", False):
+                data_dir = Path(sys.executable).resolve().parent / "webengine_data"
+            else:
+                data_dir = Path(__file__).resolve().parent / "webengine_data"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            self.profile.setCachePath(str(data_dir / "cache"))
+            self.profile.setPersistentStoragePath(str(data_dir / "storage"))
+            _tw_boot_log(f"webengine_data={data_dir}")
+        except Exception as ex:
+            _tw_boot_log(f"webengine_data_fail: {ex}")
+
         settings = self.profile.settings()
         settings.setAttribute(QWebEngineSettings.JavascriptEnabled, True)
         settings.setAttribute(QWebEngineSettings.LocalStorageEnabled, True)
         settings.setAttribute(QWebEngineSettings.PluginsEnabled, True)
-        settings.setAttribute(QWebEngineSettings.JavascriptCanOpenWindows, False)
+        settings.setAttribute(QWebEngineSettings.JavascriptCanOpenWindows, True)
         settings.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
-        settings.setAttribute(QWebEngineSettings.ScrollAnimatorEnabled, True)
+        settings.setAttribute(QWebEngineSettings.ScrollAnimatorEnabled, False)
+        try:
+            settings.setAttribute(QWebEngineSettings.ErrorPageEnabled, True)
+        except Exception:
+            pass
+        try:
+            settings.setAttribute(QWebEngineSettings.WebGLEnabled, False)
+        except Exception:
+            pass
+        try:
+            settings.setAttribute(QWebEngineSettings.Accelerated2dCanvasEnabled, False)
+        except Exception:
+            pass
 
         # HTTP disk cache — tekrar ziyaret edilen kaynaklar (css/js/img) ağdan çekilmesin
         try:
@@ -949,9 +1074,57 @@ class StealthBrowser(QWebEngineView):
         except Exception:
             pass
 
+    def _on_render_process_terminated(self, status, code):
+        """Chromium süreç çökünce: log + uyarı; sınırsız reload döngüsü yok."""
+        try:
+            _tw_boot_log(f"renderProcessTerminated status={status} code={code}")
+        except Exception:
+            pass
+        n = int(getattr(self, "_tw_render_crash_count", 0) or 0) + 1
+        self._tw_render_crash_count = n
+        if n > 3:
+            try:
+                _tw_native_msg(
+                    "Tribal Wars Bot — tarayıcı çöktü",
+                    "Gömülü Chromium art arda çöktü.\n\n"
+                    "1) baslat.bat ile açın\n"
+                    "2) %LOCALAPPDATA%\\TribalWarsBot\\webengine_data klasörünü silin\n"
+                    "3) VC++ x64 kurun\n"
+                    "4) boot.log dosyasını gönderin",
+                )
+            except Exception:
+                pass
+            return
+        try:
+            QTimer.singleShot(800, self.reload)
+        except Exception:
+            pass
+
     def _inject_stealth_js(self, ok):
         """Sayfa yüklendikten sonra anti-detection JavaScript enjekte et."""
         if not ok:
+            return
+
+        try:
+            url = (self.url().toString() or "").lower()
+        except Exception:
+            url = ""
+
+        # Giriş / hCaptcha / portal: hiçbir enjeksiyon yok (renk/stealth SPA'yı beyaz ekran yapabilir)
+        in_game = "game.php" in url
+        authish = any(
+            x in url
+            for x in (
+                "hcaptcha",
+                "newassets.hcaptcha",
+                "botprotection",
+                "bot_protection",
+                "/page/auth",
+                "/page/login",
+                "login.php",
+            )
+        )
+        if (not in_game) or authish:
             return
 
         stealth_js = """
@@ -1011,6 +1184,24 @@ class StealthBrowser(QWebEngineView):
         return TW_BROWSER_COLOR_DEFAULT
 
     def _inject_color_scheme_js(self) -> None:
+        try:
+            url = (self.url().toString() or "").lower()
+        except Exception:
+            url = ""
+        # Portal / giriş sayfasında renk CSS'i SPA'yı bozabilir
+        if "game.php" not in url:
+            return
+        if any(
+            x in url
+            for x in (
+                "hcaptcha",
+                "botprotection",
+                "/page/auth",
+                "/page/login",
+                "login.php",
+            )
+        ):
+            return
         mode = self._resolve_color_scheme_mode()
         js = _tw_browser_color_scheme_js(mode)
 
@@ -4594,6 +4785,8 @@ class TribalWarsBot(QMainWindow):
     _bright_test_finished = pyqtSignal(bool, str)  # ok, body_or_err (log’da token yok)
     _update_check_finished = pyqtSignal(object, bool)  # result dict, manual
     _update_download_finished = pyqtSignal(object)  # result dict
+    _license_check_finished = pyqtSignal(object, bool)  # result dict, manual/activate
+    _license_heartbeat_finished = pyqtSignal(object)  # heartbeat result dict
 
     # Ordu kuyruğu satırı: ek veri (mancınık hedefi — oyun `building` anahtarı, örn. wall)
     SA_QUEUE_ITEM_ROLE_CATAPULT = Qt.UserRole + 30
@@ -4663,7 +4856,7 @@ class TribalWarsBot(QMainWindow):
         self._trusted_world_speed = None
         self._trusted_unit_speed = None
         self.SA_UNIT_DEFS = list(DEFAULT_UNIT_DEFS)
-        self.villages = generate_villages()
+        self.villages = []
         self.selected_villages_list = []
         self.browser = None
         self._pending_command = None
@@ -4675,6 +4868,9 @@ class TribalWarsBot(QMainWindow):
         self._botprot_last_parts = []
         self._botprot_last_detection = {}
         self._botprot_fast_poll_until = 0.0  # şüpheli durumda hızlı tarama penceresi (unix time)
+        # Otomasyon başlangıç zamanları — botprot Telegram yalnızca aktif işler için
+        self._automation_started_at = {}  # key -> unix
+        self._botprot_telegram_last_at = 0.0
         self._last_scraped_village_id = None
         self._village_troops_refresh_timer = None
         self._last_active_troops_fp = None
@@ -4683,6 +4879,9 @@ class TribalWarsBot(QMainWindow):
         self._troops_loading_until = 0.0
         self._last_troops_scrape_at = 0.0
         self._troops_scrape_debounce_sec = 3.0
+
+        self._license = LicenseState()
+        self._license.load_from_settings(self._settings)
 
         self._build_ui()
         self._start_sync_timer()
@@ -4698,7 +4897,18 @@ class TribalWarsBot(QMainWindow):
         self._update_download_finished.connect(self._on_update_download_finished)
         self._update_progress = None
         self._pending_update_manifest = None
+
+        self._license_check_finished.connect(self._on_license_check_finished)
+        self._license_heartbeat_finished.connect(self._on_license_heartbeat_finished)
+        QTimer.singleShot(800, self._license_validate_async)
         QTimer.singleShot(4500, lambda: self._check_for_updates_async(manual=False))
+        self._license_timer = QTimer(self)
+        self._license_timer.timeout.connect(self._license_validate_async)
+        self._license_timer.start(max(1, int(VALIDATE_INTERVAL_HOURS)) * 3600 * 1000)
+        self._license_heartbeat_timer = QTimer(self)
+        self._license_heartbeat_timer.timeout.connect(self._license_heartbeat_async)
+        self._license_heartbeat_timer.start(max(60, int(HEARTBEAT_INTERVAL_SECONDS)) * 1000)
+        QTimer.singleShot(2500, self._license_heartbeat_async)
 
     @pyqtSlot(str)
     def _on_telegram_send_error_slot(self, m: str):
@@ -4774,6 +4984,20 @@ class TribalWarsBot(QMainWindow):
 
     def _build_menu_bar(self):
         mb = self.menuBar()
+        license_menu = mb.addMenu("Lisans")
+        act_status = QAction("Lisans durumu", self)
+        act_status.triggered.connect(self._show_license_status)
+        license_menu.addAction(act_status)
+        act_activate = QAction("Anahtar gir / aktive et", self)
+        act_activate.triggered.connect(self._show_license_activate_dialog)
+        license_menu.addAction(act_activate)
+        act_recheck = QAction("Yeniden doğrula", self)
+        act_recheck.triggered.connect(lambda: self._license_validate_async(manual=True))
+        license_menu.addAction(act_recheck)
+        act_deact = QAction("Bu cihazı lisansdan çıkar", self)
+        act_deact.triggered.connect(self._license_deactivate_this_device)
+        license_menu.addAction(act_deact)
+
         help_menu = mb.addMenu("Yardım")
         act_check = QAction("Güncellemeleri kontrol et", self)
         act_check.triggered.connect(lambda: self._check_for_updates_async(manual=True))
@@ -4781,6 +5005,278 @@ class TribalWarsBot(QMainWindow):
         act_about = QAction(f"Sürüm {APP_VERSION}", self)
         act_about.triggered.connect(self._show_about_version)
         help_menu.addAction(act_about)
+
+    def _license_entitled(self) -> bool:
+        return bool(self._license and self._license.is_entitled())
+
+    def _license_require_or_prompt(self, feature_title: str = "Otomasyon") -> bool:
+        if self._license_entitled():
+            return True
+        QMessageBox.warning(
+            self,
+            "Lisans gerekli",
+            f"{feature_title} için geçerli aylık üyelik gerekir.\n\n"
+            f"Durum: {self._license.status_summary()}\n\n"
+            "Menü → Lisans → Anahtar gir / aktive et",
+        )
+        self._show_license_activate_dialog()
+        return self._license_entitled()
+
+    def _show_license_status(self):
+        mid = get_machine_id()
+        QMessageBox.information(
+            self,
+            "Lisans",
+            f"Durum: {self._license.status_summary()}\n"
+            f"Anahtar: {self._license.license_key or '(yok)'}\n"
+            f"Bitiş: {self._license.expires_at or '—'}\n"
+            f"Son doğrulama: {self._license.last_ok_at or '—'}\n"
+            f"Cihaz ID: {mid[:16]}…",
+        )
+
+    def _show_license_activate_dialog(self):
+        current = self._license.license_key or ""
+        key, ok = QInputDialog.getText(
+            self,
+            "Lisans aktivasyonu",
+            "Lisans anahtarını girin (TWB-xxxx-…):",
+            text=current,
+        )
+        if not ok:
+            return
+        key = (key or "").strip().upper()
+        if not key:
+            return
+        # API adresi müşteriye sorulmaz — license_config.json / dağıtım ayarı
+        self._license.api_base = (DEFAULT_LICENSE_API_BASE or self._license.api_base or "").rstrip("/")
+        self._license.license_key = key
+        self._license.save_to_settings(self._settings)
+        self._add_log("LİSANS", "info", "Aktivasyon deneniyor…")
+        self._license_activate_async(key)
+
+    def _license_account_name(self) -> str:
+        if hasattr(self, "login_input"):
+            return (self.login_input.text() or "").strip()
+        return ""
+
+    def _license_activate_async(self, key: str):
+        account = self._license_account_name()
+
+        def work():
+            result = activate_license(
+                key,
+                api_base=self._license.api_base,
+                account_name=account,
+            )
+            self._license_check_finished.emit(result, True)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _license_validate_async(self, manual: bool = False):
+        if not self._license.license_key:
+            if manual:
+                QMessageBox.information(self, "Lisans", "Kayıtlı anahtar yok.")
+            self._refresh_license_status_ui()
+            return
+        if getattr(self, "_license_check_running", False):
+            return
+        self._license_check_running = True
+        account = self._license_account_name()
+
+        def work():
+            result = validate_license(
+                self._license.license_key,
+                session_token=self._license.session_token,
+                api_base=self._license.api_base,
+                account_name=account,
+            )
+            self._license_check_finished.emit(result, manual)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _license_hard_revoke(self, reason: str = "Lisans geçersiz"):
+        """Sunucu silindi/iptal: grace yok, yerelde hemen kapat."""
+        self._license.active = False
+        self._license.last_ok_at = None
+        self._license.message = (reason or "Lisans geçersiz")[:200]
+        self._license.save_to_settings(self._settings)
+        self._add_log("LİSANS", "warn", f"Lisans kapatıldı: {self._license.message}")
+        self._refresh_license_status_ui()
+        if getattr(self, "_scav_active", False) and hasattr(self, "_scav_stop"):
+            self._scav_stop()
+        if getattr(self, "_rt_active", False) and hasattr(self, "_rt_stop"):
+            self._rt_stop()
+        if getattr(self, "_gold_active", False) and hasattr(self, "_gold_stop"):
+            try:
+                self._gold_stop()
+            except Exception:
+                pass
+        if getattr(self, "bq_enable_cb", None) is not None and self.bq_enable_cb.isChecked():
+            self.bq_enable_cb.setChecked(False)
+        if getattr(self, "farm_enable_cb", None) is not None and self.farm_enable_cb.isChecked():
+            try:
+                self._farm_stop()
+            except Exception:
+                pass
+        if getattr(self, "is_running", False) and hasattr(self, "_stop_bot"):
+            try:
+                self._stop_bot()
+            except Exception:
+                pass
+
+    def _license_server_says_dead(self, result: dict) -> bool:
+        """404/403/401 veya sunucu active=false → kullanıcı atılmış sayılır."""
+        if not isinstance(result, dict):
+            return False
+        status = result.get("status")
+        if status in (401, 403, 404):
+            return True
+        if result.get("ok"):
+            data = result.get("data") or {}
+            if data.get("active") is False:
+                return True
+        return False
+
+    def _license_heartbeat_async(self):
+        if not self._license.license_key:
+            return
+        if getattr(self, "_license_heartbeat_running", False):
+            return
+        self._license_heartbeat_running = True
+        key = self._license.license_key
+        api = self._license.api_base
+        account = self._license_account_name()
+        running = bool(getattr(self, "is_running", False))
+        botprot = bool(getattr(self, "_human_verification_required", False))
+        parts = getattr(self, "_botprot_last_parts", None) or []
+        detail = ", ".join(str(p) for p in parts if p)[:255]
+
+        def work():
+            try:
+                result = send_heartbeat(
+                    key,
+                    api_base=api,
+                    account_name=account,
+                    bot_running=running,
+                    botprot_active=botprot,
+                    botprot_detail=detail,
+                )
+                self._license_heartbeat_finished.emit(result)
+            finally:
+                self._license_heartbeat_running = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @pyqtSlot(object)
+    def _on_license_heartbeat_finished(self, result):
+        """Heartbeat: silinen/iptal key → hemen kes; ağ hatasında grace."""
+        if not isinstance(result, dict):
+            return
+        if self._license_server_says_dead(result):
+            err = result.get("error") or (result.get("data") or {}).get("message") or "Lisans yok veya iptal"
+            self._license_hard_revoke(str(err)[:200])
+            return
+        if not result.get("ok"):
+            # Ağ kopması — grace; dokunma
+            return
+        data = result.get("data") or {}
+        if data.get("active") is False:
+            self._license_hard_revoke(data.get("message") or "Lisans pasif")
+            return
+        # Başarılı heartbeat: son OK zamanını tazele (grace için)
+        if self._license.active:
+            payload = {"active": True}
+            if data.get("expires_at"):
+                payload["expires_at"] = data["expires_at"]
+            self._license.apply_server_payload(payload)
+            self._license.save_to_settings(self._settings)
+
+    @pyqtSlot(object, bool)
+    def _on_license_check_finished(self, result, manual: bool):
+        self._license_check_running = False
+        if not isinstance(result, dict):
+            return
+
+        # Silinen / iptal / süresi dolmuş: grace UYGULAMA — hemen kapat
+        if self._license_server_says_dead(result):
+            err = result.get("error") or (result.get("data") or {}).get("message") or "Lisans yok veya iptal"
+            self._license_hard_revoke(str(err)[:200])
+            if manual:
+                QMessageBox.warning(self, "Lisans", str(err)[:400])
+            return
+
+        if not result.get("ok"):
+            err = result.get("error") or "Doğrulama başarısız"
+            self._add_log("LİSANS", "warn", str(err)[:200])
+            # Sadece gerçek ağ hatası (status 0): offline grace
+            if result.get("status") in (0, None) and self._license.is_entitled():
+                self._add_log("LİSANS", "info", "Çevrimdışı: son başarılı doğrulama grace süresi içinde")
+            elif manual:
+                QMessageBox.warning(self, "Lisans", str(err)[:400])
+            self._refresh_license_status_ui()
+            return
+        data = result.get("data") or {}
+        self._license.apply_server_payload(data)
+        self._license.save_to_settings(self._settings)
+        if not self._license.active:
+            self._license_hard_revoke(data.get("message") or "Lisans pasif")
+            if manual:
+                QMessageBox.warning(self, "Lisans", self._license.message)
+            return
+        self._add_log(
+            "LİSANS",
+            "success" if self._license.active else "warn",
+            self._license.status_summary(),
+        )
+        if manual:
+            QMessageBox.information(self, "Lisans", self._license.status_summary())
+        if not self._license.is_entitled() and self.is_running:
+            self._add_log("LİSANS", "warn", "Üyelik geçersiz — otomasyon duraklatılabilir")
+        self._refresh_license_status_ui()
+
+    def _license_deactivate_this_device(self):
+        if not self._license.license_key:
+            QMessageBox.information(self, "Lisans", "Kayıtlı anahtar yok.")
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Cihazı çıkar",
+            "Bu bilgisayar lisans cihaz kotasından çıkarılsın mı?",
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        def work():
+            result = deactivate_this_device(
+                self._license.license_key, api_base=self._license.api_base
+            )
+            # reuse signal with synthetic payload
+            if result.get("ok"):
+                self._license.active = False
+                self._license.save_to_settings(self._settings)
+            self._license_check_finished.emit(
+                {
+                    "ok": result.get("ok"),
+                    "error": result.get("error"),
+                    "data": {
+                        "active": False,
+                        "message": (result.get("data") or {}).get("message")
+                        or result.get("error")
+                        or "Cihaz çıkarıldı",
+                    },
+                },
+                True,
+            )
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _refresh_license_status_ui(self):
+        summary = self._license.status_summary()
+        if hasattr(self, "_status_license_label"):
+            self._status_license_label.setText(f"Lisans: {summary}")
+        if hasattr(self, "_status_perm_label"):
+            pass
+
 
     def _show_about_version(self):
         QMessageBox.information(
@@ -5032,8 +5528,10 @@ class TribalWarsBot(QMainWindow):
         self._build_settings_tab()
         self._build_logs_tab()
 
-        self.statusBar().showMessage("Durum: Bekliyor | Köy: 90 | Seçili: 0")
-        self._status_perm_label = QLabel(f"Tribal Wars Bot v{APP_VERSION} — PyQt5/Chromium")
+        self.statusBar().showMessage("Durum: Bekliyor | Seçili: 0")
+        self._status_license_label = QLabel(f"Lisans: {self._license.status_summary()}")
+        self.statusBar().addPermanentWidget(self._status_license_label)
+        self._status_perm_label = QLabel(f"v{APP_VERSION}")
         self.statusBar().addPermanentWidget(self._status_perm_label)
 
         self._refresh_theme_dependent_widgets()
@@ -5141,8 +5639,75 @@ class TribalWarsBot(QMainWindow):
             "Qt ayarlarında tutulur (tw_config.json’a yazılmaz).",
         )
 
-    def _format_telegram_security_message(self, parts) -> str:
-        """Güvenlik Telegram metni: oyuncu, dünya, tespit (giriş/köy yok)."""
+    def _automation_mark_started(self, key: str) -> None:
+        """Modül Başlat: süre takibi (yeniden başlatmada sıfırlanır)."""
+        if not isinstance(getattr(self, "_automation_started_at", None), dict):
+            self._automation_started_at = {}
+        self._automation_started_at[str(key)] = time.time()
+
+    def _automation_mark_stopped(self, key: str) -> None:
+        """Modül Durdur (kullanıcı) — botprot mesajına girmez."""
+        d = getattr(self, "_automation_started_at", None)
+        if isinstance(d, dict):
+            d.pop(str(key), None)
+
+    @staticmethod
+    def _automation_format_duration(seconds: float) -> str:
+        sec = max(0, int(seconds))
+        if sec < 60:
+            return f"{sec}sn"
+        mins, s = divmod(sec, 60)
+        if mins < 60:
+            return f"{mins}dk" if s < 15 else f"{mins}dk {s}sn"
+        hrs, m = divmod(mins, 60)
+        return f"{hrs}sa {m}dk" if m else f"{hrs}sa"
+
+    def _automation_collect_running(self):
+        """
+        Şu an çalışan otomasyonlar.
+        Dönüş: [(key, label, started_at), ...] — sadece gerçekten aktif olanlar.
+        """
+        checks = [
+            ("scav", "Temizlik", lambda: bool(getattr(self, "_scav_active", False))),
+            ("rt", "Asker toplama", lambda: bool(getattr(self, "_rt_active", False))),
+            (
+                "farm",
+                "Farm / yağma",
+                lambda: bool(
+                    getattr(self, "farm_enable_cb", None) is not None
+                    and self.farm_enable_cb.isChecked()
+                ),
+            ),
+            ("gold", "Altın Para", lambda: bool(getattr(self, "_gold_active", False))),
+            (
+                "bq",
+                "Bina kuyruğu",
+                lambda: bool(
+                    hasattr(self, "bq_enable_cb") and self.bq_enable_cb.isChecked()
+                ),
+            ),
+            (
+                "main",
+                "Ana bot (Başlat)",
+                lambda: bool(getattr(self, "is_running", False)),
+            ),
+        ]
+        started = getattr(self, "_automation_started_at", None) or {}
+        out = []
+        now = time.time()
+        for key, label, pred in checks:
+            try:
+                on = bool(pred())
+            except Exception:
+                on = False
+            if not on:
+                continue
+            t0 = float(started.get(key) or 0) or now
+            out.append((key, label, t0))
+        return out
+
+    def _format_telegram_security_message(self, parts, paused_jobs=None) -> str:
+        """Güvenlik Telegram: oyuncu, dünya, tespit + duran aktif görevler."""
         gd = self._game_data or {}
         p = (gd.get("player") or {}).get("name")
         p = str(p).strip() if p else ""
@@ -5153,16 +5718,52 @@ class TribalWarsBot(QMainWindow):
             w = (self.world_combo.currentText() or "").strip()
         w = w or "?"
         det = ", ".join(parts) if parts else "?"
-        return (
-            "Tribal Wars – Doğrulama gerekli\n"
-            f"Oyuncu: {p}\n"
-            f"Dünya: {w}\n"
-            f"Tespit: {det}\n"
-            "Otomatik ordu ve temizlik duraklatıldı."
-        )
+        now = time.time()
+        lines = [
+            "Tribal Wars – Görevler durdu (muhtemel bot koruması)",
+            f"Oyuncu: {p}",
+            f"Dünya: {w}",
+            f"Tespit: {det}",
+        ]
+        jobs = paused_jobs if paused_jobs is not None else self._automation_collect_running()
+        if jobs:
+            lines.append("Duraklayan aktif görevler:")
+            for _key, label, t0 in jobs:
+                dur = self._automation_format_duration(now - float(t0))
+                lines.append(f"  • {label} (çalışıyordu: {dur})")
+        lines.append("Tarayıcıda bot korumasını tamamlayın; kalkınca görevler devam eder.")
+        return "\n".join(lines)
 
     def _notify_telegram_security(self, parts) -> None:
-        tw_telegram_send_message_threaded(self, self._format_telegram_security_message(parts))
+        """Yalnızca o anda aktif otomasyon varsa Telegram; rate-limit uygulanır."""
+        jobs = self._automation_collect_running()
+        if not jobs:
+            self._add_log(
+                "GÜVENLİK",
+                "info",
+                "Telegram atlandı: duraklayan aktif otomasyon yok "
+                "(yalnızca Başlatılmış temizlik/asker/farm vb. için bildirilir).",
+            )
+            return
+        now = time.time()
+        last = float(getattr(self, "_botprot_telegram_last_at", 0) or 0)
+        if last and (now - last) < 480:  # 8 dk
+            self._add_log(
+                "GÜVENLİK",
+                "info",
+                f"Telegram atlandı: rate-limit (~{int(480 - (now - last))}sn).",
+            )
+            return
+        self._botprot_telegram_last_at = now
+        labels = ", ".join(f"{lbl} ({self._automation_format_duration(now - t0)})" for _, lbl, t0 in jobs)
+        self._add_log(
+            "GÜVENLİK",
+            "warn",
+            f"Telegram: aktif görevler durdu → bildirim ({labels})",
+        )
+        tw_telegram_send_message_threaded(
+            self, self._format_telegram_security_message(parts, paused_jobs=jobs)
+        )
 
     def _on_settings_telegram_test(self):
         """Kayıtlı token/chat ile test (kaydetmeden de widget değerleri kullanılır)."""
@@ -5749,10 +6350,10 @@ class TribalWarsBot(QMainWindow):
 
         self.tabs.addTab(tab, "🌐 Tarayıcı")
 
-        # İlk sunucu adresini yükle
+        # İlk sunucu adresini yükle (WebEngine hazir olsun diye kisa gecikme)
         initial_url = SERVERS[0][1]
         self.url_bar.setText(initial_url)
-        self.browser.navigate(initial_url)
+        QTimer.singleShot(400, lambda: self.browser.navigate(initial_url) if self.browser else None)
 
     def _navigate_to_url(self):
         url = self.url_bar.text().strip()
@@ -5984,6 +6585,15 @@ class TribalWarsBot(QMainWindow):
     def _tw_inject_planner_webchannel_hook(self, ok):
         """QWebChannel istemcisi + planlayıcı «Gonder» tıklamasını Ordu Gönder kuyruğuna yönlendir."""
         if not ok or not getattr(self, "browser", None):
+            return
+        try:
+            url = (self.browser.url().toString() or "").lower()
+        except Exception:
+            url = ""
+        # Giriş / portal sayfalarına WebChannel basma (beyaz ekran riski)
+        if "game.php" not in url:
+            return
+        if any(x in url for x in ("/page/auth", "/page/login", "hcaptcha", "botprotection")):
             return
         js = r"""
 (function(){
@@ -9608,6 +10218,8 @@ class TribalWarsBot(QMainWindow):
         - 5sn kala: rally point token'ını önceden cache'le (pre-fetch)
         - Zaman gelince: sadece 2 POST ile gönder (GET yok)
         """
+        if not self._license_entitled():
+            return
         if not self.enable_sending_cb.isChecked():
             return
         if not self._server_time_synced or not self._server_time_text:
@@ -11002,7 +11614,10 @@ class TribalWarsBot(QMainWindow):
     def _on_bq_enable_toggled(self, checked: bool):
         """Ana «Başlat» olmadan da bina kuyruğu çalışsın; açılınca hemen dene."""
         if checked:
+            self._automation_mark_started("bq")
             QTimer.singleShot(400, self._bq_auto_process)
+        else:
+            self._automation_mark_stopped("bq")
 
     def _bq_populate_levels_table(self):
         if not hasattr(self, "bq_levels_table"):
@@ -11666,6 +12281,9 @@ class TribalWarsBot(QMainWindow):
         if not self.bq_enable_cb.isChecked():
             if hasattr(self, "_bq_next_wake"):
                 self._bq_next_wake.stop()
+            return
+        if not self._license_entitled():
+            self.bq_enable_cb.setChecked(False)
             return
         if self._human_verification_required:
             return
@@ -14471,6 +15089,7 @@ class TribalWarsBot(QMainWindow):
         self.farm_enable_cb.setChecked(True)
         self.farm_start_btn.setEnabled(False)
         self.farm_stop_btn.setEnabled(True)
+        self._automation_mark_started("farm")
         self._farm_barb_index = 0
         self._farm_sent_count = 0
         self._farm_last_send = 0
@@ -14532,6 +15151,8 @@ class TribalWarsBot(QMainWindow):
 
     def _farm_start(self):
         """Farm sirkülasyonunu başlat."""
+        if not self._license_require_or_prompt("Yağma / farm"):
+            return
         if not self._map_data_loaded:
             QMessageBox.warning(self, "Uyarı", "Önce haritayı yükleyin!")
             return
@@ -14577,6 +15198,7 @@ class TribalWarsBot(QMainWindow):
         self.farm_enable_cb.setChecked(False)
         self.farm_start_btn.setEnabled(True)
         self.farm_stop_btn.setEnabled(False)
+        self._automation_mark_stopped("farm")
         self.farm_status_label.setText("Durum: Durduruldu")
         self.farm_status_label.setStyleSheet("font-size: 10px; color: #cc4444;")
         self._farm_report_scan_blocking_farm = False
@@ -14620,6 +15242,9 @@ class TribalWarsBot(QMainWindow):
     def _farm_process(self):
         """Her saniye çalışır — zamanı gelen saldırıyı gönderir."""
         if not self.farm_enable_cb.isChecked():
+            return
+        if not self._license_entitled():
+            self._farm_stop()
             return
         if self._farm_sending:
             return
@@ -15597,6 +16222,24 @@ class TribalWarsBot(QMainWindow):
         row1.addStretch()
         layout.addLayout(row1)
 
+        # Mod: toplu (tüm köyler) | köy köy (aktif liste)
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(10)
+        mode_row.addWidget(QLabel("Mod:"))
+        self.scav_mode_group = QButtonGroup(self)
+        self.scav_mode_mass = QRadioButton("Toplu (tüm köyler)")
+        self.scav_mode_village = QRadioButton("Köy köy (liste)")
+        self.scav_mode_mass.setChecked(True)
+        self.scav_mode_group.addButton(self.scav_mode_mass, 0)
+        self.scav_mode_group.addButton(self.scav_mode_village, 1)
+        self.scav_mode_mass.toggled.connect(self._scav_on_mode_changed)
+        mode_row.addWidget(self.scav_mode_mass)
+        mode_row.addWidget(self.scav_mode_village)
+        mode_hint = QLabel("Köy köy: Asker sekmesi gibi köy + birim ekleyin. Toplu: aşağıdaki birimler tüm köylere.")
+        mode_hint.setStyleSheet("font-size: 9px; color: #666;")
+        mode_row.addWidget(mode_hint, 1)
+        layout.addLayout(mode_row)
+
         scav_split = QSplitter(Qt.Vertical)
         scav_split.setChildrenCollapsible(False)
 
@@ -15613,28 +16256,102 @@ class TribalWarsBot(QMainWindow):
         opt_layout.setContentsMargins(0, 0, 0, 0)
         opt_layout.setSpacing(4)
 
-        # Satır 2: Birim seçimi (checkbox)
-        row2 = QHBoxLayout()
-        row2.setSpacing(6)
-        row2.addWidget(QLabel("Birimler:"))
-
         self.SCAV_UNITS = [
             ("spear", "Mızrakçı"), ("sword", "Kılıç"), ("axe", "Baltacı"), ("archer", "Okçu"),
             ("light", "HSvari"), ("marcher", "AOkçu"), ("heavy", "ASvari"), ("knight", "Şövalye"),
         ]
+        self.SCAV_UNIT_SHORT = {
+            "spear": "Mız", "sword": "Kıl", "axe": "Bal", "archer": "Okç",
+            "light": "HSv", "marcher": "AOk", "heavy": "ASv", "knight": "Şöv",
+        }
+
+        # ── Toplu: ortak birim seçimi ──
+        self.scav_mass_units_wrap = QWidget()
+        mass_u_lay = QHBoxLayout(self.scav_mass_units_wrap)
+        mass_u_lay.setContentsMargins(0, 0, 0, 0)
+        mass_u_lay.setSpacing(6)
+        mass_u_lay.addWidget(QLabel("Birimler (toplu):"))
         self.scav_unit_cbs = {}
         for key, name in self.SCAV_UNITS:
             cb = QCheckBox(name)
             cb.setStyleSheet("font-size: 10px;")
             troop_icon_mgr.apply_to_checkbox(cb, key)
-            row2.addWidget(cb)
+            mass_u_lay.addWidget(cb)
             self.scav_unit_cbs[key] = cb
-
         self.scav_unit_cbs["spear"].setChecked(True)
         self.scav_unit_cbs["sword"].setChecked(True)
+        mass_u_lay.addStretch()
+        opt_layout.addWidget(self.scav_mass_units_wrap)
 
-        row2.addStretch()
-        opt_layout.addLayout(row2)
+        # ── Köy köy panel (Asker sekmesi benzeri) ──
+        self.scav_pv_panel = QWidget()
+        pv_lay = QVBoxLayout(self.scav_pv_panel)
+        pv_lay.setContentsMargins(0, 0, 0, 0)
+        pv_lay.setSpacing(4)
+
+        pv_vsel = QGroupBox("1. Köyleri seçin")
+        pv_vsel_lay = QVBoxLayout(pv_vsel)
+        pv_vsel_lay.setContentsMargins(4, 4, 4, 4)
+        self.scav_vsel_table = QTreeWidget()
+        self.scav_vsel_table.setRootIsDecorated(False)
+        self.scav_vsel_table.setAlternatingRowColors(True)
+        self.scav_vsel_table.setHeaderLabels(["Köy", "Koordinat"])
+        self.scav_vsel_table.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.scav_vsel_table.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.scav_vsel_table.setMaximumHeight(140)
+        pv_vsel_lay.addWidget(self.scav_vsel_table)
+        pv_lay.addWidget(pv_vsel)
+
+        pv_urow = QHBoxLayout()
+        pv_usel = QGroupBox("2. Birimleri seçip Ekle")
+        pv_usel_lay = QHBoxLayout(pv_usel)
+        pv_usel_lay.setContentsMargins(6, 4, 6, 4)
+        pv_usel_lay.setSpacing(6)
+        self.scav_pv_unit_cbs = {}
+        for key, name in self.SCAV_UNITS:
+            cb = QCheckBox(name)
+            cb.setStyleSheet("font-size: 10px;")
+            troop_icon_mgr.apply_to_checkbox(cb, key)
+            pv_usel_lay.addWidget(cb)
+            self.scav_pv_unit_cbs[key] = cb
+        self.scav_pv_unit_cbs["spear"].setChecked(True)
+        self.scav_pv_unit_cbs["sword"].setChecked(True)
+        pv_usel_lay.addStretch()
+        pv_urow.addWidget(pv_usel, 1)
+        self.scav_pv_add_btn = QPushButton("➕ Ekle")
+        self.scav_pv_add_btn.setObjectName("startBtn")
+        self.scav_pv_add_btn.setCursor(Qt.PointingHandCursor)
+        self.scav_pv_add_btn.setMinimumWidth(80)
+        self.scav_pv_add_btn.setMinimumHeight(40)
+        self.scav_pv_add_btn.clicked.connect(self._scav_pv_add_villages)
+        pv_urow.addWidget(self.scav_pv_add_btn)
+        pv_lay.addLayout(pv_urow)
+
+        pv_active = QGroupBox("Aktif temizlik köyleri")
+        pv_active_lay = QVBoxLayout(pv_active)
+        pv_active_lay.setContentsMargins(4, 4, 4, 4)
+        self.scav_pv_table = QTreeWidget()
+        self.scav_pv_table.setRootIsDecorated(False)
+        self.scav_pv_table.setAlternatingRowColors(True)
+        self.scav_pv_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.scav_pv_table.setHeaderLabels(["Köy", "Birimler", "Durum"])
+        self.scav_pv_table.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.scav_pv_table.header().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.scav_pv_table.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.scav_pv_table.setMaximumHeight(160)
+        pv_active_lay.addWidget(self.scav_pv_table)
+        pv_btn_row = QHBoxLayout()
+        self.scav_pv_remove_btn = QPushButton("Seçileni kaldır")
+        self.scav_pv_remove_btn.clicked.connect(self._scav_pv_remove_selected)
+        pv_btn_row.addWidget(self.scav_pv_remove_btn)
+        self.scav_pv_clear_btn = QPushButton("Listeyi temizle")
+        self.scav_pv_clear_btn.clicked.connect(self._scav_pv_clear)
+        pv_btn_row.addWidget(self.scav_pv_clear_btn)
+        pv_btn_row.addStretch()
+        pv_active_lay.addLayout(pv_btn_row)
+        pv_lay.addWidget(pv_active)
+        self.scav_pv_panel.setVisible(False)
+        opt_layout.addWidget(self.scav_pv_panel)
 
         # Evde tut (Sophie keepHome)
         kh_row = QHBoxLayout()
@@ -15757,8 +16474,183 @@ class TribalWarsBot(QMainWindow):
         self._scav_next_send = 0
         self._scav_villages_cache = []  # Tüm köy verileri
         self._scav_world_meta = {}  # duration_factor, duration_exponent, duration_initial_seconds
+        self._scav_village_profiles = {}  # vid -> {units: set, row: QTreeWidgetItem}
+        self._scav_load_profiles()
+        self._scav_on_mode_changed()
+        QTimer.singleShot(0, self._scav_refresh_vsel)
 
     # ── TEMİZLİK (TOPLU) FONKSİYONLAR ────────
+
+    def _scav_get_mode(self) -> str:
+        if getattr(self, "scav_mode_village", None) and self.scav_mode_village.isChecked():
+            return "village"
+        return "mass"
+
+    def _scav_on_mode_changed(self, *_args):
+        village = self._scav_get_mode() == "village"
+        if hasattr(self, "scav_mass_units_wrap"):
+            self.scav_mass_units_wrap.setVisible(not village)
+        if hasattr(self, "scav_pv_panel"):
+            self.scav_pv_panel.setVisible(village)
+        try:
+            self._settings.setValue("scav/mode", "village" if village else "mass")
+        except Exception:
+            pass
+        if village:
+            self._scav_refresh_vsel()
+
+    def _scav_refresh_vsel(self):
+        """Köy köy seçim tablosunu oyun verisinden doldur."""
+        if not hasattr(self, "scav_vsel_table"):
+            return
+        all_v = self._game_data.get("all_villages") or []
+        if not all_v:
+            v = self._game_data.get("village", {})
+            if v:
+                all_v = [v]
+        self.scav_vsel_table.clear()
+        for v in _tw_sorted_player_villages(all_v):
+            vid = str(v.get("id", "") or "")
+            if not vid:
+                continue
+            coord = f"({v.get('x', '?')}|{v.get('y', '?')})"
+            name = v.get("name", "?")
+            row = QTreeWidgetItem([name, coord])
+            row.setCheckState(0, Qt.Unchecked)
+            row.setFlags(row.flags() | Qt.ItemIsUserCheckable)
+            row.setData(0, Qt.UserRole, vid)
+            self.scav_vsel_table.addTopLevelItem(row)
+        # Aktif liste etiketlerini güncelle
+        profiles = getattr(self, "_scav_village_profiles", {}) or {}
+        for v in all_v:
+            vid = str(v.get("id", "") or "")
+            st = profiles.get(vid)
+            if not st or not st.get("row"):
+                continue
+            coord = f"({v.get('x', '?')}|{v.get('y', '?')})"
+            st["row"].setText(0, f"{v.get('name', '?')} {coord}")
+
+    def _scav_pv_add_villages(self):
+        if not hasattr(self, "scav_vsel_table"):
+            return
+        checked = []
+        for i in range(self.scav_vsel_table.topLevelItemCount()):
+            it = self.scav_vsel_table.topLevelItem(i)
+            if it and it.checkState(0) == Qt.Checked:
+                vid = it.data(0, Qt.UserRole)
+                if vid:
+                    checked.append((str(vid), it.text(0), it.text(1)))
+        if not checked:
+            QMessageBox.warning(self, "Uyarı", "Üst listeden en az bir köy seçin.")
+            return
+        selected_units = {k for k, cb in self.scav_pv_unit_cbs.items() if cb.isChecked()}
+        if not selected_units:
+            QMessageBox.warning(self, "Uyarı", "En az bir birim seçin.")
+            return
+        unit_short = ", ".join(
+            self.SCAV_UNIT_SHORT.get(k, k)
+            for k, _ in self.SCAV_UNITS
+            if k in selected_units
+        )
+        if not hasattr(self, "_scav_village_profiles"):
+            self._scav_village_profiles = {}
+        added = updated = 0
+        for vid, vname, coord in checked:
+            label = f"{vname} {coord}"
+            if vid in self._scav_village_profiles:
+                st = self._scav_village_profiles[vid]
+                st["units"] = set(selected_units)
+                st["row"].setText(1, unit_short)
+                st["row"].setText(2, "Hazır")
+                updated += 1
+            else:
+                row = QTreeWidgetItem([label, unit_short, "Hazır"])
+                self.scav_pv_table.addTopLevelItem(row)
+                self._scav_village_profiles[vid] = {"units": set(selected_units), "row": row}
+                added += 1
+        self._scav_save_profiles()
+        parts = []
+        if added:
+            parts.append(f"{added} yeni")
+        if updated:
+            parts.append(f"{updated} güncellendi")
+        self._add_log("TEMİZLİK", "info", f"Köy köy liste: {', '.join(parts)} — {unit_short}")
+
+    def _scav_pv_remove_selected(self):
+        if not hasattr(self, "scav_pv_table"):
+            return
+        items = self.scav_pv_table.selectedItems()
+        if not items:
+            return
+        to_remove = {id(it) for it in items}
+        for vid in list(self._scav_village_profiles.keys()):
+            st = self._scav_village_profiles[vid]
+            if id(st.get("row")) in to_remove:
+                idx = self.scav_pv_table.indexOfTopLevelItem(st["row"])
+                if idx >= 0:
+                    self.scav_pv_table.takeTopLevelItem(idx)
+                del self._scav_village_profiles[vid]
+        self._scav_save_profiles()
+
+    def _scav_pv_clear(self):
+        if hasattr(self, "scav_pv_table"):
+            self.scav_pv_table.clear()
+        self._scav_village_profiles = {}
+        self._scav_save_profiles()
+        self._add_log("TEMİZLİK", "info", "Köy köy liste temizlendi")
+
+    def _scav_save_profiles(self):
+        try:
+            payload = {
+                vid: {"units": sorted(list(st.get("units") or []))}
+                for vid, st in (self._scav_village_profiles or {}).items()
+            }
+            self._settings.setValue("scav/village_profiles", json.dumps(payload, ensure_ascii=False))
+            self._settings.setValue("scav/mode", self._scav_get_mode())
+            self._settings.sync()
+        except Exception:
+            pass
+
+    def _scav_load_profiles(self):
+        self._scav_village_profiles = {}
+        try:
+            mode = (self._settings.value("scav/mode", "mass") or "mass").strip().lower()
+            if mode == "village" and hasattr(self, "scav_mode_village"):
+                self.scav_mode_village.blockSignals(True)
+                self.scav_mode_village.setChecked(True)
+                self.scav_mode_village.blockSignals(False)
+            raw = self._settings.value("scav/village_profiles", "") or ""
+            if not raw:
+                return
+            data = json.loads(str(raw))
+            if not isinstance(data, dict) or not hasattr(self, "scav_pv_table"):
+                return
+            for vid, meta in data.items():
+                units = set(meta.get("units") or []) if isinstance(meta, dict) else set()
+                units = {u for u in units if u in dict(self.SCAV_UNITS)}
+                if not units:
+                    continue
+                unit_short = ", ".join(
+                    self.SCAV_UNIT_SHORT.get(k, k)
+                    for k, _ in self.SCAV_UNITS
+                    if k in units
+                )
+                row = QTreeWidgetItem([f"Köy {vid}", unit_short, "Hazır"])
+                self.scav_pv_table.addTopLevelItem(row)
+                self._scav_village_profiles[str(vid)] = {"units": units, "row": row}
+        except Exception:
+            self._scav_village_profiles = {}
+
+    def _scav_send_order_for_village(self, village_id) -> list:
+        """Köy için gönderilecek birim sırası (moda göre)."""
+        vid = str(village_id or "")
+        if self._scav_get_mode() == "village":
+            st = (self._scav_village_profiles or {}).get(vid)
+            if not st:
+                return []
+            selected = st.get("units") or set()
+            return [k for k, _ in self.SCAV_UNITS if k in selected]
+        return [k for k, _ in self.SCAV_UNITS if self.scav_unit_cbs[k].isChecked()]
 
     RT_UNITS = [
         ("spear", "Mızrakçı"),
@@ -15794,23 +16686,38 @@ class TribalWarsBot(QMainWindow):
     }
 
     def _scav_start(self):
-        any_checked = any(cb.isChecked() for cb in self.scav_unit_cbs.values())
-        if not any_checked:
-            QMessageBox.warning(self, "Uyarı", "En az bir birim türü seçin!")
+        if not self._license_require_or_prompt("Temizlik"):
             return
+        if self._scav_get_mode() == "village":
+            if not (self._scav_village_profiles or {}):
+                QMessageBox.warning(
+                    self,
+                    "Uyarı",
+                    "Köy köy modunda aktif liste boş.\n"
+                    "Köy ve birim seçip «Ekle»ye basın (veya Toplu moda geçin).",
+                )
+                return
+        else:
+            any_checked = any(cb.isChecked() for cb in self.scav_unit_cbs.values())
+            if not any_checked:
+                QMessageBox.warning(self, "Uyarı", "En az bir birim türü seçin!")
+                return
         self.scav_enable_cb.setChecked(True)
         self._scav_active = True
+        self._automation_mark_started("scav")
         self._scav_next_send = 0
         self.scav_start_btn.setEnabled(False)
         self.scav_stop_btn.setEnabled(True)
-        self.scav_status_label.setText("Durum: Aktif")
+        mode_lbl = "köy köy" if self._scav_get_mode() == "village" else "toplu"
+        self.scav_status_label.setText(f"Durum: Aktif ({mode_lbl})")
         self.scav_status_label.setStyleSheet("font-size: 10px; color: #228822;")
-        self._add_log("TEMİZLİK", "success", "▶ Toplu temizlik başlatıldı")
+        self._add_log("TEMİZLİK", "success", f"▶ Temizlik başlatıldı — mod: {mode_lbl}")
         self._scav_process()
 
     def _scav_stop(self):
         self.scav_enable_cb.setChecked(False)
         self._scav_active = False
+        self._automation_mark_stopped("scav")
         self.scav_start_btn.setEnabled(True)
         self.scav_stop_btn.setEnabled(False)
         self.scav_status_label.setText("Durum: Durduruldu")
@@ -15819,6 +16726,8 @@ class TribalWarsBot(QMainWindow):
 
     def _scav_refresh(self):
         """Manuel güncelleme butonu."""
+        if not self._license_entitled():
+            return
         if self._human_verification_required:
             return
         self._scav_process()
@@ -15829,6 +16738,10 @@ class TribalWarsBot(QMainWindow):
         if not self._scav_active:
             if on_scav_tab:
                 self._scav_update_countdowns()
+            return
+        if not self._license_entitled():
+            self._scav_stop()
+            self.scav_status_label.setText("Durum: Lisans gerekli — durduruldu")
             return
         if self._human_verification_required:
             self.scav_status_label.setText("Durum: Doğrulama bekleniyor — temizlik duraklatıldı")
@@ -15901,6 +16814,10 @@ class TribalWarsBot(QMainWindow):
     def _scav_process(self):
         """Mass scavenging sayfasından tüm köylerin verisini çek."""
         if not self.browser:
+            return
+        if not self._license_entitled():
+            if self._scav_active:
+                self._scav_stop()
             return
         if self._human_verification_required:
             return
@@ -16184,12 +17101,24 @@ class TribalWarsBot(QMainWindow):
                           "light":"HSv","marcher":"AOk","heavy":"ASv","knight":"Şöv",
                           "spy":"Cas","ram":"Koç","catapult":"Man","snob":"Mis"}
 
-            selected_units = [k for k, cb in self.scav_unit_cbs.items() if cb.isChecked()]
+            village_mode = self._scav_get_mode() == "village"
+            profiles = self._scav_village_profiles or {}
+            global_units = [k for k, cb in self.scav_unit_cbs.items() if cb.isChecked()]
 
             for v in villages:
                 name = v.get("name") or v.get("village_name", "?")
                 opts = v.get("options", {})
                 uch = v.get("unit_counts_home") or {}
+                vid = str(v.get("village_id") or "")
+                if village_mode:
+                    st = profiles.get(vid)
+                    if st:
+                        selected_units = [k for k, _ in self.SCAV_UNITS if k in (st.get("units") or set())]
+                    else:
+                        selected_units = []  # listede yok — tabloda birim gösterme
+                else:
+                    selected_units = global_units
+
                 # Gösterim: seçili birimler − evde tut
                 available = {}
                 for u in selected_units:
@@ -16247,6 +17176,9 @@ class TribalWarsBot(QMainWindow):
 
                 status = f"{free_count} boş" if free_count > 0 else "Tümü dolu"
                 status_color = "#228822" if free_count > 0 else "#2d5a9e"
+                if village_mode and vid not in profiles:
+                    status = "Listede yok"
+                    status_color = "#888888"
 
                 # Köy bazlı: açık slotların tamamı boşalana kadar süre (UI geri sayımı)
                 ready_col = 5
@@ -16443,9 +17375,11 @@ class TribalWarsBot(QMainWindow):
         time_def = float(self.scav_rt_def.value())
         prioritise_high = self.scav_prio_highfirst.isChecked()
         cat_enabled = {i: self.scav_cat_cbs[i].isChecked() for i in (1, 2, 3, 4)}
-        send_order = [k for k, _ in self.SCAV_UNITS if self.scav_unit_cbs[k].isChecked()]
+        village_mode = self._scav_get_mode() == "village"
+        profiles = self._scav_village_profiles or {}
 
-        if not send_order:
+        if village_mode and not profiles:
+            self._add_log("TEMİZLİK", "warn", "Köy köy liste boş — gönderim yok.")
             self._scav_schedule_next_mass(villages)
             self._scav_checking = False
             return
@@ -16458,6 +17392,14 @@ class TribalWarsBot(QMainWindow):
 
             opts = v.get("options", {})
             village_id = v.get("village_id")
+            vid = str(village_id or "")
+            if village_mode and vid not in profiles:
+                continue
+
+            send_order = self._scav_send_order_for_village(village_id)
+            if not send_order:
+                continue
+
             uch = v.get("unit_counts_home") or {}
             ucf = float(v.get("unit_carry_factor") or 1)
 
@@ -16545,6 +17487,11 @@ class TribalWarsBot(QMainWindow):
             if village_squads:
                 all_squads.extend(village_squads)
                 sent_villages += 1
+                if village_mode and vid in profiles and profiles[vid].get("row"):
+                    try:
+                        profiles[vid]["row"].setText(2, "Gönderiliyor")
+                    except Exception:
+                        pass
 
         if not all_squads:
             self._scav_schedule_next_mass(villages)
@@ -16561,8 +17508,9 @@ class TribalWarsBot(QMainWindow):
 
         all_squads.sort(key=_scav_squad_order)
 
+        mode_lbl = "köy köy" if village_mode else "toplu"
         self._add_log("TEMİZLİK", "info",
-            f"Toplu gönderim (Sophie mantığı): {len(all_squads)} temizlik, {sent_villages} köy")
+            f"Gönderim ({mode_lbl}): {len(all_squads)} temizlik, {sent_villages} köy")
 
         self._scav_send_batch(all_squads, 0, sent_villages)
 
@@ -16574,9 +17522,9 @@ class TribalWarsBot(QMainWindow):
             self.scav_status_label.setText(f"Durum: {total_villages} köye gönderildi ✓")
             self.scav_status_label.setStyleSheet("font-size: 10px; color: #228822;")
             import time
-            self._scav_next_send = time.time() + 10  # 10sn sonra durumu güncelle
-            # Tabloyu yenile
-            QTimer.singleShot(3000, self._scav_refresh)
+            self._scav_next_send = time.time() + 20  # bir kez return_time tazele
+            # Tabloyu yenile → schedule return_time ile uzun yerel beklemeye geçer
+            QTimer.singleShot(4000, self._scav_refresh)
             return
 
         squads_js = json.dumps(batch)
@@ -16626,8 +17574,8 @@ class TribalWarsBot(QMainWindow):
                     self.scav_status_label.setText(f"Durum: {total_villages} köye gönderildi ✓")
                     self.scav_status_label.setStyleSheet("font-size: 10px; color: #228822;")
                     import time
-                    self._scav_next_send = time.time() + 10
-                    QTimer.singleShot(3000, self._scav_refresh)
+                    self._scav_next_send = time.time() + 20
+                    QTimer.singleShot(4000, self._scav_refresh)
             else:
                 error = result_str.replace("ERROR|", "")
                 self._add_log("TEMİZLİK", "error", f"❌ Batch hatası: {error}")
@@ -16636,53 +17584,67 @@ class TribalWarsBot(QMainWindow):
         self.browser.page().runJavaScript(check_js, on_poll)
 
     def _scav_schedule_next_mass(self, villages):
-        """Otomatik tarama aralığı: çok uzun beklememek için üst sınır (köy süreleri tabloda).
-        Her `_scav_process` tüm köyleri tekrar tarar; hazır olan köylere ayrı ayrı gönderilir."""
+        """return_time ile yerel bekle — HTTP yalnızca süre dolunca (seyrek uzlaşma üst sınırı)."""
         import time
         now = time.time()
-        next_wake_delta = None
+        village_mode = self._scav_get_mode() == "village"
+        profiles = self._scav_village_profiles or {}
 
+        next_wake_delta = None
         for v in villages:
+            vid = str(v.get("village_id") or "")
+            if village_mode and vid not in profiles:
+                continue
             opts = v.get("options", {})
-            latest_open_active = None
-            for oid in ("1", "2", "3", "4"):
-                opt = opts.get(oid) or opts.get(int(oid)) or {}
-                if opt.get("is_locked"):
-                    continue
-                if not opt.get("is_active"):
-                    continue
-                rt = opt.get("return_time")
-                if rt and rt > now:
-                    end_t = float(rt)
-                else:
-                    end_t = now + 25.0
-                if latest_open_active is None or end_t > latest_open_active:
-                    latest_open_active = end_t
-            if latest_open_active is not None:
-                delta = latest_open_active - now
+            ready_ts = self._scav_village_next_ready_unix(opts, now)
+            if ready_ts and ready_ts > now:
+                delta = float(ready_ts) - now
                 if next_wake_delta is None or delta < next_wake_delta:
                     next_wake_delta = delta
 
-        # Üst sınır: 50–70 sn arası rastgele (sabit periyot tespitini zorlaştırır)
-        poll_cap = random.randint(50, 70)
+        # Soft reconcile: saat sapması / elle müdahale için üst sınır (45 dk)
+        reconcile_cap = 45 * 60
 
         if next_wake_delta is not None:
-            wait = max(5, min(int(next_wake_delta) + 3, poll_cap))
+            # Dönüş + küçük jitter; HTTP yok, tablo zaten yerel geri sayıyor
+            wait = int(next_wake_delta) + random.randint(8, 25)
+            wait = max(45, min(wait, reconcile_cap))
             self._scav_next_send = now + wait
+            mins, secs = divmod(wait, 60)
+            hrs, mins = divmod(mins, 60)
+            human = f"{hrs:02d}:{mins:02d}:{secs:02d}" if hrs else f"{mins:02d}:{secs:02d}"
             self.scav_status_label.setText(
-                f"Durum: Sonraki tarama ~{wait}sn (köy başı süre: Atıma kalan)"
+                f"Durum: Yerel bekleme ~{human} (return_time; HTTP yok)"
             )
             self.scav_status_label.setStyleSheet("font-size: 10px; color: #2d5a9e;")
             self._add_log(
                 "TEMİZLİK",
                 "info",
-                f"⏳ Sonraki tarama ~{wait}sn (tabloda her köyün kendi geri sayımı)",
+                f"⏳ Sonraki HTTP ~{human} (en yakın dönüş; tablo geri sayıyor)",
             )
+            # Köy köy aktif satır durumu
+            if village_mode:
+                for vid, st in profiles.items():
+                    row = st.get("row")
+                    if not row:
+                        continue
+                    try:
+                        row.setText(2, f"Bekliyor ~{human}")
+                    except Exception:
+                        pass
         else:
-            idle_wait = random.randint(50, 70)
+            # Hepsi boş ama gönderilecek birlik yok / liste boş → seyrek kontrol
+            idle_wait = random.randint(240, 420)
             self._scav_next_send = now + idle_wait
-            self.scav_status_label.setText(f"Durum: ~{idle_wait}sn sonra tekrar kontrol")
+            self.scav_status_label.setText(
+                f"Durum: ~{idle_wait // 60}dk sonra kontrol (gönderilecek yok)"
+            )
             self.scav_status_label.setStyleSheet("font-size: 10px; color: #aa6600;")
+            self._add_log(
+                "TEMİZLİK",
+                "info",
+                f"⏳ Gönderilecek yok — ~{idle_wait // 60}dk sonra yeniden bakılacak",
+            )
 
     # ── ALTIN PARA SEKMESİ ─────────────────────
 
@@ -16870,6 +17832,8 @@ class TribalWarsBot(QMainWindow):
         self._add_log("ALTIN", "info", str(msg))
 
     def _gold_start(self):
+        if not self._license_require_or_prompt("Altın Para"):
+            return
         if not self.browser or self._login_state != "in_game":
             QMessageBox.warning(self, "Altın Para", "Önce oyuna giriş yapın.")
             return
@@ -16879,6 +17843,7 @@ class TribalWarsBot(QMainWindow):
             return
         self._gold_save_settings()
         self._gold_active = True
+        self._automation_mark_started("gold")
         self._gold_next_action = 0.0
         self._gold_scheduled_at = 0.0
         self._gold_pending_exchange = None
@@ -16891,6 +17856,7 @@ class TribalWarsBot(QMainWindow):
 
     def _gold_stop(self):
         self._gold_active = False
+        self._automation_mark_stopped("gold")
         self._gold_busy = False
         self._gold_pending_exchange = None
         self.gold_start_btn.setEnabled(True)
@@ -17101,6 +18067,10 @@ class TribalWarsBot(QMainWindow):
         import time
         on_tab = self.tabs.currentWidget() is getattr(self, "gold_tab", None)
         if not self._gold_active:
+            return
+        if not self._license_entitled():
+            self._gold_stop()
+            self._gold_append_log("Lisans gerekli — Altın Para durduruldu")
             return
         if self._human_verification_required:
             self.gold_status_label.setText("Durum: Doğrulama bekleniyor")
@@ -17723,6 +18693,8 @@ class TribalWarsBot(QMainWindow):
     # ── ASKER TOPLAMA: kontrol ────────────────────────────────
 
     def _rt_start(self):
+        if not self._license_require_or_prompt("Asker toplama"):
+            return
         if not self._rt_village_states:
             QMessageBox.warning(
                 self, "Uyarı",
@@ -17732,6 +18704,7 @@ class TribalWarsBot(QMainWindow):
             return
         self.rt_enable_cb.setChecked(True)
         self._rt_active = True
+        self._automation_mark_started("rt")
         self.rt_start_btn.setEnabled(False)
         self.rt_stop_btn.setEnabled(True)
         n = len(self._rt_village_states)
@@ -17742,6 +18715,7 @@ class TribalWarsBot(QMainWindow):
     def _rt_stop(self):
         self.rt_enable_cb.setChecked(False)
         self._rt_active = False
+        self._automation_mark_stopped("rt")
         self.rt_start_btn.setEnabled(True)
         self.rt_stop_btn.setEnabled(False)
         self.rt_status_label.setText("Durum: Durduruldu")
@@ -17917,6 +18891,10 @@ class TribalWarsBot(QMainWindow):
         if not self._rt_active:
             if on_tab:
                 self._rt_update_countdowns()
+            return
+        if not self._license_entitled():
+            self._rt_stop()
+            self.rt_status_label.setText("Durum: Lisans gerekli — durduruldu")
             return
         if self._human_verification_required:
             self.rt_status_label.setText("Durum: Doğrulama bekleniyor — duraklatıldı")
@@ -20047,6 +21025,8 @@ class TribalWarsBot(QMainWindow):
                 self.login_pass_label.setStyleSheet("")
 
     def _start_bot(self):
+        if not self._license_require_or_prompt("Bot başlatma"):
+            return
         username = self.login_input.text().strip()
         password = self.password_input.text().strip()
 
@@ -20056,6 +21036,7 @@ class TribalWarsBot(QMainWindow):
 
         self._set_login_credentials_highlight(False)
         self.is_running = True
+        self._automation_mark_started("main")
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.status_indicator.setText("● AKTİF")
@@ -20078,24 +21059,75 @@ class TribalWarsBot(QMainWindow):
 
         # Giriş akışını başlat
         self._login_state = "navigating"
-        server_url = SERVERS[self.server_combo.currentIndex()][1]
+        try:
+            idx = int(self.server_combo.currentIndex())
+        except Exception:
+            idx = 0
+        if idx < 0 or idx >= len(SERVERS):
+            idx = 0
+        server_url = SERVERS[idx][1]
         self._add_log("GİRİŞ", "info", f"Sunucuya bağlanılıyor: {server_url}")
+        try:
+            _tw_boot_log(f"start_bot navigate={server_url}")
+        except Exception:
+            pass
 
         # Önceki bağlantıyı temizle, sonra yeni bağla
         try:
             self.browser.loadFinished.disconnect(self._on_page_loaded)
-        except:
+        except Exception:
             pass
-        self.browser.loadFinished.connect(self._on_page_loaded)
-        self.browser.navigate(server_url)
+        try:
+            self.browser.loadFinished.connect(self._on_page_loaded)
+        except Exception:
+            pass
+
+        # UI güncellensin; anında navigate bazı PC'lerde Chromium'u düşürür
+        QTimer.singleShot(250, lambda u=server_url: self._start_bot_do_navigate(u))
+
+    def _start_bot_do_navigate(self, server_url: str) -> None:
+        if not self.is_running or not self.browser:
+            return
+        try:
+            self.browser.navigate(server_url)
+            try:
+                _tw_boot_log(f"navigate_ok {server_url}")
+            except Exception:
+                pass
+        except Exception as ex:
+            try:
+                _tw_boot_log(f"navigate_fail: {ex}")
+            except Exception:
+                pass
+            self._add_log("GİRİŞ", "error", f"Tarayıcı açılamadı: {ex}")
+            QMessageBox.critical(
+                self,
+                "Tarayıcı hatası",
+                "Sayfa açılamadı; gömülü tarayıcı çökmüş olabilir.\n\n"
+                "baslat.bat ile açın; "
+                "%LOCALAPPDATA%\\TribalWarsBot\\webengine_data silin;\n"
+                "VC++ x64 kurun.\n\n"
+                f"{ex}",
+            )
+            self._stop_bot()
 
     def _on_page_loaded(self, ok):
         """Sayfa yüklendikten sonra duruma göre aksiyon al."""
         if not self.is_running:
             return
+        try:
+            self._on_page_loaded_inner(ok)
+        except Exception as ex:
+            try:
+                _tw_boot_log(f"on_page_loaded_fail: {ex}\n{traceback.format_exc()}")
+            except Exception:
+                pass
+            self._add_log("TAR", "error", f"Sayfa işleme hatası: {ex}")
 
+    def _on_page_loaded_inner(self, ok):
+        """Sayfa yüklendikten sonra duruma göre aksiyon al (iç)."""
         current_url = self.browser.url().toString()
-        self._add_log("TAR", "info", f"Sayfa yüklendi: {current_url}")
+        self._add_log("TAR", "info", f"Sayfa yüklendi: {current_url}" + ("" if ok else " (yükleme hatası)"))
 
         # Oyun ekranına girildi mi? (her state'te kontrol et)
         if "game.php" in current_url or "/overview" in current_url:
@@ -20122,13 +21154,38 @@ class TribalWarsBot(QMainWindow):
                 self._schedule_units_overview_scrape()
             return
 
-        # 1) Ana sayfa / Login sayfası → Giriş yap
-        if self._login_state == "navigating":
-            self._perform_login()
+        # Captcha beklenirken otomatik girişe basma — yalnızca dünya/giriş durumunu izle
+        if self._login_state == "awaiting_captcha":
+            QTimer.singleShot(400, self._poll_login_captcha_and_continue)
+            return
 
-        # 2) Login sonrası → dünya seçim sayfasını kontrol et
+        # 1) Ana sayfa / Login sayfası → Giriş yap (SPA + yavaş ağ: kısa gecikme)
+        if self._login_state == "navigating":
+            if not ok:
+                self._add_log("GİRİŞ", "warn", "Sayfa yüklenemedi — 2 sn sonra yeniden deneniyor...")
+                QTimer.singleShot(2000, self._retry_login_navigation)
+                return
+            # Form DOM'u bazen loadFinished'tan sonra geliyor
+            QTimer.singleShot(1200, self._perform_login)
+
+        # 2) Login sonrası → dünya seçim sayfasını kontrol et (+ captcha kilidi)
         elif self._login_state in ("waiting_world", "world_select"):
-            self._check_world_selection()
+            QTimer.singleShot(300, self._poll_login_captcha_and_continue)
+            QTimer.singleShot(500, self._check_world_selection)
+
+    def _retry_login_navigation(self):
+        """Beyaz ekran / yükleme hatası: aynı sunucuyu bir kez daha aç."""
+        if not self.is_running or self._login_state not in ("navigating", "waiting_world"):
+            return
+        if self._login_state == "waiting_world":
+            # Form henüz bulunamadıysa tekrar navigating'e al
+            self._login_state = "navigating"
+        try:
+            server_url = SERVERS[self.server_combo.currentIndex()][1]
+        except Exception:
+            return
+        self._add_log("GİRİŞ", "info", f"Yeniden bağlanılıyor: {server_url}")
+        self.browser.navigate(server_url)
 
     def _check_world_selection(self):
         """Dünya seçim sayfasında mıyız kontrol et. Kesin HTML yapısı:
@@ -23054,6 +24111,8 @@ class TribalWarsBot(QMainWindow):
         # Asker toplama sekmesi: köy tablosunu güncelle
         if hasattr(self, 'rt_table'):
             self._rt_refresh_villages()
+        if hasattr(self, "scav_vsel_table"):
+            self._scav_refresh_vsel()
 
     def _update_villages_list(self, data):
         """Köyler sekmesindeki tüm köy tablosunu güncelle."""
@@ -23153,96 +24212,232 @@ class TribalWarsBot(QMainWindow):
             self._add_log("KÖY", "info", f"Köye geçiliyor → {village_name} (ID: {village_id})")
             self.browser.page().runJavaScript(switch_js)
 
+    def _enter_login_captcha_hold(self):
+        """Girişte görünür captcha: otomatik form submit'i durdur, elle çözülmesini bekle."""
+        if self._login_state == "in_game":
+            return
+        if self._login_state != "awaiting_captcha":
+            self._login_state = "awaiting_captcha"
+            self._add_log(
+                "GİRİŞ",
+                "warn",
+                "hCaptcha / doğrulama görünür — otomatik giriş durdu. "
+                "Tarayıcıda ELLE çöz; Start'a tekrar basma. Çözünce dünya seçimi kendiliğinden gelir "
+                "veya giriş butonuna bir kez elle tıkla.",
+            )
+            self._set_human_verification_state(True, ["giriş hCaptcha"], hidden=False)
+
+    def _poll_login_captcha_and_continue(self):
+        """Giriş akışında captcha var mı bak; varsa bekle, yoksa world select'e devam."""
+        if not self.is_running or not self.browser:
+            return
+        if self._login_state not in ("waiting_world", "world_select", "awaiting_captcha", "navigating"):
+            return
+
+        js = r"""
+        (function() {
+            function visible(el) {
+                if (!el) return false;
+                var s = window.getComputedStyle(el);
+                if (s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity || '1') < 0.05) return false;
+                var r = el.getBoundingClientRect();
+                return r.width > 20 && r.height > 20;
+            }
+            var loggedIn = document.body && document.body.classList.contains('logged-in');
+            var hc = false;
+            var ifr = document.querySelectorAll('iframe[src*="hcaptcha"], iframe[src*="newassets.hcaptcha"]');
+            for (var i = 0; i < ifr.length; i++) {
+                if (visible(ifr[i])) { hc = true; break; }
+            }
+            if (!hc) {
+                var caps = document.querySelectorAll('.h-captcha, [class*="hcaptcha"]');
+                for (var c = 0; c < caps.length; c++) {
+                    if (visible(caps[c])) { hc = true; break; }
+                }
+            }
+            var challenge = !!document.querySelector('#challenge-stage, .challenge-container, [data-hcaptcha-widget-id]');
+            if (challenge) {
+                var stage = document.querySelector('#challenge-stage, .challenge-container');
+                if (visible(stage)) hc = true;
+            }
+            return JSON.stringify({ logged_in: !!loggedIn, captcha_visible: hc });
+        })();
+        """
+
+        def on_res(result):
+            if not result or not self.is_running:
+                return
+            try:
+                d = json.loads(str(result))
+            except (json.JSONDecodeError, TypeError):
+                return
+            if d.get("captcha_visible"):
+                self._enter_login_captcha_hold()
+                # Çözülene kadar birkaç sn sonra tekrar bak (yeniden giriş YOK)
+                QTimer.singleShot(2500, self._poll_login_captcha_and_continue)
+                return
+            if self._login_state == "awaiting_captcha":
+                if d.get("logged_in"):
+                    self._login_state = "world_select"
+                    self._set_human_verification_state(False, [])
+                    self._add_log("GİRİŞ", "success", "Captcha geçildi — dünya seçimi kontrol ediliyor.")
+                    self._check_world_selection()
+                else:
+                    # Captcha kalktı ama hâlâ login — kullanıcıya bırak (otomatik tekrar tıklama yok)
+                    self._add_log(
+                        "GİRİŞ",
+                        "info",
+                        "Captcha kapandı. Giriş olmadıysa tarayıcıda kullanıcı/şifre ile bir kez «Giriş»e tıkla.",
+                    )
+                    self._login_state = "waiting_world"
+                    self._set_human_verification_state(False, [])
+                    QTimer.singleShot(800, self._check_world_selection)
+
+        self.browser.page().runJavaScript(js, on_res)
+
     def _perform_login(self, retry_count=0):
         """Login formunu doldur ve gönder."""
         # Zaten oyundaysak veya state değiştiyse durma
+        if not self.is_running:
+            return
         if self._login_state == "in_game":
             return
-        if retry_count > 5:
-            self._add_log("GİRİŞ", "error", "Login formu 5 denemede bulunamadı, durduruluyor.")
+        if self._login_state == "awaiting_captcha":
+            self._add_log("GİRİŞ", "info", "Captcha bekleniyor — otomatik giriş atlandı.")
+            return
+        # Form bulunana kadar navigating kal; erken waiting_world sonraki loadFinished'ı kırıyordu
+        if self._login_state not in ("navigating", "waiting_world"):
+            return
+        if retry_count > 8:
+            self._add_log(
+                "GİRİŞ",
+                "error",
+                "Login formu bulunamadı. Tarayıcı beyazsa: baslat.bat ile açın, "
+                "webengine_data klasörünü silin, VC++ Redist kurun.",
+            )
             return
 
         username = self.login_input.text().strip()
         password = self.password_input.text().strip()
+        if not username or not password:
+            self._add_log("GİRİŞ", "error", "Kullanıcı adı / şifre boş.")
+            return
 
-        self._add_log("GİRİŞ", "info", f"Giriş yapılıyor: {username}")
+        self._add_log("GİRİŞ", "info", f"Giriş yapılıyor: {username}" + (f" (deneme {retry_count + 1})" if retry_count else ""))
 
-        # Tam form yapısı:
-        # - Username: input#user[name="username"]
-        # - Password: input#password[name="password"]
-        # - Remember: input#remember-me (zaten checked)
-        # - Login: a.btn-login (anchor, JS ile submit)
-        # - Form: #login_form → POST /page/auth
-        # - hCaptcha invisible var
+        # Form: #user / #password / a.btn-login — alternatif seçiciler de dene
+        u_js = json.dumps(username)
+        p_js = json.dumps(password)
         login_js = f"""
         (function() {{
-            var userInput = document.getElementById('user');
-            var passInput = document.getElementById('password');
+            function visible(el) {{
+                if (!el) return false;
+                var s = window.getComputedStyle(el);
+                if (s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity || '1') < 0.05) return false;
+                var r = el.getBoundingClientRect();
+                return r.width > 20 && r.height > 20;
+            }}
+            if (!document.body || (document.body.innerText || '').trim().length < 8) {{
+                return 'PAGE_EMPTY';
+            }}
+            var ifr = document.querySelectorAll('iframe[src*="hcaptcha"], iframe[src*="newassets.hcaptcha"]');
+            for (var i = 0; i < ifr.length; i++) {{
+                if (visible(ifr[i])) return 'CAPTCHA_VISIBLE';
+            }}
+
+            var userInput = document.getElementById('user')
+                || document.querySelector('input[name="username"]')
+                || document.querySelector('input[name="user"]')
+                || document.querySelector('#login_form input[type="text"]');
+            var passInput = document.getElementById('password')
+                || document.querySelector('input[name="password"]')
+                || document.querySelector('#login_form input[type="password"]')
+                || document.querySelector('input[type="password"]');
 
             if (userInput && passInput) {{
-                // Native setter ile değer ata (framework uyumlu)
                 var nativeSetter = Object.getOwnPropertyDescriptor(
                     window.HTMLInputElement.prototype, 'value').set;
 
-                nativeSetter.call(userInput, '{username}');
+                nativeSetter.call(userInput, {u_js});
                 userInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
                 userInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
                 userInput.dispatchEvent(new Event('blur', {{ bubbles: true }}));
 
-                nativeSetter.call(passInput, '{password}');
+                nativeSetter.call(passInput, {p_js});
                 passInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
                 passInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
                 passInput.dispatchEvent(new Event('blur', {{ bubbles: true }}));
 
-                // Remember me zaten checked, ama emin ol
                 var rememberCb = document.getElementById('remember-me');
                 if (rememberCb && !rememberCb.checked) {{
                     rememberCb.click();
                 }}
 
-                // Cookie consent'i kabul et (varsa)
-                var ccBtn = document.querySelector('a.btn-confirm-yes');
+                var ccBtn = document.querySelector('a.btn-confirm-yes, .cookie-consent a.btn-confirm-yes');
                 if (ccBtn) {{
                     ccBtn.click();
                 }}
 
-                // SADECE btn-login'e tıkla — sitenin kendi JS'i
-                // invisible hCaptcha'yı çalıştırıp form'u submit eder.
-                // Manuel form.submit() captcha'yı atlar ve hata verir!
                 setTimeout(function() {{
-                    var loginBtn = document.querySelector('a.btn-login');
+                    var loginBtn = document.querySelector('a.btn-login')
+                        || document.querySelector('button.btn-login')
+                        || document.querySelector('#login_form a.btn')
+                        || document.querySelector('#login_form button[type="submit"]')
+                        || document.querySelector('button[type="submit"]');
                     if (loginBtn) {{
                         loginBtn.click();
+                    }} else {{
+                        var form = document.getElementById('login_form') || (passInput && passInput.form);
+                        if (form && typeof form.requestSubmit === 'function') form.requestSubmit();
+                        else if (form) form.submit();
                     }}
-                    return 'LOGIN_CLICKED';
                 }}, 800);
 
                 return 'FIELDS_FOUND';
-            }} else {{
-                return 'FIELDS_NOT_FOUND';
             }}
+            return 'FIELDS_NOT_FOUND';
         }})();
         """
 
-        self._login_state = "waiting_world"
-
         def on_js_result(result):
-            if result and "FIELDS_FOUND" in str(result):
+            if not self.is_running:
+                return
+            text = str(result) if result is not None else ""
+            if "CAPTCHA_VISIBLE" in text:
+                self._enter_login_captcha_hold()
+                QTimer.singleShot(2500, self._poll_login_captcha_and_continue)
+                return
+            if "PAGE_EMPTY" in text:
+                self._login_state = "navigating"
+                self._add_log("GİRİŞ", "warn", "Sayfa boş/beyaz — yeniden yükleniyor...")
+                if retry_count < 3:
+                    QTimer.singleShot(1500, self._retry_login_navigation)
+                else:
+                    QTimer.singleShot(2000, lambda: self._perform_login(retry_count + 1))
+                return
+            if "FIELDS_FOUND" in text:
+                self._login_state = "waiting_world"
                 self._add_log("GİRİŞ", "success", "Form alanları bulundu (#user, #password)")
                 self._add_log("GİRİŞ", "info", "Bilgiler giriliyor, login butonu tıklanıyor...")
                 self._add_log("GİRİŞ", "info", "Dünya seçim ekranı bekleniyor...")
-            elif result and "FIELDS_NOT_FOUND" in str(result):
-                if self._login_state == "in_game":
+                QTimer.singleShot(1500, self._poll_login_captcha_and_continue)
+                QTimer.singleShot(3500, self._check_world_selection)
+            elif "FIELDS_NOT_FOUND" in text:
+                if self._login_state in ("in_game", "awaiting_captcha"):
                     return
+                self._login_state = "navigating"
                 self._add_log("GİRİŞ", "warn", "Form alanları henüz yüklenmedi. 2sn sonra tekrar deneniyor...")
                 QTimer.singleShot(2000, lambda: self._perform_login(retry_count + 1))
             else:
+                self._login_state = "navigating"
                 self._add_log("GİRİŞ", "info", f"JS sonuç: {result}")
+                QTimer.singleShot(2000, lambda: self._perform_login(retry_count + 1))
 
         self.browser.page().runJavaScript(login_js, on_js_result)
 
     def _stop_bot(self):
         self.is_running = False
+        self._automation_mark_stopped("main")
         self._login_state = "idle"
         self._tw_post_login_scrape_scheduled = False
         self._set_login_credentials_highlight(False)
@@ -23728,8 +24923,9 @@ class TribalWarsBot(QMainWindow):
                     msg += " Gizli olabilir — tarayıcı sekmesini kontrol edin."
                 self._add_log("GÜVENLİK", "warn", msg)
                 self._notify_telegram_security(parts)
-                if hasattr(self, "_rt_stop"):
-                    self._rt_stop()
+                # Asker basımı / temizlik: _rt_stop çağırma — tick zaten
+                # _human_verification_required ile duraklatır; stop kalıcı kapatırdı.
+                QTimer.singleShot(0, self._license_heartbeat_async)
         else:
             if self._human_verification_required:
                 self._human_verification_required = False
@@ -23744,6 +24940,13 @@ class TribalWarsBot(QMainWindow):
                 )
                 if hasattr(self, "bq_enable_cb") and self.bq_enable_cb.isChecked():
                     QTimer.singleShot(500, self._bq_auto_process)
+                # Asker basımı _rt_active açıksa tick kaldığı yerden devam eder.
+                if getattr(self, "_rt_active", False) and hasattr(self, "rt_status_label"):
+                    n = len(getattr(self, "_rt_village_states", {}) or {})
+                    self.rt_status_label.setText(f"Durum: Aktif ({n} köy)")
+                    self.rt_status_label.setStyleSheet("font-size: 10px; color: #228822;")
+                    self._add_log("ASKER", "info", "Doğrulama kalktı — asker basımı devam ediyor")
+                QTimer.singleShot(0, self._license_heartbeat_async)
 
     def _apply_botprot_detection(self, d):
         """Tespit sonucunu değerlendir ve durumu güncelle."""
@@ -23805,19 +25008,84 @@ class TribalWarsBot(QMainWindow):
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Chromium GPU rasterization — QApplication oluşturulmadan önce ayarlanmalı
-    for _flag in [
-        "--enable-gpu-rasterization",
-        "--enable-accelerated-2d-canvas",
-        "--ignore-gpu-blocklist",
-    ]:
-        if _flag not in sys.argv:
-            sys.argv.append(_flag)
+    def _tw_write_crash_log(text: str) -> Path:
+        try:
+            p = _tw_app_base_dir() / "crash.log"
+            p.write_text(text, encoding="utf-8")
+            return p
+        except Exception:
+            return Path("crash.log")
 
-    app = QApplication(sys.argv)
-    tw_apply_saved_proxy_environment()
-    app.setFont(QFont("Segoe UI", 9))
+    def _tw_excepthook(exc_type, exc, tb):
+        import traceback as _tb
 
-    window = TribalWarsBot()
-    window.show()
-    sys.exit(app.exec_())
+        msg = "".join(_tb.format_exception(exc_type, exc, tb))
+        log_path = _tw_write_crash_log(msg)
+        _tw_boot_log(f"uncaught: {exc_type.__name__}: {exc}")
+        try:
+            from PyQt5.QtWidgets import QApplication, QMessageBox
+
+            app = QApplication.instance() or QApplication(sys.argv)
+            QMessageBox.critical(
+                None,
+                "Tribal Wars Bot — hata",
+                f"Bot beklenmedik sekilde kapandi.\n\n"
+                f"Detay: {log_path}\n\n"
+                f"{exc_type.__name__}: {exc}",
+            )
+        except Exception:
+            _tw_native_msg(
+                "Tribal Wars Bot — hata",
+                f"Bot kapandi.\n\n{log_path}\n\n{exc_type.__name__}: {exc}",
+            )
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = _tw_excepthook
+    try:
+        import faulthandler
+
+        _fh = open(_tw_app_base_dir() / "crash.log", "a", encoding="utf-8")
+        faulthandler.enable(file=_fh, all_threads=True)
+        _tw_boot_log("faulthandler enabled")
+    except Exception as _fh_ex:
+        _tw_boot_log(f"faulthandler skip: {_fh_ex}")
+
+    try:
+        # GPU hizlandirma: yalnizca gelistirme (script) modunda; EXE'de Chromium cokerse kapanmayi onler
+        if not getattr(sys, "frozen", False) or os.environ.get("TWB_ENABLE_GPU") == "1":
+            for _flag in [
+                "--enable-gpu-rasterization",
+                "--enable-accelerated-2d-canvas",
+                "--ignore-gpu-blocklist",
+            ]:
+                if _flag not in sys.argv:
+                    sys.argv.append(_flag)
+
+        _tw_boot_log("QApplication creating")
+        app = QApplication(sys.argv)
+        tw_apply_saved_proxy_environment()
+        app.setFont(QFont("Segoe UI", 9))
+
+        _tw_boot_log("TribalWarsBot() constructing")
+        window = TribalWarsBot()
+        window.show()
+        _tw_boot_log("main window shown — entering event loop")
+        sys.exit(app.exec_())
+    except Exception as ex:
+        import traceback as _tb
+
+        log_path = _tw_write_crash_log(_tb.format_exc())
+        _tw_boot_log(f"startup exception: {ex}")
+        try:
+            app = QApplication.instance() or QApplication(sys.argv)
+            QMessageBox.critical(
+                None,
+                "Tribal Wars Bot — baslatma hatasi",
+                f"Bot baslatilamadi.\n\nDetay: {log_path}\n\n{ex}",
+            )
+        except Exception:
+            _tw_native_msg(
+                "Tribal Wars Bot — baslatma hatasi",
+                f"Bot baslatilamadi.\n\n{log_path}\n\n{ex}",
+            )
+        sys.exit(1)

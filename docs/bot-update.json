@@ -1,5 +1,5 @@
 {
-  "version": "1.2.3",
-  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.2.3/TribalWarsBot-1.2.3.zip",
-  "changelog_tr": "Altın Para sekmesi: depo geri sayımı, bayrak+envanter indirim (çarpımsal), tek PP ile maksimum altın için tüccar dönüşümü.\nTüccar dönüşümü: PP/kaynak doğrulama (yanlış HTTP_200 hatası giderildi).\nOrdu gönderimi yaklaşırken Altın Para otomatik duraklatma.\nToplu yapıştır misyoner: 4 dalgada doğru snob dağıtımı, kuyruk stok rezervi, fake atlama.\nMisyoner ekle diyalogu: güncel köy stoğu ile bölme."
+  "version": "1.4.3",
+  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.3/TribalWarsBot-1.4.3.zip",
+  "changelog_tr": "Başlat sonrası donma/kapanma: WebEngine önbelleği LocalAppData'ya alındı, GPU/WebGL kapatıldı, baslat.bat güçlendirildi.\nBot koruması Telegram: yalnızca o anda aktif çalışan görevler (asker/temizlik/farm vb.) için bildirim + süre bilgisi.\nTemizlik: köy köy mod + return_time ile yerel bekleme (sık HTTP yok).\nboot.log / crash.log ile sessiz kapanma teşhisi.\nLisans sunucusu uyumu ve giriş formu dayanıklılığı."
 }
