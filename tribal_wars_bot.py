@@ -192,7 +192,7 @@ from license_client import (  # noqa: E402
 # ─────────────────────────────────────────────
 
 # EXE'nin guncel oldugunu dogrulamak icin her onemli degisiklikte artirin.
-APP_VERSION = "1.4.5"
+APP_VERSION = "1.4.6"
 
 # Otomatik guncelleme — kullaniciya GitHub adresi gosterilmez; yalnizca bu URL okunur.
 UPDATE_MANIFEST_URL = "https://safayolcuu.github.io/tw-bot/bot-update.json"
@@ -4872,10 +4872,13 @@ class TribalWarsBot(QMainWindow):
         self._botprot_poll_seq = 0
         self._botprot_js_timeouts = 0
         self._botprot_reload_cooldown_until = 0.0
+        self._botprot_reveal_cooldown_until = 0.0
         self._botprot_reload_deferred = False
         self._botprot_ignore_until = 0.0  # soft-reload / sayfa yükü sonrası kısa kör pencere
         self._botprot_hcaptcha_vis_streak = 0
         self._botprot_hold_until = 0.0  # asker/gönderim şüphesi: erken "kalktı" deme
+        self._botprot_hidden_since = 0.0  # gizli doğrulama başlangıcı
+        self._botprot_net_probe_at = 0.0
         self._rt_page_miss_streak = 0
         # Otomasyon başlangıç zamanları — botprot Telegram yalnızca aktif işler için
         self._automation_started_at = {}  # key -> unix
@@ -19033,10 +19036,7 @@ class TribalWarsBot(QMainWindow):
         if soft_reload:
             QTimer.singleShot(
                 500,
-                lambda: self._botprot_try_soft_reload(
-                    reason="asker train botprot",
-                    force=True,
-                ),
+                lambda: self._botprot_reveal_captcha(reason="asker train botprot"),
             )
 
     def _rt_process_building(self, vid, bld_key):
@@ -21288,15 +21288,17 @@ class TribalWarsBot(QMainWindow):
 
         # Oyun ekranına girildi mi? (her state'te kontrol et)
         if "game.php" in current_url or "/overview" in current_url:
-            # Yükleme anında hCaptcha iframe boyutlanır → yanlış pozitif; ~8 sn kör
-            try:
-                until = time.time() + 8.0
-                prev = float(getattr(self, "_botprot_ignore_until", 0) or 0)
-                if until > prev:
-                    self._botprot_ignore_until = until
-                self._botprot_hcaptcha_vis_streak = 0
-            except Exception:
-                pass
+            # Yükleme anında hCaptcha iframe boyutlanır → yanlış pozitif; doğrulama
+            # zaten açıksa kör pencere koyma (reveal reload sonrası captcha görünsün)
+            if not self._human_verification_required:
+                try:
+                    until = time.time() + 8.0
+                    prev = float(getattr(self, "_botprot_ignore_until", 0) or 0)
+                    if until > prev:
+                        self._botprot_ignore_until = until
+                    self._botprot_hcaptcha_vis_streak = 0
+                except Exception:
+                    pass
             if self._login_state != "in_game":
                 self._login_state = "in_game"
                 self._add_log("GİRİŞ", "success", "✅ Oyun ekranına girildi!")
@@ -24894,12 +24896,22 @@ class TribalWarsBot(QMainWindow):
         except Exception:
             pass
         if n >= 3:
-            self._botprot_try_soft_reload(reason="DOM timeout x3")
+            # Takılı renderer: F5 gibi soft-reload — captcha genelde bundan sonra görünür
+            self._botprot_reveal_captcha(reason="DOM timeout x3")
 
-    def _botprot_try_soft_reload(self, reason: str = "", *, force: bool = False) -> None:
+    def _botprot_try_soft_reload(
+        self,
+        reason: str = "",
+        *,
+        force: bool = False,
+        reveal: bool = False,
+    ) -> None:
         """Takılı sayfa için tek reload; cooldown + hot-path koruması."""
         now = time.time()
-        cool_until = float(getattr(self, "_botprot_reload_cooldown_until", 0) or 0)
+        if reveal:
+            cool_until = float(getattr(self, "_botprot_reveal_cooldown_until", 0) or 0)
+        else:
+            cool_until = float(getattr(self, "_botprot_reload_cooldown_until", 0) or 0)
         if now < cool_until:
             rem = int(cool_until - now)
             self._add_log(
@@ -24918,23 +24930,27 @@ class TribalWarsBot(QMainWindow):
             return
         if not self.browser:
             return
-        # Cooldown ~12 dk (10–15 aralığı)
-        self._botprot_reload_cooldown_until = now + 12 * 60
+        # Reveal: kısa cooldown (F5 ile aynı iş); hung DOM: uzun cooldown
+        if reveal:
+            self._botprot_reveal_cooldown_until = now + 90.0
+            self._botprot_ignore_until = now + 4.0
+        else:
+            self._botprot_reload_cooldown_until = now + 12 * 60
+            self._botprot_ignore_until = now + 12.0
         self._botprot_js_timeouts = 0
         self._botprot_reload_deferred = False
-        # Reload sonrası kısa süre hCaptcha/iframe yanlış pozitif olmasın
-        self._botprot_ignore_until = now + 12.0
         self._botprot_hcaptcha_vis_streak = 0
         # Yeni poll'lar eski callback'i yutmasın
         self._botprot_poll_seq = int(getattr(self, "_botprot_poll_seq", 0) or 0) + 1
         why = f" ({reason})" if reason else ""
+        kind = "görünür-yap reload" if reveal else "soft-reload"
         self._add_log(
             "GÜVENLİK",
             "warn",
-            f"Sayfa soft-reload{why} — muhtemel takılı renderer / bot koruması DOM.",
+            f"Sayfa {kind}{why} — bot koruması ekranda görünsün diye yenileniyor (F5 gibi).",
         )
         try:
-            _tw_boot_log(f"botprot_soft_reload{why}")
+            _tw_boot_log(f"botprot_{'reveal' if reveal else 'soft'}_reload{why}")
         except Exception:
             pass
         try:
@@ -24944,12 +24960,108 @@ class TribalWarsBot(QMainWindow):
             return
         self._botprot_start_fast_poll(120)
 
+    def _botprot_reveal_captcha(self, reason: str = "") -> None:
+        """Kullanıcının elle F5 yaptığı gibi: takılı sayfayı yenile → captcha görünsün."""
+        # Asker/scav hot-path kilidini kır
+        for st in (getattr(self, "_rt_village_states", None) or {}).values():
+            if not isinstance(st, dict):
+                continue
+            for bst in (st.get("buildings") or {}).values():
+                if isinstance(bst, dict):
+                    bst["processing"] = False
+        try:
+            self._botprot_hold_until = max(
+                float(getattr(self, "_botprot_hold_until", 0) or 0),
+                time.time() + 45.0,
+            )
+        except Exception:
+            pass
+        self._botprot_try_soft_reload(
+            reason=reason or "captcha reveal",
+            force=True,
+            reveal=True,
+        )
+
     def _botprot_maybe_run_deferred_reload(self) -> None:
         if not getattr(self, "_botprot_reload_deferred", False):
             return
         if self._botprot_automation_hot_path():
             return
         self._botprot_try_soft_reload(reason="ertelenmiş")
+
+    def _botprot_network_probe(self) -> None:
+        """DOM takılıyken fetch ile bot koruması HTML'ini ara (görünmez captcha)."""
+        if not self.browser:
+            return
+        if self._login_state != "in_game":
+            return
+        now = time.time()
+        # Zaten görünür doğrulama varsa probe gerekmez
+        if self._human_verification_required and not getattr(self, "_botprot_hidden_hint", False):
+            return
+        last = float(getattr(self, "_botprot_net_probe_at", 0) or 0)
+        if now - last < 35.0:
+            return
+        self._botprot_net_probe_at = now
+        vid = ""
+        try:
+            vid = str((self._game_data.get("village") or {}).get("id") or "")
+        except Exception:
+            vid = ""
+        if not vid:
+            try:
+                u = self.browser.url().toString()
+                m = re.search(r"[?&]village=(\d+)", u)
+                if m:
+                    vid = m.group(1)
+            except Exception:
+                pass
+        if not vid:
+            return
+        js = (
+            "(function(){"
+            "var vid=" + json.dumps(vid) + ";"
+            "return fetch('/game.php?village='+vid+'&screen=overview',{credentials:'same-origin',cache:'no-store'})"
+            ".then(function(r){return r.text();})"
+            ".then(function(html){"
+            "  var h=String(html||'').toLowerCase();"
+            "  var quest=h.indexOf('botprotection_quest')>=0;"
+            "  var btn=h.indexOf('bot koruma kontrol')>=0;"
+            "  var scr=h.indexOf('screen=botprotection')>=0||h.indexOf('screen=bot_protection')>=0;"
+            "  var hit=btn||scr||(quest&&(h.indexOf('quest_new')>=0||h.indexOf('bot koruma')>=0));"
+            "  return JSON.stringify({ok:true,hit:!!hit,len:(html||'').length});"
+            "})"
+            ".catch(function(e){return JSON.stringify({ok:false,err:String(e)});})"
+            "})()"
+        )
+
+        def on_probe(result):
+            try:
+                d = json.loads(str(result or ""))
+            except (json.JSONDecodeError, TypeError):
+                return
+            if not isinstance(d, dict) or not d.get("ok"):
+                return
+            if not d.get("hit"):
+                return
+            # Ağda botprot var, DOM muhtemelen stale → duraklat + F5
+            self._add_log(
+                "GÜVENLİK",
+                "warn",
+                "Ağ probe: bot koruması HTML'de var (ekran takılı olabilir) — sayfa yenilenecek.",
+            )
+            self._botprot_hold_until = time.time() + 45.0
+            self._set_human_verification_state(
+                True,
+                ["ağ probe (bot koruması HTML)"],
+                hidden=True,
+            )
+            QTimer.singleShot(200, lambda: self._botprot_reveal_captcha(reason="ağ probe"))
+
+        try:
+            self.browser.page().runJavaScript(js, on_probe)
+        except Exception:
+            pass
 
     def _schedule_next_botprot_poll(self):
         """Adaptif DOM kontrolü: şüphede ~3 sn, normal oyunda 10–15 sn, aksi 8–15 sn."""
@@ -24969,6 +25081,7 @@ class TribalWarsBot(QMainWindow):
 
     def _poll_bot_protection_reschedule(self):
         self._botprot_maybe_run_deferred_reload()
+        self._botprot_network_probe()
         self._poll_bot_protection()
         self._schedule_next_botprot_poll()
 
@@ -25176,20 +25289,29 @@ class TribalWarsBot(QMainWindow):
             self._botprot_last_parts = list(parts)
             if hidden:
                 self._botprot_start_fast_poll(120)
+                if not float(getattr(self, "_botprot_hidden_since", 0) or 0):
+                    self._botprot_hidden_since = time.time()
+            else:
+                self._botprot_hidden_since = 0.0
             self._update_botprot_ui()
             if not was:
                 msg = "Doğrulama algılandı (" + ", ".join(parts) + "). Otomatik işlemler duraklatıldı."
                 if hidden:
-                    msg += " Gizli olabilir — tarayıcı sekmesini kontrol edin."
+                    msg += " Sayfa yenilenerek ekranda gösterilecek."
                 self._add_log("GÜVENLİK", "warn", msg)
                 self._notify_telegram_security(parts)
-                # Asker basımı / temizlik: _rt_stop çağırma — tick zaten
-                # _human_verification_required ile duraklatır; stop kalıcı kapatırdı.
+                # Görünmez/takılı ekran: F5 gibi reload (zaten görünürse ekstra reload yok)
+                if hidden:
+                    QTimer.singleShot(
+                        400,
+                        lambda: self._botprot_reveal_captcha(reason="doğrulama ilk tespit"),
+                    )
                 QTimer.singleShot(0, self._license_heartbeat_async)
         else:
             if self._human_verification_required:
                 self._human_verification_required = False
                 self._botprot_hidden_hint = False
+                self._botprot_hidden_since = 0.0
                 self._botprot_last_parts = []
                 self._botprot_clear_fast_poll()
                 self._update_botprot_ui()
@@ -25240,7 +25362,20 @@ class TribalWarsBot(QMainWindow):
             # Görünür doğrulama oturunca hold kalksın — çözülünce hemen devam edebilsin
             if not hidden:
                 self._botprot_hold_until = 0.0
+                self._botprot_hidden_since = 0.0
             self._set_human_verification_state(True, parts, hidden=hidden)
+            # Hâlâ gizli görünüyorsa ~20 sn sonra bir kez daha F5 dene
+            if (
+                hidden
+                and self._human_verification_required
+                and float(getattr(self, "_botprot_hidden_since", 0) or 0)
+                and time.time() - float(self._botprot_hidden_since) >= 20.0
+            ):
+                self._botprot_hidden_since = time.time()  # bir sonraki 20 sn için sıfırla
+                QTimer.singleShot(
+                    0,
+                    lambda: self._botprot_reveal_captcha(reason="gizli doğrulama sürüyor"),
+                )
         else:
             # Asker escalate + reload sırasında erken "kalktı" deme (~45 sn)
             hold = float(getattr(self, "_botprot_hold_until", 0) or 0)

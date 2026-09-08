@@ -1,5 +1,5 @@
 {
-  "version": "1.4.3",
-  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.3/TribalWarsBot-1.4.3.zip",
-  "changelog_tr": "Başlat sonrası donma/kapanma: WebEngine önbelleği LocalAppData'ya alındı, GPU/WebGL kapatıldı, baslat.bat güçlendirildi.\nBot koruması Telegram: yalnızca o anda aktif çalışan görevler (asker/temizlik/farm vb.) için bildirim + süre bilgisi.\nTemizlik: köy köy mod + return_time ile yerel bekleme (sık HTTP yok).\nboot.log / crash.log ile sessiz kapanma teşhisi.\nLisans sunucusu uyumu ve giriş formu dayanıklılığı."
+  "version": "1.4.6",
+  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.6/TribalWarsBot-1.4.6.zip",
+  "changelog_tr": "Bot koruması görünür-yap: gizli doğrulamada otomatik sayfa yenileme (F5 gibi) + ağ HTML probe.\nAsker: eğitim formu PAGE_MISS/BOTPROT ayrımı, fetch timeout, yanlış 'dünyada yok' düzeltmesi.\nSoft-reload sonrası erken 'doğrulama kalktı' azaltıldı; Telegram bildirimleri aktif.\nv1.4.5+ asker timeout/yanlış botprot iyileştirmeleri dahil."
 }
