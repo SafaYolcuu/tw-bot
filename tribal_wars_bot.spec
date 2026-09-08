@@ -14,6 +14,9 @@ import os as _os
 _cfg = _os.path.join(SPECPATH, 'tw_config.json')
 if _os.path.isfile(_cfg):
     datas += [(_cfg, '.')]
+_lic = _os.path.join(SPECPATH, 'license_config.json')
+if _os.path.isfile(_lic):
+    datas += [(_lic, '.')]
 _gunc = _os.path.join(SPECPATH, 'guncelle.bat')
 if _os.path.isfile(_gunc):
     datas += [(_gunc, '.')]
@@ -26,7 +29,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=datas,
-    hiddenimports=hiddenimports,
+    hiddenimports=hiddenimports + ['license_client'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -49,7 +52,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
 )
@@ -59,7 +62,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name='TribalWarsBot',
 )

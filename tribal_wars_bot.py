@@ -192,7 +192,7 @@ from license_client import (  # noqa: E402
 # ─────────────────────────────────────────────
 
 # EXE'nin guncel oldugunu dogrulamak icin her onemli degisiklikte artirin.
-APP_VERSION = "1.4.3"
+APP_VERSION = "1.4.5"
 
 # Otomatik guncelleme — kullaniciya GitHub adresi gosterilmez; yalnizca bu URL okunur.
 UPDATE_MANIFEST_URL = "https://safayolcuu.github.io/tw-bot/bot-update.json"
@@ -4868,6 +4868,15 @@ class TribalWarsBot(QMainWindow):
         self._botprot_last_parts = []
         self._botprot_last_detection = {}
         self._botprot_fast_poll_until = 0.0  # şüpheli durumda hızlı tarama penceresi (unix time)
+        # DOM poll timeout → yumuşak reload (takılı renderer)
+        self._botprot_poll_seq = 0
+        self._botprot_js_timeouts = 0
+        self._botprot_reload_cooldown_until = 0.0
+        self._botprot_reload_deferred = False
+        self._botprot_ignore_until = 0.0  # soft-reload / sayfa yükü sonrası kısa kör pencere
+        self._botprot_hcaptcha_vis_streak = 0
+        self._botprot_hold_until = 0.0  # asker/gönderim şüphesi: erken "kalktı" deme
+        self._rt_page_miss_streak = 0
         # Otomasyon başlangıç zamanları — botprot Telegram yalnızca aktif işler için
         self._automation_started_at = {}  # key -> unix
         self._botprot_telegram_last_at = 0.0
@@ -18702,6 +18711,21 @@ class TribalWarsBot(QMainWindow):
                 "Köy ve birim seçip «Ekle» ye basın."
             )
             return
+        # Önceki yanlış pozitif / asker escalate kilidini kaldır — DOM yeniden taransın
+        if self._human_verification_required:
+            parts = [str(p).lower() for p in (getattr(self, "_botprot_last_parts", []) or [])]
+            asker_lock = any("asker" in p for p in parts) or bool(
+                getattr(self, "_botprot_hidden_hint", False)
+            )
+            if asker_lock:
+                self._botprot_hold_until = 0.0
+                self._set_human_verification_state(False, [])
+                self._add_log(
+                    "ASKER",
+                    "info",
+                    "Önceki doğrulama kilidi temizlendi — asker basımı yeniden denenecek.",
+                )
+        self._rt_page_miss_streak = 0
         self.rt_enable_cb.setChecked(True)
         self._rt_active = True
         self._automation_mark_started("rt")
@@ -18711,6 +18735,7 @@ class TribalWarsBot(QMainWindow):
         self.rt_status_label.setText(f"Durum: Aktif ({n} köy)")
         self.rt_status_label.setStyleSheet("font-size: 10px; color: #228822;")
         self._add_log("ASKER", "success", f"▶ Otomatik asker toplama başlatıldı — {n} köy")
+        QTimer.singleShot(200, self._poll_bot_protection)
 
     def _rt_stop(self):
         self.rt_enable_cb.setChecked(False)
@@ -18978,6 +19003,42 @@ class TribalWarsBot(QMainWindow):
             k = json.dumps(js_global)
             self.browser.page().runJavaScript(f"try {{ window[{k}] = null; }} catch (e) {{}}")
 
+    def _rt_escalate_train_botprot(self, *, vid=None, unit_name: str = "", soft_reload: bool = False) -> None:
+        """Asker train bot koruması şüphesi → duraklat; soft-reload yalnızca güçlü sinyalde."""
+        for st in (getattr(self, "_rt_village_states", None) or {}).values():
+            if not isinstance(st, dict):
+                continue
+            for bst in (st.get("buildings") or {}).values():
+                if isinstance(bst, dict):
+                    bst["processing"] = False
+            row = st.get("row")
+            if row is not None:
+                try:
+                    row.setText(4, "Doğrulama bekleniyor — durdu")
+                    row.setForeground(4, QColor("#cc4444"))
+                except Exception:
+                    pass
+        self._botprot_start_fast_poll(120)
+        try:
+            self._botprot_hold_until = time.time() + 45.0
+        except Exception:
+            self._botprot_hold_until = 0.0
+        self._set_human_verification_state(
+            True,
+            ["asker basımı engellendi (muhtemel doğrulama)"],
+            hidden=True,
+        )
+        QTimer.singleShot(100, self._poll_bot_protection)
+        # Soft-reload yalnızca net botprot HTML'de — aksi halde fetch yarım kalıp zaman aşımı olur
+        if soft_reload:
+            QTimer.singleShot(
+                500,
+                lambda: self._botprot_try_soft_reload(
+                    reason="asker train botprot",
+                    force=True,
+                ),
+            )
+
     def _rt_process_building(self, vid, bld_key):
         """Belirli bir bina kuyruğunu işle (kışla/ahır/atölye bağımsız)."""
         state = self._rt_village_states.get(str(vid))
@@ -19001,28 +19062,59 @@ class TribalWarsBot(QMainWindow):
         row.setText(4, "Kontrol ediliyor…")
         row.setForeground(4, QColor("#2d5a9e"))
 
+        # fetch timeout + dar botprot tespiti (sayfa genelinde hcaptcha stringi yanlış pozitifti)
         fetch_js = (
             "(function() {"
             "window['" + js_global + "'] = 'CHECKING';"
             "var vid = '" + vid_str + "';"
             "var unitKey = '" + unit_key + "';"
             "var csrf = '" + csrf + "';"
-            "fetch('/game.php?village=' + vid + '&screen=train&mode=train', {credentials: 'same-origin'})"
+            "var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;"
+            "var to = setTimeout(function() { try { if (ctrl) ctrl.abort(); } catch (e) {} }, 12000);"
+            "var fopts = {credentials: 'same-origin'};"
+            "if (ctrl) fopts.signal = ctrl.signal;"
+            "fetch('/game.php?village=' + vid + '&screen=train&mode=train', fopts)"
             ".then(function(r) { return r.text(); })"
             ".then(function(html) {"
-            "  var doc = new DOMParser().parseFromString(html, 'text/html');"
-            "  var inp = doc.getElementById(unitKey + '_0');"
-            "  if (!inp) { window['" + js_global + "'] = 'NO_UNIT|' + unitKey; return; }"
+            "  clearTimeout(to);"
+            "  var doc = new DOMParser().parseFromString(html || '', 'text/html');"
+            "  var hl = String(html || '').toLowerCase();"
+            "  var botprotStrong = !!doc.getElementById('botprotection_quest')"
+            "    || /botprotection|bot_protection/.test(hl)"
+            "    || hl.indexOf('bot koruma kontrol') >= 0;"
+            "  var anyUnitInp = !!("
+            "    doc.getElementById('spear_0') || doc.getElementById('sword_0')"
+            "    || doc.getElementById('axe_0') || doc.getElementById('spy_0')"
+            "    || doc.getElementById('light_0') || doc.getElementById('ram_0')"
+            "    || doc.querySelector('input[name=\"spear\"], input[name=\"sword\"], input[name=\"axe\"]')"
+            "  );"
+            "  var inp = doc.getElementById(unitKey + '_0')"
+            "    || doc.querySelector('input[name=\"' + unitKey + '\"]');"
+            "  if (!inp) {"
+            "    if (botprotStrong) {"
+            "      window['" + js_global + "'] = 'BOTPROT|' + unitKey;"
+            "      return;"
+            "    }"
+            "    if (!anyUnitInp) {"
+            "      window['" + js_global + "'] = 'PAGE_MISS|' + unitKey;"
+            "      return;"
+            "    }"
+            "    window['" + js_global + "'] = 'NO_UNIT|' + unitKey;"
+            "    return;"
+            "  }"
             "  var ispan = doc.getElementById(unitKey + '_0_interaction');"
             "  if (ispan && ispan.style.display === 'none') {"
             "    window['" + js_global + "'] = 'BLOCKED|' + unitKey; return;"
             "  }"
             "  var nowSec = Math.floor(Date.now() / 1000);"
             "  var endTimes = [];"
-            "  var allEnd = doc.querySelectorAll('[data-endtime]');"
-            "  for (var ai = 0; ai < allEnd.length; ai++) {"
-            "    var ex = parseInt(allEnd[ai].getAttribute('data-endtime'), 10);"
-            "    if (ex > nowSec) endTimes.push(ex);"
+            "  var trainRoot = doc.querySelector('#trainqueue_wrap, #train_form, form[action*=\"train\"], .trainqueue_wrap');"
+            "  if (trainRoot) {"
+            "    var allEnd = trainRoot.querySelectorAll('[data-endtime]');"
+            "    for (var ai = 0; ai < allEnd.length; ai++) {"
+            "      var ex = parseInt(allEnd[ai].getAttribute('data-endtime'), 10);"
+            "      if (ex > nowSec) endTimes.push(ex);"
+            "    }"
             "  }"
             "  var earliest = 0;"
             "  for (var ci = 0; ci < endTimes.length; ci++) {"
@@ -19078,7 +19170,9 @@ class TribalWarsBot(QMainWindow):
             "  }"
             "})"
             ".catch(function(err) {"
-            "  window['" + js_global + "'] = 'ERROR|' + String(err);"
+            "  try { clearTimeout(to); } catch (e) {}"
+            "  var msg = String(err && err.name === 'AbortError' ? 'fetch_timeout' : err);"
+            "  window['" + js_global + "'] = 'ERROR|' + msg;"
             "});"
             "})();"
         )
@@ -19150,6 +19244,7 @@ class TribalWarsBot(QMainWindow):
                         row.setBackground(c, self._rt_bg("trained"))
                 self._add_log("ASKER", "success",
                     f"✅ [{bld_label}] {unit_name} ×1 → köy {vid} — ~{mins}dk {secs}sn")
+                self._rt_page_miss_streak = 0
 
             elif result_str.startswith("BUSY|"):
                 remain = 60
@@ -19168,15 +19263,60 @@ class TribalWarsBot(QMainWindow):
                 self._add_log("ASKER", "info",
                     f"[{bld_label}] Köy {vid} kuyruk dolu — {mins}dk {secs}sn bekle")
 
+            elif result_str.startswith("BOTPROT|"):
+                bst["next_fire"] = now + 45
+                if row:
+                    row.setText(4, f"[{bld_label}] Doğrulama şüphesi — durdu")
+                    row.setForeground(4, QColor("#cc4444"))
+                    for c in range(5):
+                        row.setBackground(c, self._rt_bg("error"))
+                self._add_log(
+                    "ASKER",
+                    "warn",
+                    f"[{bld_label}] Köy {vid}: {unit_name} — eğitim HTML'de bot koruması. "
+                    f"Otomasyon duraklatılıyor, sayfa yenilenecek.",
+                )
+                self._rt_escalate_train_botprot(vid=vid, unit_name=unit_name, soft_reload=True)
+
+            elif result_str.startswith("PAGE_MISS|"):
+                import random as _rnd3
+                streak = int(getattr(self, "_rt_page_miss_streak", 0) or 0) + 1
+                self._rt_page_miss_streak = streak
+                wait_sec = _rnd3.randint(20, 40)
+                bst["next_fire"] = now + wait_sec
+                if row:
+                    row.setText(4, f"[{bld_label}] Eğitim formu yok — {wait_sec}sn")
+                    row.setForeground(4, QColor("#cc9933" if getattr(self, "_dark_mode", False) else "#aa6600"))
+                    for c in range(5):
+                        row.setBackground(c, self._rt_bg("neutral"))
+                self._add_log(
+                    "ASKER",
+                    "warn",
+                    f"[{bld_label}] Köy {vid}: eğitim formu okunamadı ({streak}/2) — {wait_sec}sn sonra tekrar",
+                )
+                self._botprot_start_fast_poll(45)
+                QTimer.singleShot(100, self._poll_bot_protection)
+                if streak >= 2:
+                    self._rt_page_miss_streak = 0
+                    self._add_log(
+                        "ASKER",
+                        "warn",
+                        "Ardışık form miss — bot koruması şüphesi, soft-reload.",
+                    )
+                    self._rt_escalate_train_botprot(vid=vid, unit_name=unit_name, soft_reload=True)
+
             elif result_str.startswith("BLOCKED|") or result_str.startswith("NO_UNIT|"):
                 import random as _rnd2
+                self._rt_page_miss_streak = 0
                 bld_units = self._rt_get_building_units(vid, bld_key)
                 bst["next_index"] = (bst["next_index"] + 1) % max(len(bld_units), 1)
 
                 is_no_unit = result_str.startswith("NO_UNIT|")
                 if is_no_unit:
-                    wait_sec = _rnd2.randint(3300, 3900)
-                    reason = "bu dünyada mevcut değil"
+                    wait_sec = _rnd2.randint(90, 150)
+                    reason = "birim eğitimde yok / form eksik"
+                    self._botprot_start_fast_poll(60)
+                    QTimer.singleShot(100, self._poll_bot_protection)
                 else:
                     wait_sec = _rnd2.randint(540, 660)
                     reason = "hammadde/farm yetersiz"
@@ -19194,13 +19334,30 @@ class TribalWarsBot(QMainWindow):
 
             elif result_str.startswith("ERROR|"):
                 msg = result_str[6:]
-                bst["next_fire"] = now + 20
-                if row:
-                    row.setText(4, f"[{bld_label}] Hata: {msg[:50]}")
-                    row.setForeground(4, QColor("#ff6666" if getattr(self, "_dark_mode", False) else "#cc4444"))
-                    for c in range(5):
-                        row.setBackground(c, self._rt_bg("error"))
-                self._add_log("ASKER", "error", f"[{bld_label}] Köy {vid} hata: {msg}")
+                if self._dispatch_error_suggests_botprot(msg) or "botprot" in msg.lower():
+                    bst["next_fire"] = now + 45
+                    if row:
+                        row.setText(4, f"[{bld_label}] Doğrulama şüphesi — durdu")
+                        row.setForeground(4, QColor("#cc4444"))
+                        for c in range(5):
+                            row.setBackground(c, self._rt_bg("error"))
+                    self._add_log(
+                        "ASKER",
+                        "warn",
+                        f"[{bld_label}] Köy {vid} hata (bot koruması şüphesi): {msg}",
+                    )
+                    self._rt_escalate_train_botprot(vid=vid, unit_name=unit_name, soft_reload=True)
+                else:
+                    bst["next_fire"] = now + (25 if "fetch_timeout" in msg.lower() else 20)
+                    if row:
+                        row.setText(4, f"[{bld_label}] Hata: {msg[:50]}")
+                        row.setForeground(4, QColor("#ff6666" if getattr(self, "_dark_mode", False) else "#cc4444"))
+                        for c in range(5):
+                            row.setBackground(c, self._rt_bg("error"))
+                    self._add_log("ASKER", "error", f"[{bld_label}] Köy {vid} hata: {msg}")
+                    if "fetch_timeout" in msg.lower():
+                        self._botprot_start_fast_poll(60)
+                        QTimer.singleShot(100, self._poll_bot_protection)
 
             else:
                 bst["next_fire"] = now + 15
@@ -21131,6 +21288,15 @@ class TribalWarsBot(QMainWindow):
 
         # Oyun ekranına girildi mi? (her state'te kontrol et)
         if "game.php" in current_url or "/overview" in current_url:
+            # Yükleme anında hCaptcha iframe boyutlanır → yanlış pozitif; ~8 sn kör
+            try:
+                until = time.time() + 8.0
+                prev = float(getattr(self, "_botprot_ignore_until", 0) or 0)
+                if until > prev:
+                    self._botprot_ignore_until = until
+                self._botprot_hcaptcha_vis_streak = 0
+            except Exception:
+                pass
             if self._login_state != "in_game":
                 self._login_state = "in_game"
                 self._add_log("GİRİŞ", "success", "✅ Oyun ekranına girildi!")
@@ -24692,6 +24858,99 @@ class TribalWarsBot(QMainWindow):
     def _botprot_clear_fast_poll(self) -> None:
         self._botprot_fast_poll_until = 0.0
 
+    def _botprot_automation_hot_path(self) -> bool:
+        """Gönderim / kritik JS sırasında soft-reload yapma."""
+        if getattr(self, "_scav_sending", False) or getattr(self, "_scav_checking", False):
+            return True
+        if getattr(self, "_farm_sending", False):
+            return True
+        if getattr(self, "_gold_busy", False):
+            return True
+        if getattr(self, "_bq_processing", False):
+            return True
+        if getattr(self, "_pending_command", None):
+            return True
+        for st in (getattr(self, "_rt_village_states", None) or {}).values():
+            for bst in (st.get("buildings") or {}).values():
+                if isinstance(bst, dict) and bst.get("processing"):
+                    return True
+        return False
+
+    def _botprot_on_js_timeout(self, seq: int, done: dict) -> None:
+        """runJavaScript 5 sn'de cevap vermezse sayaç; 3 üst üste → tek soft reload."""
+        if done.get("ok"):
+            return
+        if int(seq) != int(getattr(self, "_botprot_poll_seq", 0) or 0):
+            return
+        n = int(getattr(self, "_botprot_js_timeouts", 0) or 0) + 1
+        self._botprot_js_timeouts = n
+        self._add_log(
+            "GÜVENLİK",
+            "warn",
+            f"Botprot DOM timeout ({n}/3) — tarayıcı JS yanıt vermedi.",
+        )
+        try:
+            _tw_boot_log(f"botprot_js_timeout n={n}")
+        except Exception:
+            pass
+        if n >= 3:
+            self._botprot_try_soft_reload(reason="DOM timeout x3")
+
+    def _botprot_try_soft_reload(self, reason: str = "", *, force: bool = False) -> None:
+        """Takılı sayfa için tek reload; cooldown + hot-path koruması."""
+        now = time.time()
+        cool_until = float(getattr(self, "_botprot_reload_cooldown_until", 0) or 0)
+        if now < cool_until:
+            rem = int(cool_until - now)
+            self._add_log(
+                "GÜVENLİK",
+                "info",
+                f"Soft-reload atlandı (cooldown ~{rem // 60}dk {rem % 60}sn).",
+            )
+            return
+        if not force and self._botprot_automation_hot_path():
+            self._botprot_reload_deferred = True
+            self._add_log(
+                "GÜVENLİK",
+                "info",
+                "Soft-reload ertelendi — gönderim/işlem bitince denenecek.",
+            )
+            return
+        if not self.browser:
+            return
+        # Cooldown ~12 dk (10–15 aralığı)
+        self._botprot_reload_cooldown_until = now + 12 * 60
+        self._botprot_js_timeouts = 0
+        self._botprot_reload_deferred = False
+        # Reload sonrası kısa süre hCaptcha/iframe yanlış pozitif olmasın
+        self._botprot_ignore_until = now + 12.0
+        self._botprot_hcaptcha_vis_streak = 0
+        # Yeni poll'lar eski callback'i yutmasın
+        self._botprot_poll_seq = int(getattr(self, "_botprot_poll_seq", 0) or 0) + 1
+        why = f" ({reason})" if reason else ""
+        self._add_log(
+            "GÜVENLİK",
+            "warn",
+            f"Sayfa soft-reload{why} — muhtemel takılı renderer / bot koruması DOM.",
+        )
+        try:
+            _tw_boot_log(f"botprot_soft_reload{why}")
+        except Exception:
+            pass
+        try:
+            self.browser.reload()
+        except Exception as ex:
+            self._add_log("GÜVENLİK", "error", f"Soft-reload başarısız: {ex}")
+            return
+        self._botprot_start_fast_poll(120)
+
+    def _botprot_maybe_run_deferred_reload(self) -> None:
+        if not getattr(self, "_botprot_reload_deferred", False):
+            return
+        if self._botprot_automation_hot_path():
+            return
+        self._botprot_try_soft_reload(reason="ertelenmiş")
+
     def _schedule_next_botprot_poll(self):
         """Adaptif DOM kontrolü: şüphede ~3 sn, normal oyunda 10–15 sn, aksi 8–15 sn."""
         in_game = (
@@ -24709,6 +24968,7 @@ class TribalWarsBot(QMainWindow):
         QTimer.singleShot(delay_ms, self._poll_bot_protection_reschedule)
 
     def _poll_bot_protection_reschedule(self):
+        self._botprot_maybe_run_deferred_reload()
         self._poll_bot_protection()
         self._schedule_next_botprot_poll()
 
@@ -24951,18 +25211,57 @@ class TribalWarsBot(QMainWindow):
     def _apply_botprot_detection(self, d):
         """Tespit sonucunu değerlendir ve durumu güncelle."""
         self._botprot_last_detection = dict(d) if isinstance(d, dict) else {}
+        # Soft-reload / loadFinished sonrası kısa kör pencere
+        if time.time() < float(getattr(self, "_botprot_ignore_until", 0) or 0):
+            return
         active, parts, hidden = self._botprot_signals_from_detection(d)
+
+        # Görünür hCaptcha: sayfa yükünde iframe bir an boyutlanır — 2 ardışık poll iste
+        only_hc_vis = (
+            active
+            and not hidden
+            and parts == ["hCaptcha (görünür)"]
+        )
+        if only_hc_vis:
+            streak = int(getattr(self, "_botprot_hcaptcha_vis_streak", 0) or 0) + 1
+            self._botprot_hcaptcha_vis_streak = streak
+            if streak < 2:
+                self._add_log(
+                    "GÜVENLİK",
+                    "info",
+                    "hCaptcha görünür sinyali (1/2) — yanlış pozitif olabilir, bir poll daha bekleniyor.",
+                )
+                self._botprot_start_fast_poll(30)
+                return
+        else:
+            self._botprot_hcaptcha_vis_streak = 0
+
         if active:
+            # Görünür doğrulama oturunca hold kalksın — çözülünce hemen devam edebilsin
+            if not hidden:
+                self._botprot_hold_until = 0.0
             self._set_human_verification_state(True, parts, hidden=hidden)
         else:
+            # Asker escalate + reload sırasında erken "kalktı" deme (~45 sn)
+            hold = float(getattr(self, "_botprot_hold_until", 0) or 0)
+            if hold and time.time() < hold and self._human_verification_required:
+                return
             self._set_human_verification_state(False, [])
 
     def _poll_bot_protection(self):
-        """Sayfada bot koruması (görünür veya gizli) var mı kontrol et."""
+        """Sayfada bot koruması var mı — 5 sn JS timeout + soft-reload zinciri."""
         if not self.browser:
             return
 
+        seq = int(getattr(self, "_botprot_poll_seq", 0) or 0) + 1
+        self._botprot_poll_seq = seq
+        done = {"ok": False}
+
         def on_det(result):
+            if int(seq) != int(getattr(self, "_botprot_poll_seq", 0) or 0):
+                return
+            done["ok"] = True
+            self._botprot_js_timeouts = 0
             if not result:
                 return
             try:
@@ -24971,7 +25270,14 @@ class TribalWarsBot(QMainWindow):
                 return
             self._apply_botprot_detection(d)
 
-        self.browser.page().runJavaScript(self._botprot_detect_js(), on_det)
+        try:
+            self.browser.page().runJavaScript(self._botprot_detect_js(), on_det)
+        except Exception as ex:
+            self._add_log("GÜVENLİK", "warn", f"Botprot DOM poll hatası: {ex}")
+            done["ok"] = True
+            return
+
+        QTimer.singleShot(5000, lambda s=seq, d=done: self._botprot_on_js_timeout(s, d))
 
     def _show_local_time(self):
         """Sunucu saati alınamadığında yerel saati göster."""

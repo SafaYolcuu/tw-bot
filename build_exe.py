@@ -60,6 +60,15 @@ def main() -> int:
         gunc_dst = os.path.join(dist, "TribalWarsBot", "guncelle.bat")
         if os.path.isfile(gunc_src):
             shutil.copy2(gunc_src, gunc_dst)
+        for extra in ("baslat.bat", "README_KURULUM.txt"):
+            src = os.path.join(root, extra)
+            dst = os.path.join(dist, "TribalWarsBot", extra)
+            if os.path.isfile(src):
+                shutil.copy2(src, dst)
+        lic_src = os.path.join(root, "license_config.json")
+        lic_dst = os.path.join(dist, "TribalWarsBot", "license_config.json")
+        if os.path.isfile(lic_src):
+            shutil.copy2(lic_src, lic_dst)
         print("\nTamam. Cikti:", os.path.join(dist, "TribalWarsBot"))
         return 0
     finally:
