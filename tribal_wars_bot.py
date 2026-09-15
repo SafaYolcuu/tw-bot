@@ -127,6 +127,7 @@ try:
     import random
     import ssl
     import time
+    import uuid
     import datetime
     import shutil
     import subprocess
@@ -137,7 +138,10 @@ try:
     from dataclasses import dataclass, field
     from urllib.parse import urlparse, parse_qs, quote, urlencode
 
-    from PyQt5.QtCore import Qt, QUrl, QTimer, QTime, QDate, QSize, pyqtSignal, QObject, QSettings, pyqtSlot
+    from PyQt5.QtCore import (
+        Qt, QUrl, QTimer, QTime, QDate, QSize, pyqtSignal, QObject, QSettings, pyqtSlot,
+        QByteArray, QBuffer, QIODevice,
+    )
     from PyQt5.QtGui import QFont, QColor, QBrush, QPainter, QPen, QPixmap, QIcon, QPalette
     from PyQt5.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -192,7 +196,7 @@ from license_client import (  # noqa: E402
 # ─────────────────────────────────────────────
 
 # EXE'nin guncel oldugunu dogrulamak icin her onemli degisiklikte artirin.
-APP_VERSION = "1.4.6"
+APP_VERSION = "1.4.7"
 
 # Otomatik guncelleme — kullaniciya GitHub adresi gosterilmez; yalnizca bu URL okunur.
 UPDATE_MANIFEST_URL = "https://safayolcuu.github.io/tw-bot/bot-update.json"
@@ -656,6 +660,101 @@ def tw_telegram_api_send_message(
         return (False, str(r)[:500])
     except Exception as e:
         return (False, str(e)[:500])
+
+
+def tw_telegram_api_send_photo(
+    token: str,
+    chat_id: str,
+    png_bytes: bytes,
+    caption: str = "",
+    insecure_override: bool = None,
+) -> tuple:
+    """sendPhoto (multipart). Dönüş: (bool, hata_metni)."""
+    token = (token or "").strip()
+    chat = _tw_normalize_telegram_chat_id(chat_id)
+    if not token or not chat:
+        return (False, "Token veya Chat ID boş.")
+    if not png_bytes:
+        return (False, "Fotoğraf boş.")
+    boundary = f"----TwBotFormBoundary{uuid.uuid4().hex}"
+    cap = (caption or "").strip()[:1024]
+    parts = []
+    parts.append(
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="chat_id"\r\n\r\n'
+        f"{chat}\r\n".encode("utf-8")
+    )
+    if cap:
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="caption"\r\n\r\n'
+            f"{cap}\r\n".encode("utf-8")
+        )
+    parts.append(
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="photo"; filename="incomings.png"\r\n'
+            f"Content-Type: image/png\r\n\r\n"
+        ).encode("utf-8")
+        + png_bytes
+        + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(parts)
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    _tg = _tw_telegram_build_opener(insecure_skip_verify=insecure_override)
+    try:
+        with _tg.open(req, timeout=60) as resp:
+            raw = resp.read(8192).decode("utf-8", "replace")
+        j = json.loads(raw)
+        if not j.get("ok"):
+            desc = (j.get("description") or str(j))[:500]
+            return (False, f"API: {desc}")
+        return (True, "")
+    except urllib.error.HTTPError as e:
+        try:
+            hbody = e.read().decode("utf-8", "replace")
+            hj = json.loads(hbody)
+            desc = (hj.get("description") or hbody)[:500]
+            return (False, f"API ({e.code}): {desc}")
+        except Exception:
+            return (False, f"HTTP {e.code} {e.reason or ''}")
+    except urllib.error.URLError as e:
+        r = e.reason
+        r = r if (r and str(r).strip()) else str(e)
+        return (False, str(r)[:500])
+    except Exception as e:
+        return (False, str(e)[:500])
+
+
+def tw_telegram_send_photo_threaded(bot, png_bytes: bytes, caption: str = "") -> None:
+    """Açıksa sendPhoto (arka plan)."""
+    def work():
+        err = None
+        try:
+            cfg = _tw_load_config()
+            s = QSettings(QSETTINGS_ORG, QSETTINGS_APP)
+            enabled = cfg.get("telegram_enabled", s.value("notify/telegram_enabled", False, type=bool))
+            if not enabled:
+                return
+            token = (cfg.get("telegram_bot_token") or s.value("notify/telegram_bot_token", "") or "").strip()
+            chat = _tw_resolved_telegram_chat_id(cfg, s)
+            if not token or not chat or not png_bytes:
+                return
+            ok, emsg = tw_telegram_api_send_photo(token, chat, png_bytes, caption=caption or "")
+            if not ok:
+                err = emsg
+        except Exception as e:
+            err = str(e)[:500]
+        if err and bot is not None:
+            try:
+                bot._telegram_send_error.emit(err)
+            except (RuntimeError, AttributeError):
+                pass
+
+    threading.Thread(target=work, daemon=True).start()
 
 
 # Bright Data Web Unlocker (deneme / API doğrulama). Oyun proxy'si kullanılmaz.
@@ -4759,6 +4858,197 @@ class ArmyAuxToolsDialog(QDialog):
         )
 
 
+class DepoDengeDialog(QDialog):
+    """Tarayıcı araç çubuğundan açılan depo dengeleme (manuel gönderim)."""
+
+    def __init__(self, bot: "TribalWarsBot", parent=None):
+        super().__init__(parent or bot)
+        self.bot = bot
+        self.setWindowTitle("Depo Denge")
+        self.setMinimumSize(920, 560)
+        self.resize(980, 620)
+        self.setModal(False)
+        self.setWindowModality(Qt.NonModal)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+
+        settings = bot._settings
+        form = QHBoxLayout()
+        form.setSpacing(8)
+        self.cb_mint = QCheckBox("Ayarları yok say")
+        self.cb_mint.setChecked(bool(settings.value("wb/is_minting", False, type=bool)))
+        form.addWidget(self.cb_mint)
+
+        form.addWidget(QLabel("Alıcı Köyler <"))
+        self.sp_low = QSpinBox()
+        self.sp_low.setRange(0, 13000)
+        self.sp_low.setSingleStep(10)
+        self.sp_low.setValue(int(settings.value("wb/low_points", 3000, type=int) or 3000))
+        form.addWidget(self.sp_low)
+
+        form.addWidget(QLabel("Gönderen Köyler >"))
+        self.sp_high = QSpinBox()
+        self.sp_high.setRange(0, 13000)
+        self.sp_high.setSingleStep(10)
+        self.sp_high.setValue(int(settings.value("wb/high_points", 8000, type=int) or 8000))
+        form.addWidget(self.sp_high)
+
+        form.addWidget(QLabel("Çiftliği Dolu Köyler (Puan düşük olsa bile gönderir)"))
+        self.sp_farm = QSpinBox()
+        self.sp_farm.setRange(0, 40000)
+        self.sp_farm.setSingleStep(100)
+        self.sp_farm.setValue(int(settings.value("wb/high_farm", 23000, type=int) or 23000))
+        form.addWidget(self.sp_farm)
+        form.addStretch()
+        root.addLayout(form)
+
+        form2 = QHBoxLayout()
+        form2.addWidget(QLabel("Gönderen Köylerin Depo Dolum Oranı(Min)"))
+        self.sp_built = QDoubleSpinBox()
+        self.sp_built.setRange(0.05, 0.95)
+        self.sp_built.setSingleStep(0.05)
+        self.sp_built.setDecimals(2)
+        self.sp_built.setValue(float(settings.value("wb/built_out_pct", 0.25, type=float) or 0.25))
+        form2.addWidget(self.sp_built)
+
+        form2.addWidget(QLabel("Alıcı Köylerin Depo Dolum Oranı(Maks)"))
+        self.sp_need = QDoubleSpinBox()
+        self.sp_need.setRange(0.05, 0.95)
+        self.sp_need.setSingleStep(0.05)
+        self.sp_need.setDecimals(2)
+        self.sp_need.setValue(float(settings.value("wb/needs_more_pct", 0.85, type=float) or 0.85))
+        form2.addWidget(self.sp_need)
+        form2.addStretch()
+        root.addLayout(form2)
+
+        btns = QHBoxLayout()
+        self.btn_plan = QPushButton("Planı hesapla")
+        self.btn_plan.setObjectName("startBtn")
+        self.btn_plan.setCursor(Qt.PointingHandCursor)
+        self.btn_plan.clicked.connect(self._on_plan)
+        btns.addWidget(self.btn_plan)
+
+        self.btn_clear = QPushButton("Tabloyu temizle")
+        self.btn_clear.setCursor(Qt.PointingHandCursor)
+        self.btn_clear.clicked.connect(self._on_clear)
+        btns.addWidget(self.btn_clear)
+
+        self.status = QLabel("Durum: Bekliyor")
+        self.status.setStyleSheet("font-size: 10px; color: #888;")
+        btns.addWidget(self.status, 1)
+        root.addLayout(btns)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(
+            ["Kaynak", "Hedef", "Mesafe", "Odun", "Kil", "Demir", ""]
+        )
+        self.tree.setRootIsDecorated(False)
+        self.tree.setAlternatingRowColors(True)
+        hdr = self.tree.header()
+        hdr.setSectionResizeMode(0, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(1, QHeaderView.Stretch)
+        for i in range(2, 6):
+            hdr.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(6, QHeaderView.Fixed)
+        self.tree.setColumnWidth(6, 90)
+        root.addWidget(self.tree, 1)
+
+        self._links = []
+
+    def settings_dict(self) -> dict:
+        return {
+            "is_minting": bool(self.cb_mint.isChecked()),
+            "low_points": int(self.sp_low.value()),
+            "high_points": int(self.sp_high.value()),
+            "high_farm": int(self.sp_farm.value()),
+            "built_out_pct": float(self.sp_built.value()),
+            "needs_more_pct": float(self.sp_need.value()),
+        }
+
+    def save_settings(self):
+        s = self.bot._settings
+        d = self.settings_dict()
+        s.setValue("wb/is_minting", d["is_minting"])
+        s.setValue("wb/low_points", d["low_points"])
+        s.setValue("wb/high_points", d["high_points"])
+        s.setValue("wb/high_farm", d["high_farm"])
+        s.setValue("wb/built_out_pct", d["built_out_pct"])
+        s.setValue("wb/needs_more_pct", d["needs_more_pct"])
+        s.sync()
+
+    def _on_clear(self):
+        self.fill_links([], "")
+        self.status.setText("Durum: Tablo temiz")
+        self.btn_plan.setEnabled(True)
+
+    def _on_plan(self):
+        self.save_settings()
+        self.btn_plan.setEnabled(False)
+        self.status.setText("Durum: Sayfalar çekiliyor (2 GET)…")
+        self.bot._wb_start_plan(self)
+
+    def set_busy(self, busy: bool, msg: str = ""):
+        self.btn_plan.setEnabled(not busy)
+        if msg:
+            self.status.setText(msg)
+
+    def fill_links(self, links: list, meta: str = ""):
+        # Eski satır widget'larını temizle (Qt setItemWidget ghost buton önlemi)
+        while self.tree.topLevelItemCount() > 0:
+            it = self.tree.topLevelItem(0)
+            w = self.tree.itemWidget(it, 6) if it else None
+            if w is not None:
+                self.tree.removeItemWidget(it, 6)
+                w.deleteLater()
+            self.tree.takeTopLevelItem(0)
+
+        self._links = list(links or [])
+        for i, link in enumerate(self._links):
+            item = QTreeWidgetItem(
+                [
+                    str(link.get("source_name") or link.get("source") or "?"),
+                    str(link.get("target_name") or link.get("target") or "?"),
+                    str(link.get("distance", "")),
+                    f"{int(link.get('wood', 0)):,}".replace(",", "."),
+                    f"{int(link.get('stone', 0)):,}".replace(",", "."),
+                    f"{int(link.get('iron', 0)):,}".replace(",", "."),
+                    "",
+                ]
+            )
+            item.setData(0, Qt.UserRole, i)
+            self.tree.addTopLevelItem(item)
+            btn = QPushButton("Gönder")
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedWidth(78)
+            btn.setStyleSheet(
+                "QPushButton { background-color: #2E8B57; color: #fff; border: 1px solid #267349; "
+                "border-radius: 3px; padding: 2px 6px; }"
+                "QPushButton:hover { background-color: #3aa06a; }"
+                "QPushButton:pressed { background-color: #267349; }"
+                "QPushButton:disabled { background-color: #a0a0a0; color: #eee; border-color: #888; }"
+            )
+            btn.clicked.connect(lambda _=False, row=i: self.bot._wb_send_row(self, row))
+            self.tree.setItemWidget(item, 6, btn)
+        self.status.setText(
+            f"Durum: {len(self._links)} gönderim planı"
+            + (f" — {meta}" if meta else "")
+        )
+        self.btn_plan.setEnabled(True)
+
+    def remove_row_by_link_index(self, link_index: int):
+        """Gönderilen satırı listeden çıkar ve tabloyu yeniden kur (buton ghost kalmasın)."""
+        idx = int(link_index)
+        if 0 <= idx < len(self._links):
+            self._links.pop(idx)
+        rem = len(self._links)
+        self.fill_links(self._links, f"kalan {rem}")
+        if rem == 0:
+            self.status.setText("Durum: Tüm gönderimler tamam")
+
+
 class SaTroopAvailLabel(QLabel):
     """Köydeki mevcut birim sayısı (yeşil); tıklanınca ilgili spinbox köydeki adede ayarlanır."""
 
@@ -6335,6 +6625,15 @@ class TribalWarsBot(QMainWindow):
         self.btn_load_map_picker.clicked.connect(self._tw_load_map_coord_picker_script)
         tb_layout.addWidget(self.btn_load_map_picker)
 
+        self.btn_depo_denge = QPushButton("Depo Denge")
+        self.btn_depo_denge.setCursor(Qt.PointingHandCursor)
+        self.btn_depo_denge.setToolTip(
+            "Köyler arası kaynak dengeleme planı (prod + gelen nakliyat, 2 GET).\n"
+            "Gönderimler manuel — her satırda Gönder; otomatik peş peşe yok."
+        )
+        self.btn_depo_denge.clicked.connect(self._wb_open_dialog)
+        tb_layout.addWidget(self.btn_depo_denge)
+
         toolbar.setFixedHeight(36)
         toolbar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout.addWidget(toolbar)
@@ -6563,6 +6862,675 @@ class TribalWarsBot(QMainWindow):
             "map-coord-picker.js bot içinde bulunamadı.\n"
             "tw-bot/map-coord-picker.js dosyasının mevcut olduğundan emin olun.",
         )
+
+    # ── DEPO DENGE (Warehouse balancer) ───────
+
+    def _wb_open_dialog(self):
+        if not self.browser or self._login_state != "in_game":
+            QMessageBox.warning(self, "Depo Denge", "Önce oyuna giriş yapın.")
+            return
+        dlg = getattr(self, "_wb_dialog", None)
+        if dlg is not None:
+            try:
+                if dlg.isVisible():
+                    dlg.raise_()
+                    dlg.activateWindow()
+                    return
+            except RuntimeError:
+                self._wb_dialog = None
+        dlg = DepoDengeDialog(self, self)
+        dlg.finished.connect(lambda _r: setattr(self, "_wb_dialog", None))
+        self._wb_dialog = dlg
+        dlg.show()
+
+    def _wb_start_plan(self, dlg: "DepoDengeDialog"):
+        if self._human_verification_required:
+            dlg.set_busy(False, "Durum: Doğrulama bekleniyor — plan yok")
+            return
+        if not self.browser:
+            dlg.set_busy(False, "Durum: Tarayıcı yok")
+            return
+        self._wb_sending = False
+        settings = dlg.settings_dict()
+        js = r"""
+        (function() {
+            if (typeof game_data === 'undefined' || !game_data) {
+                return JSON.stringify({status:'ERROR', message:'game_data yok'});
+            }
+            function parseNum(s) {
+                var t = String(s || '').replace(/\./g, '').replace(/,/g, '').replace(/[^\d\-]/g, '');
+                var n = parseInt(t, 10);
+                return isNaN(n) ? 0 : n;
+            }
+            function sitterQ() {
+                try {
+                    if (game_data.player && Number(game_data.player.sitter) > 0) {
+                        return '&t=' + encodeURIComponent(String(game_data.player.id));
+                    }
+                } catch (e) {}
+                try {
+                    var u = new URL(window.location.href);
+                    var t = u.searchParams.get('t');
+                    if (t) return '&t=' + encodeURIComponent(t);
+                } catch (e2) {}
+                return '';
+            }
+            var sq = sitterQ();
+            var prodUrl = '/game.php?screen=overview_villages&mode=prod&page=-1' + sq;
+            var incUrl = '/game.php?screen=overview_villages&mode=trader&type=inc&page=-1' + sq;
+
+            function parseProd(html) {
+                var doc = new DOMParser().parseFromString(html, 'text/html');
+                var mobile = !!doc.querySelector('#mobileHeader') || !!document.querySelector('#mobileHeader');
+                var villages = [];
+                var uni = doc.querySelector('span.bonus_icon_33');
+                var uniRow = uni && uni.closest('tr') ? (Array.prototype.indexOf.call(
+                    uni.closest('tr').parentElement.children, uni.closest('tr')) - 1) : -1;
+
+                if (mobile || doc.querySelector('.res.mwood, .warn_90.mwood, .warn.mwood')) {
+                    var woods = doc.querySelectorAll('.res.mwood, .warn_90.mwood, .warn.mwood');
+                    var clays = doc.querySelectorAll('.res.mstone, .warn_90.mstone, .warn.mstone');
+                    var irons = doc.querySelectorAll('.res.miron, .warn_90.miron, .warn.miron');
+                    var whs = doc.querySelectorAll('.mheader.ressources');
+                    var vns = doc.querySelectorAll('.quickedit-vn');
+                    var farms = doc.querySelectorAll('.header.population');
+                    var merchants = doc.querySelectorAll('.trader_img');
+                    var pointsHdr = doc.querySelectorAll('.points-header');
+                    for (var i = 0; i < vns.length; i++) {
+                        if (i === uniRow) continue;
+                        var vn = vns[i];
+                        var name = (vn.textContent || '').trim();
+                        var cm = name.match(/(\d+)\|(\d+)/);
+                        var farmTxt = farms[i] && farms[i].parentElement
+                            ? (farms[i].parentElement.innerText || '') : '';
+                        var fm = farmTxt.match(/(\d+)\s*\/\s*(\d+)/);
+                        var merParent = merchants[i] ? merchants[i].parentElement : null;
+                        var merTxt = merParent ? (merParent.innerText || '') : '0/0';
+                        var mm = merTxt.match(/(\d+)/);
+                        var ptsEl = pointsHdr[i];
+                        var pts = 0;
+                        if (ptsEl && ptsEl.children && ptsEl.children.length) {
+                            pts = parseNum(ptsEl.children[ptsEl.children.length - 1].textContent);
+                        }
+                        villages.push({
+                            id: String(vn.getAttribute('data-id') || ''),
+                            name: name,
+                            x: cm ? parseInt(cm[1], 10) : 0,
+                            y: cm ? parseInt(cm[2], 10) : 0,
+                            points: pts,
+                            wood: woods[i] ? parseNum(woods[i].textContent) : 0,
+                            stone: clays[i] ? parseNum(clays[i].textContent) : 0,
+                            iron: irons[i] ? parseNum(irons[i].textContent) : 0,
+                            warehouse: whs[i] && whs[i].parentElement
+                                ? parseNum(whs[i].parentElement.innerText) : 0,
+                            merchants: mm ? parseInt(mm[1], 10) : 0,
+                            farmUsed: fm ? parseInt(fm[1], 10) : 0,
+                            farmTotal: fm ? parseInt(fm[2], 10) : 0
+                        });
+                    }
+                } else {
+                    var woods2 = doc.querySelectorAll('.res.wood, .warn_90.wood, .warn.wood');
+                    var clays2 = doc.querySelectorAll('.res.stone, .warn_90.stone, .warn.stone');
+                    var irons2 = doc.querySelectorAll('.res.iron, .warn_90.iron, .warn.iron');
+                    var vns2 = doc.querySelectorAll('.quickedit-vn');
+                    for (var j = 0; j < vns2.length; j++) {
+                        if (j === uniRow) continue;
+                        var vn2 = vns2[j];
+                        var name2 = (vn2.textContent || '').trim();
+                        var cm2 = name2.match(/(\d+)\|(\d+)/);
+                        var ironCell = irons2[j];
+                        var td = ironCell ? ironCell.parentElement : null;
+                        var wh = 0, mer = 0, fu = 0, ft = 0, pts2 = 0;
+                        if (td) {
+                            var n1 = td.nextElementSibling;
+                            if (n1) wh = parseNum(n1.textContent);
+                            var n2 = n1 ? n1.nextElementSibling : null;
+                            if (n2) {
+                                var mt = (n2.innerText || '').match(/(\d+)\s*\/\s*(\d+)/);
+                                if (mt) mer = parseInt(mt[1], 10);
+                            }
+                            var n3 = n2 ? n2.nextElementSibling : null;
+                            if (n3) {
+                                var ftmatch = (n3.innerText || '').match(/(\d+)\s*\/\s*(\d+)/);
+                                if (ftmatch) { fu = parseInt(ftmatch[1], 10); ft = parseInt(ftmatch[2], 10); }
+                            }
+                            var prev = woods2[j] && woods2[j].parentElement
+                                ? woods2[j].parentElement.previousElementSibling : null;
+                            if (prev) pts2 = parseNum(prev.textContent);
+                        }
+                        villages.push({
+                            id: String(vn2.getAttribute('data-id') || ''),
+                            name: name2,
+                            x: cm2 ? parseInt(cm2[1], 10) : 0,
+                            y: cm2 ? parseInt(cm2[2], 10) : 0,
+                            points: pts2,
+                            wood: woods2[j] ? parseNum(woods2[j].textContent) : 0,
+                            stone: clays2[j] ? parseNum(clays2[j].textContent) : 0,
+                            iron: irons2[j] ? parseNum(irons2[j].textContent) : 0,
+                            warehouse: wh,
+                            merchants: mer,
+                            farmUsed: fu,
+                            farmTotal: ft
+                        });
+                    }
+                }
+                return villages;
+            }
+
+            function parseIncoming(html) {
+                var doc = new DOMParser().parseFromString(html, 'text/html');
+                var table = doc.querySelector('#trades_table');
+                var incoming = {};
+                if (!table) return incoming;
+                var rows = table.querySelectorAll('tr');
+                var mobile = !!doc.querySelector('#mobileHeader');
+                for (var i = 1; i < rows.length - 1; i++) {
+                    var tr = rows[i];
+                    var cells = tr.children;
+                    if (!cells || cells.length < 4) continue;
+                    var vid = '';
+                    var wood = 0, stone = 0, iron = 0;
+                    try {
+                        if (mobile) {
+                            var a = tr.querySelector('a[href*="info_village"]') ||
+                                (cells[3] && cells[3].querySelector('a'));
+                            if (a && a.href) {
+                                var m = a.href.match(/id=(\d+)/);
+                                if (m) vid = m[1];
+                            }
+                            var icons = tr.querySelectorAll('.icon.mheader, .icon.header');
+                            icons.forEach(function(ic) {
+                                var cls = ic.className || '';
+                                var amt = parseNum(ic.parentElement ? ic.parentElement.textContent : '');
+                                if (/wood/.test(cls)) wood += amt;
+                                else if (/stone/.test(cls)) stone += amt;
+                                else if (/iron/.test(cls)) iron += amt;
+                            });
+                        } else {
+                            var a2 = cells[4] ? cells[4].querySelector('a') : null;
+                            if (a2 && a2.href) {
+                                var m2 = a2.href.match(/id=(\d+)/);
+                                if (m2) vid = m2[1];
+                            }
+                            var resCell = cells[8] || cells[cells.length - 1];
+                            if (resCell) {
+                                var parts = resCell.querySelectorAll('.icon.header, span');
+                                if (!parts.length) {
+                                    var txt = resCell.innerText || '';
+                                    // fallback: leave 0
+                                }
+                                resCell.querySelectorAll('.icon.header').forEach(function(ic) {
+                                    var cls = ic.className || '';
+                                    var parent = ic.parentElement;
+                                    var amt = parseNum(parent ? parent.textContent : '');
+                                    if (!amt && ic.nextSibling) amt = parseNum(ic.nextSibling.textContent);
+                                    if (/wood/.test(cls)) wood += amt;
+                                    else if (/stone/.test(cls)) stone += amt;
+                                    else if (/iron/.test(cls)) iron += amt;
+                                });
+                            }
+                        }
+                    } catch (e) { continue; }
+                    if (!vid) continue;
+                    if (!incoming[vid]) incoming[vid] = {wood:0, stone:0, iron:0};
+                    incoming[vid].wood += wood;
+                    incoming[vid].stone += stone;
+                    incoming[vid].iron += iron;
+                }
+                return incoming;
+            }
+
+            if (!window.__tw_wb_fetch) window.__tw_wb_fetch = 'LOADING';
+            window.__tw_wb_fetch = 'LOADING';
+            fetch(prodUrl, {credentials:'same-origin'})
+                .then(function(r) { return r.text(); })
+                .then(function(prodHtml) {
+                    return new Promise(function(resolve) {
+                        setTimeout(function() {
+                            fetch(incUrl, {credentials:'same-origin'})
+                                .then(function(r2) { return r2.text(); })
+                                .then(function(incHtml) {
+                                    resolve({prodHtml: prodHtml, incHtml: incHtml});
+                                })
+                                .catch(function(e) {
+                                    resolve({prodHtml: prodHtml, incHtml: '', error: String(e)});
+                                });
+                        }, 650);
+                    });
+                })
+                .then(function(pack) {
+                    var villages = parseProd(pack.prodHtml || '');
+                    var incoming = parseIncoming(pack.incHtml || '');
+                    window.__tw_wb_fetch = JSON.stringify({
+                        status: 'OK',
+                        villages: villages,
+                        incoming: incoming,
+                        villageCount: villages.length
+                    });
+                })
+                .catch(function(e) {
+                    window.__tw_wb_fetch = JSON.stringify({status:'ERROR', message:String(e)});
+                });
+            return 'STARTED';
+        })();
+        """
+
+        def on_started(result):
+            if str(result or "") != "STARTED":
+                dlg.set_busy(False, f"Durum: Başlatılamadı ({result})")
+                return
+            QTimer.singleShot(self.TW_JS_POLL_MS, lambda: self._wb_poll_fetch(dlg, settings, 0))
+
+        self.browser.page().runJavaScript(js, on_started)
+
+    def _wb_poll_fetch(self, dlg, settings, attempt: int):
+        if attempt > 80:
+            dlg.set_busy(False, "Durum: Zaman aşımı (sayfa çekimi)")
+            self.browser.page().runJavaScript("window.__tw_wb_fetch=null;")
+            return
+        check = (
+            "(function(){ var x=window.__tw_wb_fetch; "
+            "if(x===undefined||x===null||x==='LOADING') return 'WAITING'; return x; })();"
+        )
+
+        def on_poll(result):
+            res = str(result or "").strip()
+            if res in ("WAITING", "LOADING", ""):
+                QTimer.singleShot(
+                    self.TW_JS_POLL_MS,
+                    lambda: self._wb_poll_fetch(dlg, settings, attempt + 1),
+                )
+                return
+            self.browser.page().runJavaScript("window.__tw_wb_fetch=null;")
+            try:
+                data = json.loads(res) if res.startswith("{") else {}
+            except Exception:
+                data = {}
+            if data.get("status") != "OK":
+                dlg.set_busy(False, "Durum: Hata — " + str(data.get("message", "?"))[:80])
+                return
+            villages = data.get("villages") or []
+            incoming = data.get("incoming") or {}
+            links = self._wb_compute_links(villages, incoming, settings)
+            meta = f"{len(villages)} köy, 2 GET OK"
+            try:
+                dlg.fill_links(links, meta)
+            except RuntimeError:
+                pass
+            self._add_log("DEPO", "info", f"Plan: {len(links)} satır ({meta})")
+
+        self.browser.page().runJavaScript(check, on_poll)
+
+    def _wb_compute_links(self, villages, incoming, settings) -> list:
+        """Sophie warehouse balancer — excess → shortage, mesafe öncelikli."""
+        if not villages:
+            return []
+        is_mint = bool(settings.get("is_minting"))
+        low_pts = int(settings.get("low_points") or 3000)
+        high_pts = int(settings.get("high_points") or 8000)
+        high_farm = int(settings.get("high_farm") or 23000)
+        built_pct = float(settings.get("built_out_pct") or 0.25)
+        need_pct = float(settings.get("needs_more_pct") or 0.85)
+        built_pct = max(0.05, min(0.95, built_pct))
+        need_pct = max(0.05, min(0.95, need_pct))
+
+        rows = []
+        for v in villages:
+            vid = str(v.get("id") or "")
+            if not vid:
+                continue
+            inc = incoming.get(vid) or incoming.get(int(vid) if vid.isdigit() else vid) or {}
+            if not isinstance(inc, dict):
+                inc = {}
+            rows.append({
+                "id": vid,
+                "name": str(v.get("name") or vid),
+                "x": int(v.get("x") or 0),
+                "y": int(v.get("y") or 0),
+                "points": int(v.get("points") or 0),
+                "wood": int(v.get("wood") or 0),
+                "stone": int(v.get("stone") or 0),
+                "iron": int(v.get("iron") or 0),
+                "warehouse": max(1, int(v.get("warehouse") or 1)),
+                "merchants": max(0, int(v.get("merchants") or 0)),
+                "farmUsed": int(v.get("farmUsed") or 0),
+                "inc_wood": int(inc.get("wood") or 0),
+                "inc_stone": int(inc.get("stone") or 0),
+                "inc_iron": int(inc.get("iron") or 0),
+            })
+        if not rows:
+            return []
+
+        rows.sort(key=lambda r: r["points"], reverse=True)
+        n = len(rows)
+        total_w = sum(r["wood"] + r["inc_wood"] for r in rows)
+        total_s = sum(r["stone"] + r["inc_stone"] for r in rows)
+        total_i = sum(r["iron"] + r["inc_iron"] for r in rows)
+        avg_w = total_w // n
+        avg_s = total_s // n
+        avg_i = total_i // n
+
+        if not is_mint:
+            # Küçük depolar ortalamayı şişirmesin — Sophie correction (sade)
+            act_w, act_s, act_i = total_w, total_s, total_i
+            cnt_w = cnt_s = cnt_i = n
+            aw, as_, ai = avg_w, avg_s, avg_i
+            for r in rows:
+                wh = r["warehouse"]
+                if wh < aw and cnt_w > 1:
+                    act_w -= max(0, aw - int(wh * need_pct))
+                    cnt_w -= 1
+                    aw = act_w // max(1, cnt_w)
+                if wh < as_ and cnt_s > 1:
+                    act_s -= max(0, as_ - int(wh * need_pct))
+                    cnt_s -= 1
+                    as_ = act_s // max(1, cnt_s)
+                if wh < ai and cnt_i > 1:
+                    act_i -= max(0, ai - int(wh * need_pct))
+                    cnt_i -= 1
+                    ai = act_i // max(1, cnt_i)
+            avg_w, avg_s, avg_i = aw, as_, ai
+
+        excess = []
+        shortage = []
+        for r in rows:
+            iw, is_, ii = r["inc_wood"], r["inc_stone"], r["inc_iron"]
+            wh = r["warehouse"]
+            tw = r["wood"] + iw
+            ts = r["stone"] + is_
+            ti = r["iron"] + ii
+
+            if avg_w < wh * need_pct:
+                temp_w = tw - avg_w
+            else:
+                temp_w = -int(wh * need_pct - iw - r["wood"])
+            if avg_s < wh * need_pct:
+                temp_s = ts - avg_s
+            else:
+                temp_s = -int(wh * need_pct - is_ - r["stone"])
+            if avg_i < wh * need_pct:
+                temp_i = ti - avg_i
+            else:
+                temp_i = -int(wh * need_pct - ii - r["iron"])
+
+            if not is_mint and (r["farmUsed"] > high_farm or r["points"] > high_pts):
+                if tw > built_pct * wh:
+                    temp_w = int(tw - built_pct * wh)
+                if ts > built_pct * wh:
+                    temp_s = int(ts - built_pct * wh)
+                if ti > built_pct * wh:
+                    temp_i = int(ti - built_pct * wh)
+
+            if not is_mint and r["points"] < low_pts:
+                temp_w = -int(wh * need_pct - r["wood"] - iw)
+                temp_s = -int(wh * need_pct - r["stone"] - is_)
+                temp_i = -int(wh * need_pct - r["iron"] - ii)
+
+            if temp_w > 0:
+                temp_w = min(temp_w, r["wood"])
+            if temp_s > 0:
+                temp_s = min(temp_s, r["stone"])
+            if temp_i > 0:
+                temp_i = min(temp_i, r["iron"])
+
+            def floor_k(x):
+                return (int(x) // 1000) * 1000
+
+            ex_w = floor_k(temp_w) if temp_w > 0 else 0
+            sh_w = floor_k(-temp_w) if temp_w < 0 else 0
+            ex_s = floor_k(temp_s) if temp_s > 0 else 0
+            sh_s = floor_k(-temp_s) if temp_s < 0 else 0
+            ex_i = floor_k(temp_i) if temp_i > 0 else 0
+            sh_i = floor_k(-temp_i) if temp_i < 0 else 0
+
+            excess.append({"id": r["id"], "name": r["name"], "x": r["x"], "y": r["y"],
+                           "wood": ex_w, "stone": ex_s, "iron": ex_i, "merchants": r["merchants"]})
+            shortage.append({"id": r["id"], "name": r["name"], "x": r["x"], "y": r["y"],
+                             "wood": sh_w, "stone": sh_s, "iron": sh_i})
+
+        # Merchant orders from excess
+        orders = []
+        for e in excess:
+            total_ex = e["wood"] + e["stone"] + e["iron"]
+            if total_ex <= 0 or e["merchants"] <= 0:
+                continue
+            need_m = total_ex // 1000
+            if need_m <= e["merchants"]:
+                orders.append({
+                    "id": e["id"], "name": e["name"], "x": e["x"], "y": e["y"],
+                    "wood": e["wood"] // 1000, "stone": e["stone"] // 1000, "iron": e["iron"] // 1000,
+                })
+            else:
+                pw = e["wood"] / total_ex
+                ps = e["stone"] / total_ex
+                pi = e["iron"] / total_ex
+                m = e["merchants"]
+                orders.append({
+                    "id": e["id"], "name": e["name"], "x": e["x"], "y": e["y"],
+                    "wood": int(pw * m), "stone": int(ps * m), "iron": int(pi * m),
+                })
+
+        def dist(a, b):
+            return int(round(math.hypot(a["x"] - b["x"], a["y"] - b["y"])))
+
+        raw_links = []
+
+        def assign_resource(res_key: str):
+            for q in range(len(shortage) - 1, -1, -1):
+                need = int(shortage[q][res_key] or 0)
+                if need <= 0:
+                    continue
+                for o in orders:
+                    o["distance"] = dist(o, shortage[q])
+                orders.sort(key=lambda o: o.get("distance", 9999))
+                while need > 0:
+                    traded = 0
+                    for o in orders:
+                        avail = int(o[res_key] or 0) * 1000
+                        if avail <= 0:
+                            continue
+                        traded += avail
+                        if need <= avail:
+                            raw_links.append({
+                                "source": o["id"], "source_name": o["name"],
+                                "target": shortage[q]["id"], "target_name": shortage[q]["name"],
+                                "wood": need if res_key == "wood" else 0,
+                                "stone": need if res_key == "stone" else 0,
+                                "iron": need if res_key == "iron" else 0,
+                            })
+                            o[res_key] -= need // 1000
+                            shortage[q][res_key] = 0
+                            need = 0
+                            break
+                        else:
+                            raw_links.append({
+                                "source": o["id"], "source_name": o["name"],
+                                "target": shortage[q]["id"], "target_name": shortage[q]["name"],
+                                "wood": avail if res_key == "wood" else 0,
+                                "stone": avail if res_key == "stone" else 0,
+                                "iron": avail if res_key == "iron" else 0,
+                            })
+                            need -= avail
+                            shortage[q][res_key] = need
+                            o[res_key] = 0
+                    if traded <= 0:
+                        break
+
+        assign_resource("wood")
+        assign_resource("stone")
+        assign_resource("iron")
+
+        # Merge same source→target
+        merged = {}
+        for L in raw_links:
+            key = (L["source"], L["target"])
+            if key not in merged:
+                merged[key] = dict(L)
+            else:
+                merged[key]["wood"] += int(L.get("wood") or 0)
+                merged[key]["stone"] += int(L.get("stone") or 0)
+                merged[key]["iron"] += int(L.get("iron") or 0)
+
+        by_id = {r["id"]: r for r in rows}
+        out = []
+        for L in merged.values():
+            if int(L.get("wood") or 0) + int(L.get("stone") or 0) + int(L.get("iron") or 0) <= 0:
+                continue
+            s = by_id.get(L["source"], {})
+            t = by_id.get(L["target"], {})
+            L["distance"] = int(round(math.hypot(
+                int(s.get("x", 0)) - int(t.get("x", 0)),
+                int(s.get("y", 0)) - int(t.get("y", 0)),
+            )))
+            out.append(L)
+        out.sort(key=lambda x: x.get("distance", 9999))
+        return out
+
+    def _wb_send_row(self, dlg: "DepoDengeDialog", row_index: int):
+        if self._human_verification_required:
+            QMessageBox.warning(dlg, "Depo Denge", "Doğrulama bekleniyor — gönderim yok.")
+            return
+        blocked, reason = self._gold_army_dispatch_blocks()
+        if blocked:
+            QMessageBox.warning(dlg, "Depo Denge", f"Ordu gönderimi çakışması:\n{reason}")
+            return
+        if getattr(self, "_wb_sending", False):
+            return
+        links = getattr(dlg, "_links", None) or []
+        if row_index < 0 or row_index >= len(links):
+            return
+        link = links[row_index]
+        if int(link.get("wood") or 0) + int(link.get("stone") or 0) + int(link.get("iron") or 0) <= 0:
+            return
+        if not self.browser:
+            return
+
+        self._wb_sending = True
+        import uuid
+        cmd_id = "wb_" + uuid.uuid4().hex[:12]
+        src = str(link["source"])
+        tgt = str(link["target"])
+        wood = int(link.get("wood") or 0)
+        stone = int(link.get("stone") or 0)
+        iron = int(link.get("iron") or 0)
+
+        js = f"""
+        (function() {{
+            var cmdId = {json.dumps(cmd_id)};
+            if (!window.__tw_bot_results) window.__tw_bot_results = {{}};
+            if (window.__tw_bot_results[cmdId]) return;
+            window.__tw_bot_results[cmdId] = 'SENDING';
+            var payload = {{
+                target_id: {json.dumps(tgt)},
+                wood: {wood},
+                stone: {stone},
+                iron: {iron}
+            }};
+            try {{
+                if (typeof TribalWars !== 'undefined' && typeof TribalWars.post === 'function') {{
+                    TribalWars.post('market', {{ajaxaction: 'map_send', village: {json.dumps(src)}}},
+                        payload,
+                        function(e) {{
+                            window.__tw_bot_results[cmdId] = 'OK';
+                        }},
+                        function() {{
+                            window.__tw_bot_results[cmdId] = 'ERROR|TribalWars.post';
+                        }}
+                    );
+                    return;
+                }}
+            }} catch (e1) {{}}
+            var csrf = (typeof csrf_token !== 'undefined' && csrf_token) ? csrf_token :
+                ((game_data && game_data.csrf) ? game_data.csrf : '');
+            if (!csrf) {{
+                window.__tw_bot_results[cmdId] = 'ERROR|CSRF yok';
+                return;
+            }}
+            var url = '/game.php?village=' + encodeURIComponent({json.dumps(src)}) +
+                '&screen=market&ajaxaction=map_send';
+            var body = 'target_id=' + encodeURIComponent({json.dumps(tgt)}) +
+                '&wood=' + encodeURIComponent(String({wood})) +
+                '&stone=' + encodeURIComponent(String({stone})) +
+                '&iron=' + encodeURIComponent(String({iron})) +
+                '&h=' + encodeURIComponent(csrf);
+            fetch(url, {{
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: {{
+                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                    'TribalWars-Ajax': '1',
+                    'X-Requested-With': 'XMLHttpRequest'
+                }},
+                body: body
+            }}).then(function(r) {{
+                return r.text().then(function(t) {{
+                    var low = (t || '').toLowerCase();
+                    if (!r.ok) {{
+                        window.__tw_bot_results[cmdId] = 'ERROR|HTTP_' + r.status;
+                        return;
+                    }}
+                    try {{
+                        var d = JSON.parse(t);
+                        if (d && (d.error || d.errors)) {{
+                            window.__tw_bot_results[cmdId] = 'ERROR|' + (d.error || 'errors');
+                            return;
+                        }}
+                    }} catch (e) {{}}
+                    if (low.indexOf('error') >= 0 && low.indexOf('success') < 0 && low.indexOf('message') < 0) {{
+                        window.__tw_bot_results[cmdId] = 'VERIFY';
+                    }} else {{
+                        window.__tw_bot_results[cmdId] = 'OK';
+                    }}
+                }});
+            }}).catch(function(e) {{
+                window.__tw_bot_results[cmdId] = 'ERROR|' + String(e);
+            }});
+        }})();
+        """
+        self.browser.page().runJavaScript(js)
+        QTimer.singleShot(self.TW_JS_POLL_MS, lambda: self._wb_poll_send(dlg, cmd_id, row_index, 0))
+
+    def _wb_poll_send(self, dlg, cmd_id: str, row_index: int, attempt: int):
+        if attempt > 40:
+            self._wb_sending = False
+            self._add_log("DEPO", "warn", "Gönderim zaman aşımı")
+            try:
+                dlg.set_busy(False, "Durum: Gönderim zaman aşımı")
+            except RuntimeError:
+                pass
+            return
+        check = (
+            f"(function(){{ var x=window.__tw_bot_results&&window.__tw_bot_results[{json.dumps(cmd_id)}]; "
+            f"return x==null?'WAITING':x; }})();"
+        )
+
+        def on_poll(result):
+            res = str(result or "").strip()
+            if res in ("WAITING", "SENDING", ""):
+                QTimer.singleShot(
+                    self.TW_JS_POLL_MS,
+                    lambda: self._wb_poll_send(dlg, cmd_id, row_index, attempt + 1),
+                )
+                return
+            self.browser.page().runJavaScript(
+                f"delete window.__tw_bot_results[{json.dumps(cmd_id)}];"
+            )
+            self._wb_sending = False
+            if res in ("OK", "VERIFY"):
+                self._add_log("DEPO", "success", f"Kaynak gönderildi (satır {row_index + 1})")
+                try:
+                    dlg.remove_row_by_link_index(row_index)
+                except RuntimeError:
+                    pass
+            else:
+                err = res.split("|", 1)[-1] if "|" in res else res
+                self._add_log("DEPO", "warn", f"Gönderim hata: {err}")
+                try:
+                    dlg.set_busy(False, f"Durum: Hata — {err[:60]}")
+                except RuntimeError:
+                    pass
+
+        self.browser.page().runJavaScript(check, on_poll)
 
     def _tw_set_fake_targets_from_map(self, coords_text: str) -> None:
         """Harita seçiciden gelen koordinatları Fake planı hedef alanına yazar."""
@@ -16234,23 +17202,22 @@ class TribalWarsBot(QMainWindow):
         row1.addStretch()
         layout.addLayout(row1)
 
-        # Mod: toplu (tüm köyler) | köy köy (aktif liste)
-        mode_row = QHBoxLayout()
-        mode_row.setSpacing(10)
-        mode_row.addWidget(QLabel("Mod:"))
-        self.scav_mode_group = QButtonGroup(self)
-        self.scav_mode_mass = QRadioButton("Toplu (tüm köyler)")
-        self.scav_mode_village = QRadioButton("Köy köy (liste)")
-        self.scav_mode_mass.setChecked(True)
-        self.scav_mode_group.addButton(self.scav_mode_mass, 0)
-        self.scav_mode_group.addButton(self.scav_mode_village, 1)
-        self.scav_mode_mass.toggled.connect(self._scav_on_mode_changed)
-        mode_row.addWidget(self.scav_mode_mass)
-        mode_row.addWidget(self.scav_mode_village)
-        mode_hint = QLabel("Köy köy: Asker sekmesi gibi köy + birim ekleyin. Toplu: aşağıdaki birimler tüm köylere.")
-        mode_hint.setStyleSheet("font-size: 9px; color: #666;")
-        mode_row.addWidget(mode_hint, 1)
-        layout.addLayout(mode_row)
+        # Köy grubu (şablonlu destek ile aynı kaynak: village_groups)
+        group_row = QHBoxLayout()
+        group_row.setSpacing(8)
+        group_row.addWidget(QLabel("Köy grubu:"))
+        self.scav_group_combo = QComboBox()
+        self.scav_group_combo.setMinimumWidth(200)
+        self.scav_group_combo.setToolTip(
+            "Yalnızca seçili gruptaki köylere temizlik gönderilir.\n"
+            "«Tüm köyler» = filtre yok. Gruplar: Veriyi yenile."
+        )
+        self.scav_group_combo.currentIndexChanged.connect(self._scav_on_group_changed)
+        group_row.addWidget(self.scav_group_combo)
+        group_hint = QLabel("Gruplar oyundan gelir (Veriyi yenile).")
+        group_hint.setStyleSheet("font-size: 9px; color: #666;")
+        group_row.addWidget(group_hint, 1)
+        layout.addLayout(group_row)
 
         scav_split = QSplitter(Qt.Vertical)
         scav_split.setChildrenCollapsible(False)
@@ -16282,7 +17249,7 @@ class TribalWarsBot(QMainWindow):
         mass_u_lay = QHBoxLayout(self.scav_mass_units_wrap)
         mass_u_lay.setContentsMargins(0, 0, 0, 0)
         mass_u_lay.setSpacing(6)
-        mass_u_lay.addWidget(QLabel("Birimler (toplu):"))
+        mass_u_lay.addWidget(QLabel("Birimler:"))
         self.scav_unit_cbs = {}
         for key, name in self.SCAV_UNITS:
             cb = QCheckBox(name)
@@ -16294,76 +17261,6 @@ class TribalWarsBot(QMainWindow):
         self.scav_unit_cbs["sword"].setChecked(True)
         mass_u_lay.addStretch()
         opt_layout.addWidget(self.scav_mass_units_wrap)
-
-        # ── Köy köy panel (Asker sekmesi benzeri) ──
-        self.scav_pv_panel = QWidget()
-        pv_lay = QVBoxLayout(self.scav_pv_panel)
-        pv_lay.setContentsMargins(0, 0, 0, 0)
-        pv_lay.setSpacing(4)
-
-        pv_vsel = QGroupBox("1. Köyleri seçin")
-        pv_vsel_lay = QVBoxLayout(pv_vsel)
-        pv_vsel_lay.setContentsMargins(4, 4, 4, 4)
-        self.scav_vsel_table = QTreeWidget()
-        self.scav_vsel_table.setRootIsDecorated(False)
-        self.scav_vsel_table.setAlternatingRowColors(True)
-        self.scav_vsel_table.setHeaderLabels(["Köy", "Koordinat"])
-        self.scav_vsel_table.header().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.scav_vsel_table.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.scav_vsel_table.setMaximumHeight(140)
-        pv_vsel_lay.addWidget(self.scav_vsel_table)
-        pv_lay.addWidget(pv_vsel)
-
-        pv_urow = QHBoxLayout()
-        pv_usel = QGroupBox("2. Birimleri seçip Ekle")
-        pv_usel_lay = QHBoxLayout(pv_usel)
-        pv_usel_lay.setContentsMargins(6, 4, 6, 4)
-        pv_usel_lay.setSpacing(6)
-        self.scav_pv_unit_cbs = {}
-        for key, name in self.SCAV_UNITS:
-            cb = QCheckBox(name)
-            cb.setStyleSheet("font-size: 10px;")
-            troop_icon_mgr.apply_to_checkbox(cb, key)
-            pv_usel_lay.addWidget(cb)
-            self.scav_pv_unit_cbs[key] = cb
-        self.scav_pv_unit_cbs["spear"].setChecked(True)
-        self.scav_pv_unit_cbs["sword"].setChecked(True)
-        pv_usel_lay.addStretch()
-        pv_urow.addWidget(pv_usel, 1)
-        self.scav_pv_add_btn = QPushButton("➕ Ekle")
-        self.scav_pv_add_btn.setObjectName("startBtn")
-        self.scav_pv_add_btn.setCursor(Qt.PointingHandCursor)
-        self.scav_pv_add_btn.setMinimumWidth(80)
-        self.scav_pv_add_btn.setMinimumHeight(40)
-        self.scav_pv_add_btn.clicked.connect(self._scav_pv_add_villages)
-        pv_urow.addWidget(self.scav_pv_add_btn)
-        pv_lay.addLayout(pv_urow)
-
-        pv_active = QGroupBox("Aktif temizlik köyleri")
-        pv_active_lay = QVBoxLayout(pv_active)
-        pv_active_lay.setContentsMargins(4, 4, 4, 4)
-        self.scav_pv_table = QTreeWidget()
-        self.scav_pv_table.setRootIsDecorated(False)
-        self.scav_pv_table.setAlternatingRowColors(True)
-        self.scav_pv_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.scav_pv_table.setHeaderLabels(["Köy", "Birimler", "Durum"])
-        self.scav_pv_table.header().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.scav_pv_table.header().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.scav_pv_table.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.scav_pv_table.setMaximumHeight(160)
-        pv_active_lay.addWidget(self.scav_pv_table)
-        pv_btn_row = QHBoxLayout()
-        self.scav_pv_remove_btn = QPushButton("Seçileni kaldır")
-        self.scav_pv_remove_btn.clicked.connect(self._scav_pv_remove_selected)
-        pv_btn_row.addWidget(self.scav_pv_remove_btn)
-        self.scav_pv_clear_btn = QPushButton("Listeyi temizle")
-        self.scav_pv_clear_btn.clicked.connect(self._scav_pv_clear)
-        pv_btn_row.addWidget(self.scav_pv_clear_btn)
-        pv_btn_row.addStretch()
-        pv_active_lay.addLayout(pv_btn_row)
-        pv_lay.addWidget(pv_active)
-        self.scav_pv_panel.setVisible(False)
-        opt_layout.addWidget(self.scav_pv_panel)
 
         # Evde tut (Sophie keepHome)
         kh_row = QHBoxLayout()
@@ -16486,182 +17383,99 @@ class TribalWarsBot(QMainWindow):
         self._scav_next_send = 0
         self._scav_villages_cache = []  # Tüm köy verileri
         self._scav_world_meta = {}  # duration_factor, duration_exponent, duration_initial_seconds
-        self._scav_village_profiles = {}  # vid -> {units: set, row: QTreeWidgetItem}
-        self._scav_load_profiles()
-        self._scav_on_mode_changed()
-        QTimer.singleShot(0, self._scav_refresh_vsel)
+        self._refresh_scav_groups()
 
     # ── TEMİZLİK (TOPLU) FONKSİYONLAR ────────
 
-    def _scav_get_mode(self) -> str:
-        if getattr(self, "scav_mode_village", None) and self.scav_mode_village.isChecked():
-            return "village"
-        return "mass"
+    def _refresh_scav_groups(self) -> None:
+        """Temizlik sekmesindeki köy grubu combobox'ını village_groups ile güncelle."""
+        cb = getattr(self, "scav_group_combo", None)
+        if cb is None:
+            return
+        groups = self._game_data.get("village_groups") or []
 
-    def _scav_on_mode_changed(self, *_args):
-        village = self._scav_get_mode() == "village"
-        if hasattr(self, "scav_mass_units_wrap"):
-            self.scav_mass_units_wrap.setVisible(not village)
-        if hasattr(self, "scav_pv_panel"):
-            self.scav_pv_panel.setVisible(village)
-        try:
-            self._settings.setValue("scav/mode", "village" if village else "mass")
-        except Exception:
-            pass
-        if village:
-            self._scav_refresh_vsel()
-
-    def _scav_refresh_vsel(self):
-        """Köy köy seçim tablosunu oyun verisinden doldur."""
-        if not hasattr(self, "scav_vsel_table"):
-            return
-        all_v = self._game_data.get("all_villages") or []
-        if not all_v:
-            v = self._game_data.get("village", {})
-            if v:
-                all_v = [v]
-        self.scav_vsel_table.clear()
-        for v in _tw_sorted_player_villages(all_v):
-            vid = str(v.get("id", "") or "")
-            if not vid:
-                continue
-            coord = f"({v.get('x', '?')}|{v.get('y', '?')})"
-            name = v.get("name", "?")
-            row = QTreeWidgetItem([name, coord])
-            row.setCheckState(0, Qt.Unchecked)
-            row.setFlags(row.flags() | Qt.ItemIsUserCheckable)
-            row.setData(0, Qt.UserRole, vid)
-            self.scav_vsel_table.addTopLevelItem(row)
-        # Aktif liste etiketlerini güncelle
-        profiles = getattr(self, "_scav_village_profiles", {}) or {}
-        for v in all_v:
-            vid = str(v.get("id", "") or "")
-            st = profiles.get(vid)
-            if not st or not st.get("row"):
-                continue
-            coord = f"({v.get('x', '?')}|{v.get('y', '?')})"
-            st["row"].setText(0, f"{v.get('name', '?')} {coord}")
-
-    def _scav_pv_add_villages(self):
-        if not hasattr(self, "scav_vsel_table"):
-            return
-        checked = []
-        for i in range(self.scav_vsel_table.topLevelItemCount()):
-            it = self.scav_vsel_table.topLevelItem(i)
-            if it and it.checkState(0) == Qt.Checked:
-                vid = it.data(0, Qt.UserRole)
-                if vid:
-                    checked.append((str(vid), it.text(0), it.text(1)))
-        if not checked:
-            QMessageBox.warning(self, "Uyarı", "Üst listeden en az bir köy seçin.")
-            return
-        selected_units = {k for k, cb in self.scav_pv_unit_cbs.items() if cb.isChecked()}
-        if not selected_units:
-            QMessageBox.warning(self, "Uyarı", "En az bir birim seçin.")
-            return
-        unit_short = ", ".join(
-            self.SCAV_UNIT_SHORT.get(k, k)
-            for k, _ in self.SCAV_UNITS
-            if k in selected_units
-        )
-        if not hasattr(self, "_scav_village_profiles"):
-            self._scav_village_profiles = {}
-        added = updated = 0
-        for vid, vname, coord in checked:
-            label = f"{vname} {coord}"
-            if vid in self._scav_village_profiles:
-                st = self._scav_village_profiles[vid]
-                st["units"] = set(selected_units)
-                st["row"].setText(1, unit_short)
-                st["row"].setText(2, "Hazır")
-                updated += 1
+        if cb.count() > 0:
+            prev = cb.currentData()
+            if isinstance(prev, dict):
+                want = str(prev.get("id", "") or "")
             else:
-                row = QTreeWidgetItem([label, unit_short, "Hazır"])
-                self.scav_pv_table.addTopLevelItem(row)
-                self._scav_village_profiles[vid] = {"units": set(selected_units), "row": row}
-                added += 1
-        self._scav_save_profiles()
-        parts = []
-        if added:
-            parts.append(f"{added} yeni")
-        if updated:
-            parts.append(f"{updated} güncellendi")
-        self._add_log("TEMİZLİK", "info", f"Köy köy liste: {', '.join(parts)} — {unit_short}")
+                want = ""  # «Tüm köyler» seçili
+        else:
+            try:
+                want = (self._settings.value("scav/selected_group_id", "") or "").strip()
+            except Exception:
+                want = ""
 
-    def _scav_pv_remove_selected(self):
-        if not hasattr(self, "scav_pv_table"):
+        cb.blockSignals(True)
+        cb.clear()
+        cb.addItem("— Tüm köyler —", None)
+        for g in groups:
+            gid = str(g.get("id", "") or "")
+            name = (g.get("name") or "").strip() or gid
+            gtype = (g.get("type") or "static").strip()
+            cb.addItem(f"{name} ({gtype})", g)
+
+        if want:
+            for i in range(cb.count()):
+                g = cb.itemData(i)
+                if g and str(g.get("id", "")) == want:
+                    cb.setCurrentIndex(i)
+                    break
+            else:
+                cb.setCurrentIndex(0)
+        else:
+            cb.setCurrentIndex(0)
+        cb.blockSignals(False)
+
+    def _scav_on_group_changed(self, *_args):
+        cb = getattr(self, "scav_group_combo", None)
+        if cb is None:
             return
-        items = self.scav_pv_table.selectedItems()
-        if not items:
-            return
-        to_remove = {id(it) for it in items}
-        for vid in list(self._scav_village_profiles.keys()):
-            st = self._scav_village_profiles[vid]
-            if id(st.get("row")) in to_remove:
-                idx = self.scav_pv_table.indexOfTopLevelItem(st["row"])
-                if idx >= 0:
-                    self.scav_pv_table.takeTopLevelItem(idx)
-                del self._scav_village_profiles[vid]
-        self._scav_save_profiles()
-
-    def _scav_pv_clear(self):
-        if hasattr(self, "scav_pv_table"):
-            self.scav_pv_table.clear()
-        self._scav_village_profiles = {}
-        self._scav_save_profiles()
-        self._add_log("TEMİZLİK", "info", "Köy köy liste temizlendi")
-
-    def _scav_save_profiles(self):
+        g = cb.currentData()
+        gid = str(g.get("id", "") or "") if isinstance(g, dict) else ""
         try:
-            payload = {
-                vid: {"units": sorted(list(st.get("units") or []))}
-                for vid, st in (self._scav_village_profiles or {}).items()
-            }
-            self._settings.setValue("scav/village_profiles", json.dumps(payload, ensure_ascii=False))
-            self._settings.setValue("scav/mode", self._scav_get_mode())
+            self._settings.setValue("scav/selected_group_id", gid)
             self._settings.sync()
         except Exception:
             pass
+        cache = getattr(self, "_scav_villages_cache", None) or []
+        if cache:
+            self._scav_update_table(cache)
 
-    def _scav_load_profiles(self):
-        self._scav_village_profiles = {}
-        try:
-            mode = (self._settings.value("scav/mode", "mass") or "mass").strip().lower()
-            if mode == "village" and hasattr(self, "scav_mode_village"):
-                self.scav_mode_village.blockSignals(True)
-                self.scav_mode_village.setChecked(True)
-                self.scav_mode_village.blockSignals(False)
-            raw = self._settings.value("scav/village_profiles", "") or ""
-            if not raw:
-                return
-            data = json.loads(str(raw))
-            if not isinstance(data, dict) or not hasattr(self, "scav_pv_table"):
-                return
-            for vid, meta in data.items():
-                units = set(meta.get("units") or []) if isinstance(meta, dict) else set()
-                units = {u for u in units if u in dict(self.SCAV_UNITS)}
-                if not units:
-                    continue
-                unit_short = ", ".join(
-                    self.SCAV_UNIT_SHORT.get(k, k)
-                    for k, _ in self.SCAV_UNITS
-                    if k in units
-                )
-                row = QTreeWidgetItem([f"Köy {vid}", unit_short, "Hazır"])
-                self.scav_pv_table.addTopLevelItem(row)
-                self._scav_village_profiles[str(vid)] = {"units": units, "row": row}
-        except Exception:
-            self._scav_village_profiles = {}
+    def _scav_group_label(self) -> str:
+        cb = getattr(self, "scav_group_combo", None)
+        if cb is None or cb.count() <= 0:
+            return "tüm köyler"
+        g = cb.currentData()
+        if not isinstance(g, dict):
+            return "tüm köyler"
+        name = (g.get("name") or "").strip()
+        return name or "grup"
+
+    def _scav_allowed_village_ids(self):
+        """None = filtre yok (tüm köyler); set = yalnızca gruptaki köy id'leri."""
+        cb = getattr(self, "scav_group_combo", None)
+        if cb is None or cb.count() <= 0:
+            return None
+        g = cb.currentData()
+        if not isinstance(g, dict):
+            return None
+        group_name = (g.get("name") or "").strip()
+        group_id = str(g.get("id", "") or "")
+        group_type = (g.get("type") or "static").strip()
+        if not group_name:
+            return set()
+        all_v = self._game_data.get("all_villages") or []
+        return {
+            str(v.get("id", "") or "")
+            for v in all_v
+            if v
+            and str(v.get("id", "") or "")
+            and self._sa_village_in_group(v, group_id, group_name, group_type)
+        }
 
     def _scav_send_order_for_village(self, village_id) -> list:
-        """Köy için gönderilecek birim sırası (moda göre)."""
-        vid = str(village_id or "")
-        if self._scav_get_mode() == "village":
-            st = (self._scav_village_profiles or {}).get(vid)
-            if not st:
-                return []
-            selected = st.get("units") or set()
-            return [k for k, _ in self.SCAV_UNITS if k in selected]
+        """Köy için gönderilecek birim sırası (ortak birim seçimi)."""
         return [k for k, _ in self.SCAV_UNITS if self.scav_unit_cbs[k].isChecked()]
 
     RT_UNITS = [
@@ -16700,30 +17514,29 @@ class TribalWarsBot(QMainWindow):
     def _scav_start(self):
         if not self._license_require_or_prompt("Temizlik"):
             return
-        if self._scav_get_mode() == "village":
-            if not (self._scav_village_profiles or {}):
-                QMessageBox.warning(
-                    self,
-                    "Uyarı",
-                    "Köy köy modunda aktif liste boş.\n"
-                    "Köy ve birim seçip «Ekle»ye basın (veya Toplu moda geçin).",
-                )
-                return
-        else:
-            any_checked = any(cb.isChecked() for cb in self.scav_unit_cbs.values())
-            if not any_checked:
-                QMessageBox.warning(self, "Uyarı", "En az bir birim türü seçin!")
-                return
+        any_checked = any(cb.isChecked() for cb in self.scav_unit_cbs.values())
+        if not any_checked:
+            QMessageBox.warning(self, "Uyarı", "En az bir birim türü seçin!")
+            return
+        allowed = self._scav_allowed_village_ids()
+        if allowed is not None and not allowed:
+            QMessageBox.warning(
+                self,
+                "Uyarı",
+                "Seçili köy grubunda köy yok.\n"
+                "Veriyi yenileyin veya başka bir grup / «Tüm köyler» seçin.",
+            )
+            return
         self.scav_enable_cb.setChecked(True)
         self._scav_active = True
         self._automation_mark_started("scav")
         self._scav_next_send = 0
         self.scav_start_btn.setEnabled(False)
         self.scav_stop_btn.setEnabled(True)
-        mode_lbl = "köy köy" if self._scav_get_mode() == "village" else "toplu"
-        self.scav_status_label.setText(f"Durum: Aktif ({mode_lbl})")
+        grp_lbl = self._scav_group_label()
+        self.scav_status_label.setText(f"Durum: Aktif ({grp_lbl})")
         self.scav_status_label.setStyleSheet("font-size: 10px; color: #228822;")
-        self._add_log("TEMİZLİK", "success", f"▶ Temizlik başlatıldı — mod: {mode_lbl}")
+        self._add_log("TEMİZLİK", "success", f"▶ Temizlik başlatıldı — grup: {grp_lbl}")
         self._scav_process()
 
     def _scav_stop(self):
@@ -17113,8 +17926,7 @@ class TribalWarsBot(QMainWindow):
                           "light":"HSv","marcher":"AOk","heavy":"ASv","knight":"Şöv",
                           "spy":"Cas","ram":"Koç","catapult":"Man","snob":"Mis"}
 
-            village_mode = self._scav_get_mode() == "village"
-            profiles = self._scav_village_profiles or {}
+            allowed_ids = self._scav_allowed_village_ids()
             global_units = [k for k, cb in self.scav_unit_cbs.items() if cb.isChecked()]
 
             for v in villages:
@@ -17122,14 +17934,9 @@ class TribalWarsBot(QMainWindow):
                 opts = v.get("options", {})
                 uch = v.get("unit_counts_home") or {}
                 vid = str(v.get("village_id") or "")
-                if village_mode:
-                    st = profiles.get(vid)
-                    if st:
-                        selected_units = [k for k, _ in self.SCAV_UNITS if k in (st.get("units") or set())]
-                    else:
-                        selected_units = []  # listede yok — tabloda birim gösterme
-                else:
-                    selected_units = global_units
+                if allowed_ids is not None and vid not in allowed_ids:
+                    continue
+                selected_units = global_units
 
                 # Gösterim: seçili birimler − evde tut
                 available = {}
@@ -17188,9 +17995,6 @@ class TribalWarsBot(QMainWindow):
 
                 status = f"{free_count} boş" if free_count > 0 else "Tümü dolu"
                 status_color = "#228822" if free_count > 0 else "#2d5a9e"
-                if village_mode and vid not in profiles:
-                    status = "Listede yok"
-                    status_color = "#888888"
 
                 # Köy bazlı: açık slotların tamamı boşalana kadar süre (UI geri sayımı)
                 ready_col = 5
@@ -17387,11 +18191,14 @@ class TribalWarsBot(QMainWindow):
         time_def = float(self.scav_rt_def.value())
         prioritise_high = self.scav_prio_highfirst.isChecked()
         cat_enabled = {i: self.scav_cat_cbs[i].isChecked() for i in (1, 2, 3, 4)}
-        village_mode = self._scav_get_mode() == "village"
-        profiles = self._scav_village_profiles or {}
+        allowed_ids = self._scav_allowed_village_ids()
 
-        if village_mode and not profiles:
-            self._add_log("TEMİZLİK", "warn", "Köy köy liste boş — gönderim yok.")
+        if allowed_ids is not None and not allowed_ids:
+            self._add_log(
+                "TEMİZLİK",
+                "warn",
+                "Seçili grupta köy yok — gönderim yok (Veriyi yenile / grup değiştir).",
+            )
             self._scav_schedule_next_mass(villages)
             self._scav_checking = False
             return
@@ -17405,7 +18212,7 @@ class TribalWarsBot(QMainWindow):
             opts = v.get("options", {})
             village_id = v.get("village_id")
             vid = str(village_id or "")
-            if village_mode and vid not in profiles:
+            if allowed_ids is not None and vid not in allowed_ids:
                 continue
 
             send_order = self._scav_send_order_for_village(village_id)
@@ -17499,11 +18306,6 @@ class TribalWarsBot(QMainWindow):
             if village_squads:
                 all_squads.extend(village_squads)
                 sent_villages += 1
-                if village_mode and vid in profiles and profiles[vid].get("row"):
-                    try:
-                        profiles[vid]["row"].setText(2, "Gönderiliyor")
-                    except Exception:
-                        pass
 
         if not all_squads:
             self._scav_schedule_next_mass(villages)
@@ -17520,9 +18322,9 @@ class TribalWarsBot(QMainWindow):
 
         all_squads.sort(key=_scav_squad_order)
 
-        mode_lbl = "köy köy" if village_mode else "toplu"
+        grp_lbl = self._scav_group_label()
         self._add_log("TEMİZLİK", "info",
-            f"Gönderim ({mode_lbl}): {len(all_squads)} temizlik, {sent_villages} köy")
+            f"Gönderim ({grp_lbl}): {len(all_squads)} temizlik, {sent_villages} köy")
 
         self._scav_send_batch(all_squads, 0, sent_villages)
 
@@ -17599,13 +18401,12 @@ class TribalWarsBot(QMainWindow):
         """return_time ile yerel bekle — HTTP yalnızca süre dolunca (seyrek uzlaşma üst sınırı)."""
         import time
         now = time.time()
-        village_mode = self._scav_get_mode() == "village"
-        profiles = self._scav_village_profiles or {}
+        allowed_ids = self._scav_allowed_village_ids()
 
         next_wake_delta = None
         for v in villages:
             vid = str(v.get("village_id") or "")
-            if village_mode and vid not in profiles:
+            if allowed_ids is not None and vid not in allowed_ids:
                 continue
             opts = v.get("options", {})
             ready_ts = self._scav_village_next_ready_unix(opts, now)
@@ -17634,16 +18435,6 @@ class TribalWarsBot(QMainWindow):
                 "info",
                 f"⏳ Sonraki HTTP ~{human} (en yakın dönüş; tablo geri sayıyor)",
             )
-            # Köy köy aktif satır durumu
-            if village_mode:
-                for vid, st in profiles.items():
-                    row = st.get("row")
-                    if not row:
-                        continue
-                    try:
-                        row.setText(2, f"Bekliyor ~{human}")
-                    except Exception:
-                        pass
         else:
             # Hepsi boş ama gönderilecek birlik yok / liste boş → seyrek kontrol
             idle_wait = random.randint(240, 420)
@@ -17664,134 +18455,196 @@ class TribalWarsBot(QMainWindow):
         tab = QWidget()
         tab.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(4)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
 
-        row1 = QHBoxLayout()
-        row1.setSpacing(6)
+        # ── Üst: kontrol ──
+        ctrl = QHBoxLayout()
+        ctrl.setSpacing(8)
 
         self.gold_start_btn = QPushButton("▶ Başlat")
         self.gold_start_btn.setObjectName("startBtn")
         self.gold_start_btn.setCursor(Qt.PointingHandCursor)
+        self.gold_start_btn.setMinimumHeight(34)
+        self.gold_start_btn.setMinimumWidth(96)
         self.gold_start_btn.clicked.connect(self._gold_start)
-        row1.addWidget(self.gold_start_btn)
+        ctrl.addWidget(self.gold_start_btn)
 
         self.gold_stop_btn = QPushButton("⏹ Durdur")
         self.gold_stop_btn.setObjectName("stopBtn")
         self.gold_stop_btn.setCursor(Qt.PointingHandCursor)
+        self.gold_stop_btn.setMinimumHeight(34)
+        self.gold_stop_btn.setMinimumWidth(96)
         self.gold_stop_btn.setEnabled(False)
         self.gold_stop_btn.clicked.connect(self._gold_stop)
-        row1.addWidget(self.gold_stop_btn)
+        ctrl.addWidget(self.gold_stop_btn)
 
-        row1.addSpacing(10)
-        row1.addWidget(QLabel("Köy:"))
+        ctrl.addSpacing(12)
+        lbl_v = QLabel("Köy")
+        lbl_v.setStyleSheet("font-weight: 600;")
+        ctrl.addWidget(lbl_v)
         self.gold_village_combo = QComboBox()
-        self.gold_village_combo.setMinimumWidth(220)
+        self.gold_village_combo.setMinimumWidth(260)
+        self.gold_village_combo.setMinimumHeight(30)
         self.gold_village_combo.setStyleSheet(TW_VILLAGE_COMBO_STYLE)
         self.gold_village_combo.addItem("— Köy Seçin —", None)
-        row1.addWidget(self.gold_village_combo)
+        ctrl.addWidget(self.gold_village_combo, 1)
 
-        row1.addSpacing(10)
-        row1.addWidget(QLabel("Bayrak %:"))
+        self.gold_status_label = QLabel("Durum: Bekliyor")
+        self.gold_status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.gold_status_label.setStyleSheet(
+            "font-size: 11px; color: #888; font-weight: 600; padding: 0 4px;"
+        )
+        ctrl.addWidget(self.gold_status_label)
+        layout.addLayout(ctrl)
+
+        # ── Ayarlar: iki kolon ──
+        settings_row = QHBoxLayout()
+        settings_row.setSpacing(8)
+
+        disc_box = QGroupBox("İndirim ve PP")
+        disc_grid = QGridLayout(disc_box)
+        disc_grid.setContentsMargins(10, 12, 10, 10)
+        disc_grid.setHorizontalSpacing(10)
+        disc_grid.setVerticalSpacing(8)
+
+        disc_grid.addWidget(QLabel("Bayrak indirimi"), 0, 0)
         self.gold_discount_flag_spin = QSpinBox()
         self.gold_discount_flag_spin.setRange(0, 99)
+        self.gold_discount_flag_spin.setSuffix(" %")
+        self.gold_discount_flag_spin.setFixedWidth(88)
         _legacy_disc = int(self._settings.value("gold/discount_pct", 0, type=int) or 0)
         self.gold_discount_flag_spin.setValue(
             int(self._settings.value("gold/discount_flag", _legacy_disc, type=int) or 0)
         )
         self.gold_discount_flag_spin.setToolTip("Bayrak altın para indirimi (taban üzerine)")
-        row1.addWidget(self.gold_discount_flag_spin)
+        disc_grid.addWidget(self.gold_discount_flag_spin, 0, 1)
 
-        row1.addWidget(QLabel("Envanter %:"))
+        disc_grid.addWidget(QLabel("Envanter indirimi"), 1, 0)
         self.gold_discount_inv_spin = QSpinBox()
         self.gold_discount_inv_spin.setRange(0, 99)
+        self.gold_discount_inv_spin.setSuffix(" %")
+        self.gold_discount_inv_spin.setFixedWidth(88)
         self.gold_discount_inv_spin.setValue(
             int(self._settings.value("gold/discount_inv", 0, type=int) or 0)
         )
-        self.gold_discount_inv_spin.setToolTip("Envanter altın para indirimi (taban üzerine, çarpımsal)")
-        row1.addWidget(self.gold_discount_inv_spin)
+        self.gold_discount_inv_spin.setToolTip(
+            "Envanter altın para indirimi (taban üzerine, çarpımsal)"
+        )
+        disc_grid.addWidget(self.gold_discount_inv_spin, 1, 1)
 
-        row1.addWidget(QLabel("PP üst sınır:"))
+        disc_grid.addWidget(QLabel("PP üst sınır"), 2, 0)
         self.gold_pp_cap_spin = QSpinBox()
         self.gold_pp_cap_spin.setRange(0, 999999)
+        self.gold_pp_cap_spin.setFixedWidth(88)
+        self.gold_pp_cap_spin.setSpecialValueText("Sınırsız")
         self.gold_pp_cap_spin.setValue(
             int(self._settings.value("gold/pp_cap", 0, type=int) or 0)
         )
         self.gold_pp_cap_spin.setToolTip("0 = sınırsız (oturum harcaması)")
-        row1.addWidget(self.gold_pp_cap_spin)
+        disc_grid.addWidget(self.gold_pp_cap_spin, 2, 1)
 
-        row1.addStretch()
-        layout.addLayout(row1)
+        self.gold_pp_spent_label = QLabel("Harcanan PP: 0")
+        self.gold_pp_spent_label.setStyleSheet("font-size: 11px; color: #888;")
+        disc_grid.addWidget(self.gold_pp_spent_label, 3, 0, 1, 2)
+        disc_grid.setColumnStretch(2, 1)
+        settings_row.addWidget(disc_box, 1)
 
-        row2 = QHBoxLayout()
-        row2.setSpacing(6)
-        row2.addWidget(QLabel("Güvenlik payı:"))
+        time_box = QGroupBox("Zamanlama")
+        time_grid = QGridLayout(time_box)
+        time_grid.setContentsMargins(10, 12, 10, 10)
+        time_grid.setHorizontalSpacing(10)
+        time_grid.setVerticalSpacing(8)
+
+        time_grid.addWidget(QLabel("Güvenlik payı"), 0, 0)
         self.gold_safety_spin = QSpinBox()
         self.gold_safety_spin.setRange(0, 500000)
         self.gold_safety_spin.setSingleStep(500)
+        self.gold_safety_spin.setFixedWidth(100)
         self.gold_safety_spin.setValue(
             int(self._settings.value("gold/safety_margin", 1000, type=int) or 1000)
         )
-        row2.addWidget(self.gold_safety_spin)
+        self.gold_safety_spin.setToolTip("Kaynaklardan bırakılacak güvenlik payı")
+        time_grid.addWidget(self.gold_safety_spin, 0, 1)
 
-        row2.addWidget(QLabel("Başlangıç tamponu (sn):"))
+        time_grid.addWidget(QLabel("Başlangıç tamponu"), 1, 0)
         self.gold_buf_start_spin = QSpinBox()
         self.gold_buf_start_spin.setRange(0, 3600)
+        self.gold_buf_start_spin.setSuffix(" sn")
+        self.gold_buf_start_spin.setFixedWidth(100)
         self.gold_buf_start_spin.setValue(
             int(self._settings.value("gold/buffer_start", 45, type=int) or 45)
         )
-        row2.addWidget(self.gold_buf_start_spin)
+        time_grid.addWidget(self.gold_buf_start_spin, 1, 1)
 
-        row2.addWidget(QLabel("Bitiş tamponu (sn):"))
+        time_grid.addWidget(QLabel("Bitiş tamponu"), 2, 0)
         self.gold_buf_end_spin = QSpinBox()
         self.gold_buf_end_spin.setRange(0, 3600)
+        self.gold_buf_end_spin.setSuffix(" sn")
+        self.gold_buf_end_spin.setFixedWidth(100)
         self.gold_buf_end_spin.setValue(
             int(self._settings.value("gold/buffer_end", 90, type=int) or 90)
         )
-        row2.addWidget(self.gold_buf_end_spin)
+        time_grid.addWidget(self.gold_buf_end_spin, 2, 1)
 
-        row2.addWidget(QLabel("Pencere oranı:"))
+        time_grid.addWidget(QLabel("Pencere oranı"), 3, 0)
         self.gold_window_frac_spin = QDoubleSpinBox()
         self.gold_window_frac_spin.setRange(0.05, 0.95)
         self.gold_window_frac_spin.setSingleStep(0.05)
         self.gold_window_frac_spin.setDecimals(2)
+        self.gold_window_frac_spin.setFixedWidth(100)
         self.gold_window_frac_spin.setValue(
             float(self._settings.value("gold/window_fraction", 0.55, type=float) or 0.55)
         )
         self.gold_window_frac_spin.setToolTip(
             "Depo dolmadan önceki pencerede dönüşüm zamanı (0.55 = ortaya yakın)"
         )
-        row2.addWidget(self.gold_window_frac_spin)
+        time_grid.addWidget(self.gold_window_frac_spin, 3, 1)
+        time_grid.setColumnStretch(2, 1)
+        settings_row.addWidget(time_box, 1)
+        layout.addLayout(settings_row)
 
-        row2.addStretch()
-        layout.addLayout(row2)
-
-        info_row = QHBoxLayout()
-        self.gold_status_label = QLabel("Durum: Bekliyor")
-        self.gold_status_label.setStyleSheet("font-size: 10px; color: #888;")
-        info_row.addWidget(self.gold_status_label, 1)
-        self.gold_pp_spent_label = QLabel("Harcanan PP: 0")
-        self.gold_pp_spent_label.setStyleSheet("font-size: 10px; color: #888;")
-        info_row.addWidget(self.gold_pp_spent_label)
-        layout.addLayout(info_row)
+        # ── Canlı özet ──
+        live_box = QGroupBox("Canlı durum")
+        live_lay = QVBoxLayout(live_box)
+        live_lay.setContentsMargins(10, 12, 10, 10)
+        live_lay.setSpacing(6)
 
         self.gold_res_label = QLabel("Kaynaklar: —")
-        self.gold_res_label.setStyleSheet("font-size: 10px;")
-        layout.addWidget(self.gold_res_label)
+        self.gold_res_label.setWordWrap(True)
+        self.gold_res_label.setStyleSheet("font-size: 12px;")
+        live_lay.addWidget(self.gold_res_label)
 
         self.gold_timer_label = QLabel("Depo dolma: —")
-        self.gold_timer_label.setStyleSheet("font-size: 10px;")
-        layout.addWidget(self.gold_timer_label)
+        self.gold_timer_label.setStyleSheet("font-size: 12px;")
+        live_lay.addWidget(self.gold_timer_label)
 
         self.gold_decision_label = QLabel("Karar: —")
-        self.gold_decision_label.setStyleSheet("font-size: 10px; color: #2d5a9e;")
-        layout.addWidget(self.gold_decision_label)
+        self.gold_decision_label.setWordWrap(True)
+        self.gold_decision_label.setStyleSheet(
+            "font-size: 12px; color: #2d5a9e; font-weight: 600;"
+        )
+        live_lay.addWidget(self.gold_decision_label)
+        layout.addWidget(live_box)
 
+        # ── Günlük ──
+        log_box = QGroupBox("İşlem günlüğü")
+        log_lay = QVBoxLayout(log_box)
+        log_lay.setContentsMargins(8, 10, 8, 8)
         self.gold_log = QTextEdit()
+        self.gold_log.setObjectName("logText")
         self.gold_log.setReadOnly(True)
-        self.gold_log.setMaximumHeight(160)
-        self.gold_log.setStyleSheet("font-size: 10px; font-family: Consolas, monospace;")
-        layout.addWidget(self.gold_log)
+        self.gold_log.setMinimumHeight(140)
+        log_lay.addWidget(self.gold_log)
+        layout.addWidget(log_box, 1)
+
+        hint = QLabel(
+            "Akademi mint ayrıdır; bu sekme depo dolmadan önce PP ile kaynak dengeler "
+            "(merchantexchange). Ordu gönderimi varken otomatik duraklar."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("font-size: 9px; color: #888;")
+        layout.addWidget(hint)
 
         self.gold_tab = tab
         self.tabs.addTab(tab, "🪙 Altın Para")
@@ -19416,13 +20269,26 @@ class TribalWarsBot(QMainWindow):
         self.incomings_auto_tag_cb = QCheckBox("Otomatik etiketleme")
         self.incomings_auto_tag_cb.setCursor(Qt.PointingHandCursor)
         self.incomings_auto_tag_cb.setToolTip(
-            "Açıkken 60–80 sn aralıkla liste sessizce yenilenir; etiketsiz saldırı/destek "
-            "satırlarına tahmini en yavaş birim etiketi AJAX ile yazılır. "
-            "Tarayıcı sayfası değiştirilmez."
+            "Açıkken ~3 dk aralıkla liste sessizce yenilenir; etiketsiz saldırı/destek "
+            "satırlarına oyunun «hepsini seç + Etiket» işlemi uygulanır "
+            "(Yapılandırma Etiketi ayarları geçerli). Tarayıcı sayfası değiştirilmez."
         )
         self.incomings_auto_tag_cb.setChecked(False)
         self.incomings_auto_tag_cb.toggled.connect(self._incomings_on_auto_tag_toggled)
         bar.addWidget(self.incomings_auto_tag_cb)
+
+        self.incomings_tg_snob_cb = QCheckBox("Telegram ile misyonerleri haber ver")
+        self.incomings_tg_snob_cb.setCursor(Qt.PointingHandCursor)
+        self.incomings_tg_snob_cb.setToolTip(
+            "Snob ikonu («Misyoner İçeriyor») olan yeni komutları Telegram’a bildirir.\n"
+            "Aynı hedefe ≥3 snob ve varışlar ~200 ms aralıklı (±30 ms) ise «N’li misyoner treni».\n"
+            "Ayarlar → Telegram açık ve token/chat dolu olmalı."
+        )
+        self.incomings_tg_snob_cb.setChecked(
+            bool(self._settings.value("notify/telegram_snob_alert", False, type=bool))
+        )
+        self.incomings_tg_snob_cb.toggled.connect(self._incomings_on_tg_snob_toggled)
+        bar.addWidget(self.incomings_tg_snob_cb)
 
         self.incomings_open_btn = QPushButton("🌐 Seçileni tarayıcıda aç")
         self.incomings_open_btn.setCursor(Qt.PointingHandCursor)
@@ -19469,16 +20335,18 @@ class TribalWarsBot(QMainWindow):
         self._incomings_refresh_silent = False
         self._incomings_pending_auto_label = False
         self._incomings_reschedule_after_this_fetch = False
+        self._incomings_labeling = False
         self._incomings_auto_timer = QTimer(self)
         self._incomings_auto_timer.setSingleShot(True)
         self._incomings_auto_timer.timeout.connect(self._incomings_auto_refresh_tick)
+        self._incomings_snob_notified_ids = self._incomings_load_snob_notified_ids()
 
         self.incomings_foot = QLabel(
-            "İlk sayfadaki gelen komutlar listelenir. «Otomatik etiketleme» açıkken 60–80 saniye "
-            "aralığında liste sessizce yenilenir (loga yazılmaz). Mesafe ve yol süresinden tahmini "
-            "en yavaş birim «Komut / etiket» ve «Tür» sütunlarında gösterilir; oyun içi komut etiketi "
-            "boş olan saldırı/desteklerde aynı tahmin otomatik kaydedilir (elle yazılmış etiketlere "
-            "dokunulmaz). Kapalıyken yalnızca «Gelenleri Yükle» ile manuel güncelleme yapılır."
+            "«Otomatik etiketleme» ~3 dk’da bir sessiz yeniler; etiketsiz komutlara oyunun "
+            "Etiket butonu (hepsini seç) uygulanır. Snob ikonu kesin misyonerdir; hız etiketi "
+            "(M/HA/…) tahmindir. «Telegram ile misyonerleri haber ver» açıkken yeni snob’lar "
+            "ve ~200 ms aralıklı 3’lü/4’lü trenler bildirim + mümkünse ekran görüntüsü alır. "
+            "Kapalıyken yalnızca «Gelenleri Yükle» ile manuel güncelleme yapılır."
         )
         self.incomings_foot.setWordWrap(True)
         self.incomings_foot.setStyleSheet("font-size: 9px; color: #888;")
@@ -19623,37 +20491,99 @@ class TribalWarsBot(QMainWindow):
             return True
         if s in ("—", "-", "–", "―"):
             return True
+        # Varsayılan oyun etiketleri (henüz Etiket basılmamış)
+        low = s.lower()
+        defaults = (
+            "saldırı", "saldiri", "attack", "destek", "support",
+            "dönüş", "donus", "return", "casus", "spy",
+        )
+        if low in defaults:
+            return True
         return False
 
-    def _incomings_post_command_label_job(self, job):
-        """Gelen komut satırına TW QuickEdit ile tahmini en yavaş birim etiketini kaydet."""
+    def _incomings_on_tg_snob_toggled(self, checked: bool) -> None:
+        try:
+            self._settings.setValue("notify/telegram_snob_alert", bool(checked))
+            self._settings.sync()
+        except Exception:
+            pass
+
+    def _incomings_load_snob_notified_ids(self) -> set:
+        out = set()
+        try:
+            raw = self._settings.value("notify/telegram_snob_notified_ids", "[]") or "[]"
+            data = json.loads(str(raw))
+            if isinstance(data, list):
+                for x in data[-800:]:
+                    sx = str(x).strip()
+                    if sx:
+                        out.add(sx)
+        except Exception:
+            out = set()
+        return out
+
+    def _incomings_save_snob_notified_ids(self) -> None:
+        try:
+            ids = sorted(getattr(self, "_incomings_snob_notified_ids", set()) or set())
+            if len(ids) > 800:
+                ids = ids[-800:]
+            self._settings.setValue(
+                "notify/telegram_snob_notified_ids",
+                json.dumps(ids, ensure_ascii=False),
+            )
+            self._settings.sync()
+        except Exception:
+            pass
+
+    def _incomings_native_label_all(self, command_ids, type_p, subtype_p, on_done=None):
+        """Oyundaki hepsini seç + Etiket ile aynı form POST (fetch)."""
         if not getattr(self, "browser", None):
+            if on_done:
+                on_done(False, "no browser")
             return
-        vid = (job.get("village_id") or "").strip()
-        cid = (job.get("command_id") or "").strip()
-        typ = (job.get("command_type") or "other").strip()
-        label = (job.get("label") or "").strip()
+        ids = [str(c).strip() for c in (command_ids or []) if str(c).strip()]
+        if not ids:
+            if on_done:
+                on_done(True, "empty")
+            return
+        if getattr(self, "_human_verification_required", False) or self._botprot_automation_hot_path():
+            if on_done:
+                on_done(False, "hot_path")
+            return
+        village_id = str(self._game_data.get("village", {}).get("id") or "")
         csrf = (self._game_data.get("csrf") or "").strip()
-        if not (vid and cid and label and csrf):
+        if not village_id or not csrf:
+            if on_done:
+                on_done(False, "no village/csrf")
             return
-        vid_j = json.dumps(vid)
-        cid_j = json.dumps(cid)
-        typ_j = json.dumps(typ)
-        lbl_j = json.dumps(label)
+        t = str(type_p or "all")
+        st = str(subtype_p or "all")
+        self._incomings_labeling = True
+        ids_js = json.dumps(ids)
+        vid_j = json.dumps(village_id)
         csrf_j = json.dumps(csrf)
-        fetch_js = f"""
+        t_j = json.dumps(t)
+        st_j = json.dumps(st)
+        send_js = f"""
         (function() {{
+            window.__tw_incomings_label = 'SENDING';
+            var ids = {ids_js};
             var vid = {vid_j};
-            var cid = {cid_j};
-            var typ = {typ_j};
-            var txt = {lbl_j};
             var h = {csrf_j};
+            var typeP = {t_j};
+            var subtypeP = {st_j};
             var url = '/game.php?village=' + encodeURIComponent(vid) +
-                '&screen=info_command&id=' + encodeURIComponent(cid) +
-                '&type=' + encodeURIComponent(typ) +
-                '&ajaxaction=edit_other_comment&h=' + encodeURIComponent(h);
+                '&screen=overview_villages&mode=incomings&action=process' +
+                '&type=' + encodeURIComponent(typeP || 'all') +
+                '&subtype=' + encodeURIComponent(subtypeP || 'all') +
+                '&h=' + encodeURIComponent(h);
             var fd = new URLSearchParams();
-            fd.append('text', txt);
+            var i;
+            for (i = 0; i < ids.length; i++) {{
+                fd.append('command_ids[' + ids[i] + ']', 'true');
+                fd.append('id_' + ids[i], 'on');
+            }}
+            fd.append('label', 'Etiket');
             fetch(url, {{
                 method: 'POST',
                 credentials: 'same-origin',
@@ -19662,10 +20592,171 @@ class TribalWarsBot(QMainWindow):
                     'X-Requested-With': 'XMLHttpRequest'
                 }},
                 body: fd.toString()
-            }}).catch(function() {{}});
+            }}).then(function(r) {{
+                window.__tw_incomings_label = 'OK|' + r.status + '|' + ids.length;
+            }}).catch(function(e) {{
+                window.__tw_incomings_label = 'ERROR|' + String(e);
+            }});
         }})();
         """
-        self.browser.page().runJavaScript(fetch_js)
+        self.browser.page().runJavaScript(send_js)
+        QTimer.singleShot(
+            self.TW_JS_POLL_MS,
+            lambda: self._incomings_poll_native_label(0, on_done),
+        )
+
+    def _incomings_poll_native_label(self, attempt, on_done=None):
+        if attempt > 40:
+            self._incomings_labeling = False
+            if on_done:
+                on_done(False, "timeout")
+            return
+        check_js = "window.__tw_incomings_label || 'WAITING';"
+
+        def on_poll(result):
+            result_str = str(result) if result else "WAITING"
+            if result_str in ("WAITING", "SENDING"):
+                QTimer.singleShot(
+                    self.TW_JS_POLL_MS,
+                    lambda: self._incomings_poll_native_label(attempt + 1, on_done),
+                )
+                return
+            self.browser.page().runJavaScript("window.__tw_incomings_label = null;")
+            self._incomings_labeling = False
+            ok = result_str.startswith("OK")
+            if ok:
+                self._add_log("GELEN", "success", f"Native Etiket: {result_str}")
+            else:
+                self._add_log("GELEN", "warn", f"Native Etiket: {result_str}")
+            if on_done:
+                on_done(ok, result_str)
+
+        self.browser.page().runJavaScript(check_js, on_poll)
+
+    def _incomings_grab_screenshot_png(self) -> bytes:
+        """Mümkünse Gelen ağacı veya tarayıcıdan PNG."""
+        try:
+            w = getattr(self, "incomings_tree", None)
+            if w is not None and w.isVisible() and w.width() > 40 and w.height() > 40:
+                pix = w.grab()
+                if not pix.isNull():
+                    ba = QByteArray()
+                    buf = QBuffer(ba)
+                    buf.open(QIODevice.WriteOnly)
+                    if pix.save(buf, "PNG"):
+                        return bytes(ba)
+            br = getattr(self, "browser", None)
+            if br is not None:
+                url = ""
+                try:
+                    url = (br.url().toString() or "").lower()
+                except Exception:
+                    url = ""
+                if "mode=incomings" in url or "overview_villages" in url:
+                    pix = br.grab()
+                    if not pix.isNull():
+                        ba = QByteArray()
+                        buf = QBuffer(ba)
+                        buf.open(QIODevice.WriteOnly)
+                        if pix.save(buf, "PNG"):
+                            return bytes(ba)
+        except Exception:
+            pass
+        return b""
+
+    def _incomings_notify_snobs(self, snob_rows: list) -> None:
+        """Yeni snob ikonlu komutları Telegram'a bildir (3+’lı tren gruplama)."""
+        if not getattr(self, "incomings_tg_snob_cb", None) or not self.incomings_tg_snob_cb.isChecked():
+            return
+        if not snob_rows:
+            return
+        notified = getattr(self, "_incomings_snob_notified_ids", None)
+        if notified is None:
+            notified = set()
+            self._incomings_snob_notified_ids = notified
+
+        # Tüm snob satırları (tren hesabı için); bildirim yalnızca yeni id'ler
+        by_target = {}
+        new_ids = []
+        for r in snob_rows:
+            cid = str(r.get("command_id") or "").strip()
+            if not cid:
+                continue
+            tgt = (r.get("target") or r.get("target_name") or "?").strip() or "?"
+            by_target.setdefault(tgt, []).append(r)
+            if cid not in notified:
+                new_ids.append(cid)
+        if not new_ids:
+            return
+
+        messages = []
+        mark_ids = []
+        for tgt, rows in by_target.items():
+            rows_sorted = sorted(
+                rows,
+                key=lambda x: float(x.get("arrival_end_ms") or 0) or 0.0,
+            )
+            new_in_tgt = [
+                r for r in rows_sorted
+                if str(r.get("command_id") or "").strip() in set(new_ids)
+            ]
+            if not new_in_tgt:
+                continue
+            arrivals = []
+            for r in rows_sorted:
+                try:
+                    ae = float(r.get("arrival_end_ms") or 0)
+                except (TypeError, ValueError):
+                    ae = 0.0
+                if ae > 0:
+                    arrivals.append(ae)
+            # Oyun: misyoner treni ~200 ms aralık, ±30 ms sapma
+            # n komut → ilk–son en fazla (n-1)*230 ms; 3’lü ve üzeri tren
+            n_snob = len(rows_sorted)
+            span_ok = False
+            if arrivals and n_snob >= 3:
+                span_ms = max(arrivals) - min(arrivals)
+                max_span_ms = (n_snob - 1) * 230.0
+                span_ok = span_ms <= max_span_ms
+            is_train = n_snob >= 3 and span_ok
+            if is_train:
+                title = f"{len(rows_sorted)}'lü misyoner treni"
+            else:
+                title = "Misyoner geliyor"
+            lines = [title, ""]
+            for r in (rows_sorted if is_train else new_in_tgt):
+                src = (r.get("source") or r.get("source_name") or "?").strip() or "?"
+                arr = (r.get("arrival") or r.get("arrival_text") or "?").strip() or "?"
+                lines.append(f"Gönderen köy: {src}")
+                lines.append(f"Misyoner gelen köy: {tgt}")
+                lines.append(f"Varış zamanı: {arr}")
+                lines.append("")
+            messages.append("\n".join(lines).strip())
+            for r in new_in_tgt:
+                cid = str(r.get("command_id") or "").strip()
+                if cid:
+                    mark_ids.append(cid)
+
+        if not messages:
+            return
+
+        body = "\n\n———\n\n".join(messages)
+        tw_telegram_send_message_threaded(self, body)
+        png = self._incomings_grab_screenshot_png()
+        if png:
+            cap = messages[0][:200] if messages else "Misyoner"
+            tw_telegram_send_photo_threaded(self, png, caption=cap)
+        else:
+            self._add_log("GELEN", "info", "Telegram snob: ekran görüntüsü alınamadı (yalnız metin).")
+
+        for cid in mark_ids:
+            notified.add(cid)
+        self._incomings_save_snob_notified_ids()
+        self._add_log(
+            "GELEN",
+            "success",
+            f"Telegram misyoner bildirimi: {len(mark_ids)} yeni komut",
+        )
 
     def _incomings_tick_countdowns(self):
         """Devamı sütununda fetch anındaki kalan süreyi monotonic ile ilerleterek gösterir."""
@@ -19707,12 +20798,12 @@ class TribalWarsBot(QMainWindow):
             self._incomings_reschedule_after_this_fetch = False
 
     def _incomings_schedule_next_auto_refresh(self):
-        """60–80 sn sonra bir sonraki sessiz yenilemeyi tetikle (tek atış)."""
+        """~3 dk sonra bir sonraki sessiz yenilemeyi tetikle (tek atış)."""
         if not getattr(self, "incomings_auto_tag_cb", None) or not self.incomings_auto_tag_cb.isChecked():
             if getattr(self, "_incomings_auto_timer", None):
                 self._incomings_auto_timer.stop()
             return
-        delay_ms = random.randint(60_000, 80_000)
+        delay_ms = random.randint(170_000, 190_000)
         self._incomings_auto_timer.stop()
         self._incomings_auto_timer.start(delay_ms)
 
@@ -19729,6 +20820,9 @@ class TribalWarsBot(QMainWindow):
             self._incomings_after_fetch_cycle_cleanup()
             return
         if getattr(self, "_human_verification_required", False):
+            self._incomings_schedule_next_auto_refresh()
+            return
+        if self._botprot_automation_hot_path() or getattr(self, "_incomings_labeling", False):
             self._incomings_schedule_next_auto_refresh()
             return
         if not getattr(self, "browser", None):
@@ -19788,18 +20882,31 @@ class TribalWarsBot(QMainWindow):
             var typeP = """ + json.dumps(t) + """;
             var subtypeP = """ + json.dumps(st) + """;
             var url = '/game.php?village=' + encodeURIComponent(villageId) +
-                '&screen=overview_villages&mode=incomings&group=0' +
+                '&screen=overview_villages&mode=incomings&group=0&page=-1' +
                 '&type=' + encodeURIComponent(typeP || 'all') +
                 '&subtype=' + encodeURIComponent(subtypeP || 'all');
 
+            function rowHasSnob(row) {
+                var h = (row.innerHTML || '').toLowerCase();
+                if (h.indexOf('command/snob') >= 0) return true;
+                var hints = row.querySelectorAll('[data-icon-hint]');
+                var i, t;
+                for (i = 0; i < hints.length; i++) {
+                    t = (hints[i].getAttribute('data-icon-hint') || '').toLowerCase();
+                    if (t.indexOf('misyoner') >= 0 || t.indexOf('noble') >= 0 || t.indexOf('snob') >= 0)
+                        return true;
+                }
+                return false;
+            }
+
             function rowKind(row) {
                 var h = (row.innerHTML || '').toLowerCase();
+                if (rowHasSnob(row)) return 'Misyoner';
                 if (h.indexOf('command/support') >= 0) return 'Destek';
                 if (h.indexOf('command/return') >= 0) return 'Dönüş';
                 if (h.indexOf('command/attack') >= 0 || h.indexOf('attack_small') >= 0
                     || h.indexOf('attack_medium') >= 0 || h.indexOf('attack_large') >= 0) return 'Saldırı';
                 if (h.indexOf('command/spy') >= 0) return 'Casus';
-                if (h.indexOf('command/snob') >= 0) return 'Misyoner';
                 return '—';
             }
 
@@ -19929,20 +21036,31 @@ class TribalWarsBot(QMainWindow):
                     href = pickHref(row);
                     var cm = parseCommandMeta(href);
                     kind = rowKind(row);
+                    var hasSnob = rowHasSnob(row);
                     arrEnd = pickArrivalEndMs(row);
                     sendMs = pickSendStartMs(row);
                     remMs = (arrEnd !== null && !isNaN(arrEnd)) ? (arrEnd - sn) : null;
+                    // Hedef hücresinden koordinat (overview çok köylü)
+                    var dx = destX, dy = destY;
+                    if (texts.length > 1) {
+                        var tm = /(\\d+)\\s*\\|\\s*(\\d+)/.exec(texts[1] || '');
+                        if (tm) { dx = Number(tm[1]); dy = Number(tm[2]); }
+                    }
                     out.push({
                         cells: texts,
                         href: href,
                         kind: kind,
+                        has_snob: hasSnob,
                         arrival_end_ms: arrEnd,
                         send_start_ms: sendMs,
-                        dest_x: destX,
-                        dest_y: destY,
+                        dest_x: dx,
+                        dest_y: dy,
                         remaining_ms_at_fetch: remMs,
                         command_id: cm.command_id,
-                        command_type: cm.command_type
+                        command_type: cm.command_type,
+                        target: texts.length > 1 ? texts[1] : '',
+                        source: texts.length > 2 ? texts[2] : '',
+                        arrival: texts.length > 5 ? texts[5] : ''
                     });
                 }
                 window.__tw_incomings_fetch = JSON.stringify({
@@ -20001,8 +21119,11 @@ class TribalWarsBot(QMainWindow):
         silent = getattr(self, "_incomings_refresh_silent", False)
         do_auto_label = silent and getattr(self, "_incomings_pending_auto_label", False)
         self._incomings_pending_auto_label = False
-        label_jobs = []
-        vid_cur = str(self._game_data.get("village", {}).get("id") or "")
+        unlabeled_ids = []
+        snob_rows = []
+        type_p = self.incomings_type_combo.currentData() or "all"
+        subtype_p = self.incomings_subtype_combo.currentData() or "all"
+        cleanup_deferred = False
         try:
             if not result_str or result_str in ("WAITING", "LOADING"):
                 self._incomings_tick_origin_mono = None
@@ -20037,6 +21158,7 @@ class TribalWarsBot(QMainWindow):
 
             for r in rows:
                 kind = str(r.get("kind", "—"))
+                has_snob = bool(r.get("has_snob")) or ("misyoner" in kind.lower())
                 cells = r.get("cells") or []
                 if not isinstance(cells, list):
                     cells = []
@@ -20064,11 +21186,19 @@ class TribalWarsBot(QMainWindow):
                     or "attack" in klow
                     or "destek" in klow
                     or "support" in klow
+                    or "misyoner" in klow
                 )
-                disp_kind = slow_label if (slow_label and is_march) else kind
+                if has_snob:
+                    disp_kind = "Misyoner"
+                else:
+                    disp_kind = slow_label if (slow_label and is_march) else kind
 
                 orig_komut = str(cells[0]).strip() if len(cells) > 0 else ""
-                if slow_label and is_march:
+                if has_snob:
+                    komut_txt = orig_komut or "Misyoner"
+                    if slow_label and slow_label not in komut_txt:
+                        komut_txt = f"{slow_label} · {komut_txt}" if orig_komut else slow_label
+                elif slow_label and is_march:
                     komut_txt = slow_label
                     if orig_komut and orig_komut != slow_label:
                         komut_txt = f"{slow_label} · {orig_komut}"
@@ -20082,20 +21212,23 @@ class TribalWarsBot(QMainWindow):
                 command_id = r.get("command_id")
                 if (
                     do_auto_label
-                    and slow_label
                     and is_march
                     and command_id
-                    and vid_cur
                     and self._incomings_cell_is_unlabeled(orig_komut)
                 ):
-                    label_jobs.append(
-                        {
-                            "village_id": vid_cur,
-                            "command_id": str(command_id),
-                            "command_type": str(r.get("command_type") or "other"),
-                            "label": slow_label,
-                        }
-                    )
+                    unlabeled_ids.append(str(command_id))
+
+                target = (r.get("target") or (cells[1] if len(cells) > 1 else "") or "").strip()
+                source = (r.get("source") or (cells[2] if len(cells) > 2 else "") or "").strip()
+                arrival = (r.get("arrival") or (cells[5] if len(cells) > 5 else "") or "").strip()
+                if has_snob and command_id:
+                    snob_rows.append({
+                        "command_id": str(command_id),
+                        "target": target,
+                        "source": source,
+                        "arrival": arrival,
+                        "arrival_end_ms": r.get("arrival_end_ms"),
+                    })
 
                 col = [disp_kind, komut_txt]
                 for i in range(1, 6):
@@ -20116,6 +21249,7 @@ class TribalWarsBot(QMainWindow):
                     {
                         "href": href,
                         "kind": kind,
+                        "has_snob": has_snob,
                         "remaining_ms_at_fetch": rem,
                         "rest_text": rest,
                         "slowest_guess": slow_label,
@@ -20132,7 +21266,9 @@ class TribalWarsBot(QMainWindow):
                 tip = " | ".join(str(c) for c in cells[:10])
                 if tip:
                     item.setToolTip(1, tip)
-                if "sald" in klow or "attack" in klow:
+                if has_snob:
+                    item.setForeground(0, QColor("#8b008b"))
+                elif "sald" in klow or "attack" in klow:
                     item.setForeground(0, QColor("#cc4444"))
                 elif "destek" in klow or "support" in klow:
                     item.setForeground(0, QColor("#228822"))
@@ -20151,13 +21287,30 @@ class TribalWarsBot(QMainWindow):
                     "success",
                     f"Gelen komut listesi güncellendi: {n} satır ({data.get('fetchUrl', '')})",
                 )
-            for idx, job in enumerate(label_jobs):
-                QTimer.singleShot(
-                    200 + idx * 450,
-                    lambda j=job: self._incomings_post_command_label_job(j),
+
+            def _after_label(_ok=True, _msg=""):
+                try:
+                    self._incomings_notify_snobs(snob_rows)
+                finally:
+                    self._incomings_after_fetch_cycle_cleanup()
+
+            if do_auto_label and unlabeled_ids and not self._botprot_automation_hot_path():
+                cleanup_deferred = True
+                # Tekil id'ler (sıra koru)
+                seen = set()
+                uniq = []
+                for cid in unlabeled_ids:
+                    if cid not in seen:
+                        seen.add(cid)
+                        uniq.append(cid)
+                self._incomings_native_label_all(
+                    uniq, type_p, subtype_p, on_done=lambda ok, msg: _after_label(ok, msg)
                 )
+            else:
+                self._incomings_notify_snobs(snob_rows)
         finally:
-            self._incomings_after_fetch_cycle_cleanup()
+            if not cleanup_deferred:
+                self._incomings_after_fetch_cycle_cleanup()
 
     def _incomings_open_selected(self):
         if not self.browser:
@@ -23635,6 +24788,7 @@ class TribalWarsBot(QMainWindow):
                 f"Gruplar: {len(vgroups)} | Köy+grup: {n_with_groups} | "
                 f"Dünya: {data.get('world', '?')}")
             self._refresh_support_plan_groups()
+            self._refresh_scav_groups()
 
             QTimer.singleShot(200, self._poll_bot_protection)
 
@@ -24279,8 +25433,8 @@ class TribalWarsBot(QMainWindow):
         # Asker toplama sekmesi: köy tablosunu güncelle
         if hasattr(self, 'rt_table'):
             self._rt_refresh_villages()
-        if hasattr(self, "scav_vsel_table"):
-            self._scav_refresh_vsel()
+        if hasattr(self, "scav_group_combo"):
+            self._refresh_scav_groups()
 
     def _update_villages_list(self, data):
         """Köyler sekmesindeki tüm köy tablosunu güncelle."""
@@ -24868,7 +26022,11 @@ class TribalWarsBot(QMainWindow):
             return True
         if getattr(self, "_gold_busy", False):
             return True
+        if getattr(self, "_wb_sending", False):
+            return True
         if getattr(self, "_bq_processing", False):
+            return True
+        if getattr(self, "_incomings_labeling", False):
             return True
         if getattr(self, "_pending_command", None):
             return True

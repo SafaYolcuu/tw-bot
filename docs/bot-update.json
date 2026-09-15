@@ -1,5 +1,5 @@
 {
-  "version": "1.4.6",
-  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.6/TribalWarsBot-1.4.6.zip",
-  "changelog_tr": "Bot koruması görünür-yap: gizli doğrulamada otomatik sayfa yenileme (F5 gibi) + ağ HTML probe.\nAsker: eğitim formu PAGE_MISS/BOTPROT ayrımı, fetch timeout, yanlış 'dünyada yok' düzeltmesi.\nSoft-reload sonrası erken 'doğrulama kalktı' azaltıldı; Telegram bildirimleri aktif.\nv1.4.5+ asker timeout/yanlış botprot iyileştirmeleri dahil."
+  "version": "1.4.7",
+  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.7/TribalWarsBot-1.4.7.zip",
+  "changelog_tr": "Temizlik: köy köy liste kaldırıldı; şablonlu destek gibi köy grubu seçimi.\nGelen: ~3 dk native Etiket (hepsini seç); snob ikonu tespiti; Telegram misyoner bildirimi (3+ tren ~200ms±30ms) + ekran görüntüsü.\nDepo Denge: Türkçe etiketler; Gönder butonu yeşil.\nAltın Para: düzenli UI; işlem günlüğü tema uyumu.\nv1.4.6 botprot/asker düzeltmeleri dahil."
 }
