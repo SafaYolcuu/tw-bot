@@ -196,7 +196,7 @@ from license_client import (  # noqa: E402
 # ─────────────────────────────────────────────
 
 # EXE'nin guncel oldugunu dogrulamak icin her onemli degisiklikte artirin.
-APP_VERSION = "1.4.7"
+APP_VERSION = "1.4.8"
 
 # Otomatik guncelleme — kullaniciya GitHub adresi gosterilmez; yalnizca bu URL okunur.
 UPDATE_MANIFEST_URL = "https://safayolcuu.github.io/tw-bot/bot-update.json"
@@ -4052,7 +4052,9 @@ class ArmyAuxToolsDialog(QDialog):
         fake_form.addWidget(self.cb_fake_limit, 0, 2, 1, 2)
         fake_form.setColumnStretch(4, 1)
         v_fake.addLayout(fake_form)
-        v_fake.addWidget(QLabel("Fake birimleri (en az bir koç veya mancınık seçili olmalı):"))
+        v_fake.addWidget(QLabel(
+            "Fake birimleri (en az bir birim; limit kapalıysa seçilenlerden stokta olan 1 asker gider):"
+        ))
         unit_wrap = QWidget()
         unit_grid = QGridLayout(unit_wrap)
         unit_grid.setContentsMargins(0, 0, 0, 0)
@@ -4063,7 +4065,7 @@ class ArmyAuxToolsDialog(QDialog):
         for i, (ukey, short) in enumerate(defs):
             cb = QCheckBox(short)
             cb.setProperty("unit_key", ukey)
-            if ukey in ("ram", "catapult", "spear"):
+            if ukey in ("axe", "spear"):
                 cb.setChecked(True)
             self.fake_unit_checks[ukey] = cb
             unit_grid.addWidget(cb, i // 6, i % 6)
@@ -4424,11 +4426,11 @@ class ArmyAuxToolsDialog(QDialog):
             )
             return
         units = self._fake_selected_unit_keys()
-        if not any(u in units for u in ("ram", "catapult")):
+        if not units:
             QMessageBox.warning(
                 self._mb_parent(),
                 "Fake planı",
-                "En az koç veya mancınık seçili olmalı.",
+                "En az bir birim seçin (ör. balta).",
             )
             return
         b._sa_plan_mass_fakes_with(
@@ -5169,6 +5171,7 @@ class TribalWarsBot(QMainWindow):
         self._botprot_hold_until = 0.0  # asker/gönderim şüphesi: erken "kalktı" deme
         self._botprot_hidden_since = 0.0  # gizli doğrulama başlangıcı
         self._botprot_net_probe_at = 0.0
+        self._botprot_opaque_fail_streak = 0  # farm/scav/gold/gelen/asker opak hata sayacı
         self._rt_page_miss_streak = 0
         # Otomasyon başlangıç zamanları — botprot Telegram yalnızca aktif işler için
         self._automation_started_at = {}  # key -> unix
@@ -5986,6 +5989,14 @@ class TribalWarsBot(QMainWindow):
                 "Bina kuyruğu",
                 lambda: bool(
                     hasattr(self, "bq_enable_cb") and self.bq_enable_cb.isChecked()
+                ),
+            ),
+            (
+                "incomings",
+                "Gelen otomatik Etiket",
+                lambda: bool(
+                    getattr(self, "incomings_auto_tag_cb", None) is not None
+                    and self.incomings_auto_tag_cb.isChecked()
                 ),
             ),
             (
@@ -8409,12 +8420,14 @@ class TribalWarsBot(QMainWindow):
         return None
 
     def _sa_village_has_siege_stock(self, troops, selected_unit_keys):
+        """Seçili birimlerden herhangi birinin köyde en az 1 stoğu var mı (fake kaynak uygunluğu)."""
         sel = set(selected_unit_keys or [])
+        if not sel:
+            return False
         t = troops or {}
-        if "ram" in sel and self._sa_troop_count(t, "ram") > 0:
-            return True
-        if "catapult" in sel and self._sa_troop_count(t, "catapult") > 0:
-            return True
+        for k in sel:
+            if self._sa_troop_count(t, k) > 0:
+                return True
         return False
 
     def _sa_on_source_user_changed(self, index):
@@ -9361,7 +9374,7 @@ class TribalWarsBot(QMainWindow):
     def _fake_limit_checkbox_text(self) -> str:
         pct = self._sa_fake_min_pop_percent()
         if pct <= 0:
-            return "Fake limiti uygula (dünyada pasif — yalnızca koç/mancınık)"
+            return "Fake limiti uygula (bu dünyada pasif — seçilenlerden 1 asker yeter)"
         return f"Fake limiti uygula (köy puanının %{self._format_fake_pct(pct)} nüfusu)"
 
     def _update_fake_limit_ui(self) -> None:
@@ -10436,20 +10449,13 @@ class TribalWarsBot(QMainWindow):
         if not cycle:
             return None
 
-        if selected_set & {"ram", "catapult"}:
-            if self._sa_troop_count(vt, "ram") + self._sa_troop_count(vt, "catapult") < 1:
-                return None
-
         troops = {k: 0 for k, _ in self.SA_UNIT_DEFS}
 
         pct = self._sa_fake_min_pop_percent()
         effective_enforce = enforce_fake_limit and pct > 0
 
         if not effective_enforce:
-            for pref in ("ram", "catapult"):
-                if pref in selected_set and self._sa_troop_count(vt, pref) >= 1:
-                    troops[pref] = 1
-                    return troops
+            # Limit yok / kapalı: seçilen birimlerden stokta olan ilk birimden 1 adet
             for k in cycle:
                 if self._sa_troop_count(vt, k) >= 1:
                     troops[k] = 1
@@ -10599,9 +10605,9 @@ class TribalWarsBot(QMainWindow):
             )
             return
 
-        if not any(u in (selected_unit_keys or []) for u in ("ram", "catapult")):
+        if not (selected_unit_keys or []):
             QMessageBox.warning(
-                parent, "Fake planı", "En az koç veya mancınık seçili olmalı."
+                parent, "Fake planı", "En az bir birim seçin (ör. balta)."
             )
             return
 
@@ -10633,7 +10639,7 @@ class TribalWarsBot(QMainWindow):
 
         pool = []
         n_no_coord = 0
-        n_no_siege = 0
+        n_no_units = 0
         n_no_pts = 0
         for v in villages:
             vid = v.get("id")
@@ -10643,7 +10649,7 @@ class TribalWarsBot(QMainWindow):
                 continue
             stock0 = self._sa_available_troops_for_village_id(vid)
             if not self._sa_village_has_siege_stock(stock0, selected_unit_keys):
-                n_no_siege += 1
+                n_no_units += 1
                 continue
             pts = self._sa_resolve_village_points(v)
             if enforce_fake_limit and (pts is None or pts <= 0):
@@ -10671,11 +10677,10 @@ class TribalWarsBot(QMainWindow):
                 "Fake planı",
                 f"Uygun kaynak köy yok ({len(villages)} köy listelendi).\n\n"
                 f"• Koordinatsız: {n_no_coord}\n"
-                f"• Seçili kuşatma yok (koç/mancınık): {n_no_siege}"
+                f"• Seçili birim stoğu yok: {n_no_units}"
                 f"{extra_pts}\n\n"
-                "Tarayıcıda oyun sayfasını yenileyin (köy puanları üretim "
-                "sekmesinden otomatik çekilir); fake birimlerinde en az koç veya "
-                "mancınık işaretli olsun.",
+                "Tarayıcıda oyun sayfasını yenileyin; fake birimlerinde "
+                "köyde bulunan en az bir birim işaretli olsun.",
             )
             return
 
@@ -16460,6 +16465,7 @@ class TribalWarsBot(QMainWindow):
             int(target_id), int(target_x), int(target_y),
             tpl_key or "A", int(template_id or 0))
 
+        botprot_js = self._botprot_js_strong_check_fn()
         send_js = f"""
         (function() {{
             var sourceId = {village_id};
@@ -16467,6 +16473,7 @@ class TribalWarsBot(QMainWindow):
             var templateId = {template_id};
             var csrf = '{csrf}';
             var cmdId = '{farm_cmd_id}';
+            {botprot_js}
 
             if (!window.__tw_bot_results) window.__tw_bot_results = {{}};
             window.__tw_bot_results[cmdId] = 'SENDING';
@@ -16484,7 +16491,9 @@ class TribalWarsBot(QMainWindow):
                 }}
                 if (resp.error) {{
                     var err = String(resp.error);
-                    if (/asker|birlik|unit|yeterli|enough/i.test(err)) {{
+                    if (twBotprotStrong(err)) {{
+                        window.__tw_bot_results[cmdId] = 'BOTPROT|' + err.substring(0, 120);
+                    }} else if (/asker|birlik|unit|yeterli|enough/i.test(err)) {{
                         window.__tw_bot_results[cmdId] = 'NO_TROOPS|' + err.substring(0, 120);
                     }} else if (/premium|yağma|yagma|asistan/i.test(err)) {{
                         window.__tw_bot_results[cmdId] = 'PREMIUM|' + err.substring(0, 120);
@@ -16497,14 +16506,25 @@ class TribalWarsBot(QMainWindow):
                 }}
                 if (resp.success === false) {{
                     var msg = resp.message ? String(resp.message) : 'Gonderim basarisiz';
-                    window.__tw_bot_results[cmdId] = 'ERROR|' + msg.substring(0, 120);
+                    if (twBotprotStrong(msg)) {{
+                        window.__tw_bot_results[cmdId] = 'BOTPROT|' + msg.substring(0, 120);
+                    }} else {{
+                        window.__tw_bot_results[cmdId] = 'ERROR|' + msg.substring(0, 120);
+                    }}
                     return;
                 }}
                 window.__tw_bot_results[cmdId] = 'SENT_OK';
             }}
 
             function laFail(msg) {{
-                window.__tw_bot_results[cmdId] = 'ERROR|' + String(msg).substring(0, 120);
+                var s = String(msg || '');
+                if (twBotprotStrong(s)) {{
+                    window.__tw_bot_results[cmdId] = 'BOTPROT|' + s.substring(0, 120);
+                }} else if (twLooksLikeHtml(s)) {{
+                    window.__tw_bot_results[cmdId] = 'OPAQUE|html_response';
+                }} else {{
+                    window.__tw_bot_results[cmdId] = 'ERROR|' + s.substring(0, 120);
+                }}
             }}
 
             if (typeof TribalWars !== 'undefined' && typeof Accountmanager !== 'undefined' &&
@@ -16542,6 +16562,16 @@ class TribalWarsBot(QMainWindow):
                 }});
             }})
             .then(function(data) {{
+                if (data && data.raw) {{
+                    if (twBotprotStrong(data.raw)) {{
+                        window.__tw_bot_results[cmdId] = 'BOTPROT|' + String(data.raw).substring(0, 80);
+                        return;
+                    }}
+                    if (twLooksLikeHtml(data.raw) && !/^\\s*\\{{/.test(String(data.raw))) {{
+                        window.__tw_bot_results[cmdId] = 'OPAQUE|html_response';
+                        return;
+                    }}
+                }}
                 if (data && data.error) {{
                     laOk(data);
                 }} else if (data && data.raw && /error|hata/i.test(data.raw)) {{
@@ -16628,6 +16658,7 @@ class TribalWarsBot(QMainWindow):
                 self.farm_status_label.setStyleSheet("font-size: 10px; color: #228822;")
                 log_tpl = f" {tpl_key}" if tpl_key else ""
                 self._add_log("FARM", "success", f"✅ Yağma{log_tpl} → ({tx}|{ty})")
+                self._botprot_note_success()
                 self.browser.page().runJavaScript(
                     f"if(window.__tw_bot_results) delete window.__tw_bot_results['{cmd_id}'];")
 
@@ -16706,11 +16737,16 @@ class TribalWarsBot(QMainWindow):
                 self.farm_status_label.setStyleSheet("font-size: 10px; color: #aa6600;")
                 self._add_log("FARM", "warn", f"⏳ Hız sınırı: {msg}")
 
-            elif result_str.startswith("ERROR"):
-                error = result_str.replace("ERROR|", "")
+            elif (
+                result_str.startswith("BOTPROT")
+                or result_str.startswith("OPAQUE")
+                or result_str.startswith("ERROR")
+            ):
+                kind = self._botprot_handle_module_result("farm", result_str)
+                error = result_str.split("|", 1)[-1] if "|" in result_str else result_str
                 self._farm_release_village(self._farm_poll_vid_from_cmd(cmd_id))
                 if table_item:
-                    table_item.setText(4, "✗ Hata")
+                    table_item.setText(4, "✗ Doğrulama" if kind in ("strong", "opaque") else "✗ Hata")
                     table_item.setForeground(4, QColor("#cc2222"))
                 self._farm_sending = False
                 self._farm_last_send = time.time()
@@ -17202,8 +17238,28 @@ class TribalWarsBot(QMainWindow):
         row1.addStretch()
         layout.addLayout(row1)
 
-        # Köy grubu (şablonlu destek ile aynı kaynak: village_groups)
-        group_row = QHBoxLayout()
+        # Mod: toplu (grup) | köy köy (aktif liste)
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(10)
+        mode_row.addWidget(QLabel("Mod:"))
+        self.scav_mode_group = QButtonGroup(self)
+        self.scav_mode_mass = QRadioButton("Toplu (grup / tüm köyler)")
+        self.scav_mode_village = QRadioButton("Köy köy (liste)")
+        self.scav_mode_mass.setChecked(True)
+        self.scav_mode_group.addButton(self.scav_mode_mass, 0)
+        self.scav_mode_group.addButton(self.scav_mode_village, 1)
+        self.scav_mode_mass.toggled.connect(self._scav_on_mode_changed)
+        mode_row.addWidget(self.scav_mode_mass)
+        mode_row.addWidget(self.scav_mode_village)
+        mode_hint = QLabel("Köy köy: köy + birim ekleyin. Toplu: grup seçici + aşağıdaki birimler.")
+        mode_hint.setStyleSheet("font-size: 9px; color: #666;")
+        mode_row.addWidget(mode_hint, 1)
+        layout.addLayout(mode_row)
+
+        # Köy grubu (şablonlu destek ile aynı kaynak: village_groups) — yalnızca toplu mod
+        self.scav_group_row_wrap = QWidget()
+        group_row = QHBoxLayout(self.scav_group_row_wrap)
+        group_row.setContentsMargins(0, 0, 0, 0)
         group_row.setSpacing(8)
         group_row.addWidget(QLabel("Köy grubu:"))
         self.scav_group_combo = QComboBox()
@@ -17217,7 +17273,7 @@ class TribalWarsBot(QMainWindow):
         group_hint = QLabel("Gruplar oyundan gelir (Veriyi yenile).")
         group_hint.setStyleSheet("font-size: 9px; color: #666;")
         group_row.addWidget(group_hint, 1)
-        layout.addLayout(group_row)
+        layout.addWidget(self.scav_group_row_wrap)
 
         scav_split = QSplitter(Qt.Vertical)
         scav_split.setChildrenCollapsible(False)
@@ -17249,7 +17305,7 @@ class TribalWarsBot(QMainWindow):
         mass_u_lay = QHBoxLayout(self.scav_mass_units_wrap)
         mass_u_lay.setContentsMargins(0, 0, 0, 0)
         mass_u_lay.setSpacing(6)
-        mass_u_lay.addWidget(QLabel("Birimler:"))
+        mass_u_lay.addWidget(QLabel("Birimler (toplu):"))
         self.scav_unit_cbs = {}
         for key, name in self.SCAV_UNITS:
             cb = QCheckBox(name)
@@ -17261,6 +17317,76 @@ class TribalWarsBot(QMainWindow):
         self.scav_unit_cbs["sword"].setChecked(True)
         mass_u_lay.addStretch()
         opt_layout.addWidget(self.scav_mass_units_wrap)
+
+        # ── Köy köy panel (Asker sekmesi benzeri) ──
+        self.scav_pv_panel = QWidget()
+        pv_lay = QVBoxLayout(self.scav_pv_panel)
+        pv_lay.setContentsMargins(0, 0, 0, 0)
+        pv_lay.setSpacing(4)
+
+        pv_vsel = QGroupBox("1. Köyleri seçin")
+        pv_vsel_lay = QVBoxLayout(pv_vsel)
+        pv_vsel_lay.setContentsMargins(4, 4, 4, 4)
+        self.scav_vsel_table = QTreeWidget()
+        self.scav_vsel_table.setRootIsDecorated(False)
+        self.scav_vsel_table.setAlternatingRowColors(True)
+        self.scav_vsel_table.setHeaderLabels(["Köy", "Koordinat"])
+        self.scav_vsel_table.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.scav_vsel_table.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.scav_vsel_table.setMaximumHeight(140)
+        pv_vsel_lay.addWidget(self.scav_vsel_table)
+        pv_lay.addWidget(pv_vsel)
+
+        pv_urow = QHBoxLayout()
+        pv_usel = QGroupBox("2. Birimleri seçip Ekle")
+        pv_usel_lay = QHBoxLayout(pv_usel)
+        pv_usel_lay.setContentsMargins(6, 4, 6, 4)
+        pv_usel_lay.setSpacing(6)
+        self.scav_pv_unit_cbs = {}
+        for key, name in self.SCAV_UNITS:
+            cb = QCheckBox(name)
+            cb.setStyleSheet("font-size: 10px;")
+            troop_icon_mgr.apply_to_checkbox(cb, key)
+            pv_usel_lay.addWidget(cb)
+            self.scav_pv_unit_cbs[key] = cb
+        self.scav_pv_unit_cbs["spear"].setChecked(True)
+        self.scav_pv_unit_cbs["sword"].setChecked(True)
+        pv_usel_lay.addStretch()
+        pv_urow.addWidget(pv_usel, 1)
+        self.scav_pv_add_btn = QPushButton("➕ Ekle")
+        self.scav_pv_add_btn.setObjectName("startBtn")
+        self.scav_pv_add_btn.setCursor(Qt.PointingHandCursor)
+        self.scav_pv_add_btn.setMinimumWidth(80)
+        self.scav_pv_add_btn.setMinimumHeight(40)
+        self.scav_pv_add_btn.clicked.connect(self._scav_pv_add_villages)
+        pv_urow.addWidget(self.scav_pv_add_btn)
+        pv_lay.addLayout(pv_urow)
+
+        pv_active = QGroupBox("Aktif temizlik köyleri")
+        pv_active_lay = QVBoxLayout(pv_active)
+        pv_active_lay.setContentsMargins(4, 4, 4, 4)
+        self.scav_pv_table = QTreeWidget()
+        self.scav_pv_table.setRootIsDecorated(False)
+        self.scav_pv_table.setAlternatingRowColors(True)
+        self.scav_pv_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.scav_pv_table.setHeaderLabels(["Köy", "Birimler", "Durum"])
+        self.scav_pv_table.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.scav_pv_table.header().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.scav_pv_table.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.scav_pv_table.setMaximumHeight(160)
+        pv_active_lay.addWidget(self.scav_pv_table)
+        pv_btn_row = QHBoxLayout()
+        self.scav_pv_remove_btn = QPushButton("Seçileni kaldır")
+        self.scav_pv_remove_btn.clicked.connect(self._scav_pv_remove_selected)
+        pv_btn_row.addWidget(self.scav_pv_remove_btn)
+        self.scav_pv_clear_btn = QPushButton("Listeyi temizle")
+        self.scav_pv_clear_btn.clicked.connect(self._scav_pv_clear)
+        pv_btn_row.addWidget(self.scav_pv_clear_btn)
+        pv_btn_row.addStretch()
+        pv_active_lay.addLayout(pv_btn_row)
+        pv_lay.addWidget(pv_active)
+        self.scav_pv_panel.setVisible(False)
+        opt_layout.addWidget(self.scav_pv_panel)
 
         # Evde tut (Sophie keepHome)
         kh_row = QHBoxLayout()
@@ -17383,9 +17509,178 @@ class TribalWarsBot(QMainWindow):
         self._scav_next_send = 0
         self._scav_villages_cache = []  # Tüm köy verileri
         self._scav_world_meta = {}  # duration_factor, duration_exponent, duration_initial_seconds
+        self._scav_village_profiles = {}  # vid -> {units: set, row: QTreeWidgetItem}
         self._refresh_scav_groups()
+        self._scav_load_profiles()
+        self._scav_on_mode_changed()
+        QTimer.singleShot(0, self._scav_refresh_vsel)
 
     # ── TEMİZLİK (TOPLU) FONKSİYONLAR ────────
+
+    def _scav_get_mode(self) -> str:
+        if getattr(self, "scav_mode_village", None) and self.scav_mode_village.isChecked():
+            return "village"
+        return "mass"
+
+    def _scav_on_mode_changed(self, *_args):
+        village = self._scav_get_mode() == "village"
+        if hasattr(self, "scav_mass_units_wrap"):
+            self.scav_mass_units_wrap.setVisible(not village)
+        if hasattr(self, "scav_group_row_wrap"):
+            self.scav_group_row_wrap.setVisible(not village)
+        if hasattr(self, "scav_pv_panel"):
+            self.scav_pv_panel.setVisible(village)
+        try:
+            self._settings.setValue("scav/mode", "village" if village else "mass")
+        except Exception:
+            pass
+        if village:
+            self._scav_refresh_vsel()
+        else:
+            cache = getattr(self, "_scav_villages_cache", None) or []
+            if cache:
+                self._scav_update_table(cache)
+
+    def _scav_refresh_vsel(self):
+        """Köy köy seçim tablosunu oyun verisinden doldur."""
+        if not hasattr(self, "scav_vsel_table"):
+            return
+        all_v = self._game_data.get("all_villages") or []
+        if not all_v:
+            v = self._game_data.get("village", {})
+            if v:
+                all_v = [v]
+        self.scav_vsel_table.clear()
+        for v in _tw_sorted_player_villages(all_v):
+            vid = str(v.get("id", "") or "")
+            if not vid:
+                continue
+            coord = f"({v.get('x', '?')}|{v.get('y', '?')})"
+            name = v.get("name", "?")
+            row = QTreeWidgetItem([name, coord])
+            row.setCheckState(0, Qt.Unchecked)
+            row.setFlags(row.flags() | Qt.ItemIsUserCheckable)
+            row.setData(0, Qt.UserRole, vid)
+            self.scav_vsel_table.addTopLevelItem(row)
+        profiles = getattr(self, "_scav_village_profiles", {}) or {}
+        for v in all_v:
+            vid = str(v.get("id", "") or "")
+            st = profiles.get(vid)
+            if not st or not st.get("row"):
+                continue
+            coord = f"({v.get('x', '?')}|{v.get('y', '?')})"
+            st["row"].setText(0, f"{v.get('name', '?')} {coord}")
+
+    def _scav_pv_add_villages(self):
+        if not hasattr(self, "scav_vsel_table"):
+            return
+        checked = []
+        for i in range(self.scav_vsel_table.topLevelItemCount()):
+            it = self.scav_vsel_table.topLevelItem(i)
+            if it and it.checkState(0) == Qt.Checked:
+                vid = it.data(0, Qt.UserRole)
+                if vid:
+                    checked.append((str(vid), it.text(0), it.text(1)))
+        if not checked:
+            QMessageBox.warning(self, "Uyarı", "Üst listeden en az bir köy seçin.")
+            return
+        selected_units = {k for k, cb in self.scav_pv_unit_cbs.items() if cb.isChecked()}
+        if not selected_units:
+            QMessageBox.warning(self, "Uyarı", "En az bir birim seçin.")
+            return
+        unit_short = ", ".join(
+            self.SCAV_UNIT_SHORT.get(k, k)
+            for k, _ in self.SCAV_UNITS
+            if k in selected_units
+        )
+        if not hasattr(self, "_scav_village_profiles"):
+            self._scav_village_profiles = {}
+        added = updated = 0
+        for vid, vname, coord in checked:
+            label = f"{vname} {coord}"
+            if vid in self._scav_village_profiles:
+                st = self._scav_village_profiles[vid]
+                st["units"] = set(selected_units)
+                st["row"].setText(1, unit_short)
+                st["row"].setText(2, "Hazır")
+                updated += 1
+            else:
+                row = QTreeWidgetItem([label, unit_short, "Hazır"])
+                self.scav_pv_table.addTopLevelItem(row)
+                self._scav_village_profiles[vid] = {"units": set(selected_units), "row": row}
+                added += 1
+        self._scav_save_profiles()
+        parts = []
+        if added:
+            parts.append(f"{added} yeni")
+        if updated:
+            parts.append(f"{updated} güncellendi")
+        self._add_log("TEMİZLİK", "info", f"Köy köy liste: {', '.join(parts)} — {unit_short}")
+
+    def _scav_pv_remove_selected(self):
+        if not hasattr(self, "scav_pv_table"):
+            return
+        items = self.scav_pv_table.selectedItems()
+        if not items:
+            return
+        to_remove = {id(it) for it in items}
+        for vid in list(self._scav_village_profiles.keys()):
+            st = self._scav_village_profiles[vid]
+            if id(st.get("row")) in to_remove:
+                idx = self.scav_pv_table.indexOfTopLevelItem(st["row"])
+                if idx >= 0:
+                    self.scav_pv_table.takeTopLevelItem(idx)
+                del self._scav_village_profiles[vid]
+        self._scav_save_profiles()
+
+    def _scav_pv_clear(self):
+        if hasattr(self, "scav_pv_table"):
+            self.scav_pv_table.clear()
+        self._scav_village_profiles = {}
+        self._scav_save_profiles()
+        self._add_log("TEMİZLİK", "info", "Köy köy liste temizlendi")
+
+    def _scav_save_profiles(self):
+        try:
+            payload = {
+                vid: {"units": sorted(list(st.get("units") or []))}
+                for vid, st in (self._scav_village_profiles or {}).items()
+            }
+            self._settings.setValue("scav/village_profiles", json.dumps(payload, ensure_ascii=False))
+            self._settings.setValue("scav/mode", self._scav_get_mode())
+            self._settings.sync()
+        except Exception:
+            pass
+
+    def _scav_load_profiles(self):
+        self._scav_village_profiles = {}
+        try:
+            mode = (self._settings.value("scav/mode", "mass") or "mass").strip().lower()
+            if mode == "village" and hasattr(self, "scav_mode_village"):
+                self.scav_mode_village.blockSignals(True)
+                self.scav_mode_village.setChecked(True)
+                self.scav_mode_village.blockSignals(False)
+            raw = self._settings.value("scav/village_profiles", "") or ""
+            if not raw:
+                return
+            data = json.loads(str(raw))
+            if not isinstance(data, dict) or not hasattr(self, "scav_pv_table"):
+                return
+            for vid, meta in data.items():
+                units = set(meta.get("units") or []) if isinstance(meta, dict) else set()
+                units = {u for u in units if u in dict(self.SCAV_UNITS)}
+                if not units:
+                    continue
+                unit_short = ", ".join(
+                    self.SCAV_UNIT_SHORT.get(k, k)
+                    for k, _ in self.SCAV_UNITS
+                    if k in units
+                )
+                row = QTreeWidgetItem([f"Köy {vid}", unit_short, "Hazır"])
+                self.scav_pv_table.addTopLevelItem(row)
+                self._scav_village_profiles[str(vid)] = {"units": units, "row": row}
+        except Exception:
+            self._scav_village_profiles = {}
 
     def _refresh_scav_groups(self) -> None:
         """Temizlik sekmesindeki köy grubu combobox'ını village_groups ile güncelle."""
@@ -17453,7 +17748,9 @@ class TribalWarsBot(QMainWindow):
         return name or "grup"
 
     def _scav_allowed_village_ids(self):
-        """None = filtre yok (tüm köyler); set = yalnızca gruptaki köy id'leri."""
+        """None = filtre yok (tüm köyler); set = yalnızca izinli köy id'leri."""
+        if self._scav_get_mode() == "village":
+            return set((self._scav_village_profiles or {}).keys())
         cb = getattr(self, "scav_group_combo", None)
         if cb is None or cb.count() <= 0:
             return None
@@ -17475,7 +17772,14 @@ class TribalWarsBot(QMainWindow):
         }
 
     def _scav_send_order_for_village(self, village_id) -> list:
-        """Köy için gönderilecek birim sırası (ortak birim seçimi)."""
+        """Köy için gönderilecek birim sırası (moda göre)."""
+        vid = str(village_id or "")
+        if self._scav_get_mode() == "village":
+            st = (self._scav_village_profiles or {}).get(vid)
+            if not st:
+                return []
+            selected = st.get("units") or set()
+            return [k for k, _ in self.SCAV_UNITS if k in selected]
         return [k for k, _ in self.SCAV_UNITS if self.scav_unit_cbs[k].isChecked()]
 
     RT_UNITS = [
@@ -17514,29 +17818,40 @@ class TribalWarsBot(QMainWindow):
     def _scav_start(self):
         if not self._license_require_or_prompt("Temizlik"):
             return
-        any_checked = any(cb.isChecked() for cb in self.scav_unit_cbs.values())
-        if not any_checked:
-            QMessageBox.warning(self, "Uyarı", "En az bir birim türü seçin!")
-            return
-        allowed = self._scav_allowed_village_ids()
-        if allowed is not None and not allowed:
-            QMessageBox.warning(
-                self,
-                "Uyarı",
-                "Seçili köy grubunda köy yok.\n"
-                "Veriyi yenileyin veya başka bir grup / «Tüm köyler» seçin.",
-            )
-            return
+        if self._scav_get_mode() == "village":
+            if not (self._scav_village_profiles or {}):
+                QMessageBox.warning(
+                    self,
+                    "Uyarı",
+                    "Köy köy modunda aktif liste boş.\n"
+                    "Köy ve birim seçip «Ekle»ye basın (veya Toplu moda geçin).",
+                )
+                return
+            mode_lbl = "köy köy"
+        else:
+            any_checked = any(cb.isChecked() for cb in self.scav_unit_cbs.values())
+            if not any_checked:
+                QMessageBox.warning(self, "Uyarı", "En az bir birim türü seçin!")
+                return
+            allowed = self._scav_allowed_village_ids()
+            if allowed is not None and not allowed:
+                QMessageBox.warning(
+                    self,
+                    "Uyarı",
+                    "Seçili köy grubunda köy yok.\n"
+                    "Veriyi yenileyin veya başka bir grup / «Tüm köyler» seçin.",
+                )
+                return
+            mode_lbl = f"toplu ({self._scav_group_label()})"
         self.scav_enable_cb.setChecked(True)
         self._scav_active = True
         self._automation_mark_started("scav")
         self._scav_next_send = 0
         self.scav_start_btn.setEnabled(False)
         self.scav_stop_btn.setEnabled(True)
-        grp_lbl = self._scav_group_label()
-        self.scav_status_label.setText(f"Durum: Aktif ({grp_lbl})")
+        self.scav_status_label.setText(f"Durum: Aktif ({mode_lbl})")
         self.scav_status_label.setStyleSheet("font-size: 10px; color: #228822;")
-        self._add_log("TEMİZLİK", "success", f"▶ Temizlik başlatıldı — grup: {grp_lbl}")
+        self._add_log("TEMİZLİK", "success", f"▶ Temizlik başlatıldı — {mode_lbl}")
         self._scav_process()
 
     def _scav_stop(self):
@@ -17927,6 +18242,8 @@ class TribalWarsBot(QMainWindow):
                           "spy":"Cas","ram":"Koç","catapult":"Man","snob":"Mis"}
 
             allowed_ids = self._scav_allowed_village_ids()
+            village_mode = self._scav_get_mode() == "village"
+            profiles = self._scav_village_profiles or {}
             global_units = [k for k, cb in self.scav_unit_cbs.items() if cb.isChecked()]
 
             for v in villages:
@@ -17934,9 +18251,16 @@ class TribalWarsBot(QMainWindow):
                 opts = v.get("options", {})
                 uch = v.get("unit_counts_home") or {}
                 vid = str(v.get("village_id") or "")
-                if allowed_ids is not None and vid not in allowed_ids:
+                if not village_mode and allowed_ids is not None and vid not in allowed_ids:
                     continue
-                selected_units = global_units
+                if village_mode:
+                    st = profiles.get(vid)
+                    if st:
+                        selected_units = [k for k, _ in self.SCAV_UNITS if k in (st.get("units") or set())]
+                    else:
+                        selected_units = []  # listede yok — tabloda birim gösterme
+                else:
+                    selected_units = global_units
 
                 # Gösterim: seçili birimler − evde tut
                 available = {}
@@ -17995,6 +18319,9 @@ class TribalWarsBot(QMainWindow):
 
                 status = f"{free_count} boş" if free_count > 0 else "Tümü dolu"
                 status_color = "#228822" if free_count > 0 else "#2d5a9e"
+                if village_mode and vid not in profiles:
+                    status = "Listede yok"
+                    status_color = "#888888"
 
                 # Köy bazlı: açık slotların tamamı boşalana kadar süre (UI geri sayımı)
                 ready_col = 5
@@ -18192,12 +18519,20 @@ class TribalWarsBot(QMainWindow):
         prioritise_high = self.scav_prio_highfirst.isChecked()
         cat_enabled = {i: self.scav_cat_cbs[i].isChecked() for i in (1, 2, 3, 4)}
         allowed_ids = self._scav_allowed_village_ids()
+        village_mode = self._scav_get_mode() == "village"
+        profiles = self._scav_village_profiles or {}
+
+        if village_mode and not profiles:
+            self._add_log("TEMİZLİK", "warn", "Köy köy liste boş — gönderim yok.")
+            self._scav_schedule_next_mass(villages)
+            self._scav_checking = False
+            return
 
         if allowed_ids is not None and not allowed_ids:
             self._add_log(
                 "TEMİZLİK",
                 "warn",
-                "Seçili grupta köy yok — gönderim yok (Veriyi yenile / grup değiştir).",
+                "Seçili grupta / listede köy yok — gönderim yok (Veriyi yenile / grup değiştir).",
             )
             self._scav_schedule_next_mass(villages)
             self._scav_checking = False
@@ -18212,6 +18547,8 @@ class TribalWarsBot(QMainWindow):
             opts = v.get("options", {})
             village_id = v.get("village_id")
             vid = str(village_id or "")
+            if village_mode and vid not in profiles:
+                continue
             if allowed_ids is not None and vid not in allowed_ids:
                 continue
 
@@ -18342,10 +18679,12 @@ class TribalWarsBot(QMainWindow):
             return
 
         squads_js = json.dumps(batch)
+        botprot_js = self._botprot_js_strong_check_fn()
 
         send_js = f"""
         (function() {{
             window.__tw_scav_batch = 'SENDING';
+            {botprot_js}
             TribalWars.post('scavenge_api',
                 {{ajaxaction: 'send_squads'}},
                 {{"squad_requests": {squads_js}}},
@@ -18355,7 +18694,14 @@ class TribalWarsBot(QMainWindow):
                     window.__tw_scav_batch = 'OK|' + success + '/' + resp.length;
                 }},
                 function(err) {{
-                    window.__tw_scav_batch = 'ERROR|' + String(err);
+                    var s = String(err || '');
+                    if (twBotprotStrong(s)) {{
+                        window.__tw_scav_batch = 'BOTPROT|' + s.substring(0, 120);
+                    }} else if (twLooksLikeHtml(s)) {{
+                        window.__tw_scav_batch = 'OPAQUE|html_response';
+                    }} else {{
+                        window.__tw_scav_batch = 'ERROR|' + s;
+                    }}
                 }}
             );
         }})();
@@ -18379,6 +18725,7 @@ class TribalWarsBot(QMainWindow):
             if result_str.startswith("OK"):
                 info = result_str.replace("OK|", "")
                 self._add_log("TEMİZLİK", "success", f"✅ Batch gönderildi: {info}")
+                self._botprot_note_success()
                 # Sonraki batch
                 next_offset = offset + 200
                 if next_offset < len(all_squads):
@@ -18391,7 +18738,8 @@ class TribalWarsBot(QMainWindow):
                     self._scav_next_send = time.time() + 20
                     QTimer.singleShot(4000, self._scav_refresh)
             else:
-                error = result_str.replace("ERROR|", "")
+                self._botprot_handle_module_result("temizlik", result_str)
+                error = result_str.split("|", 1)[-1] if "|" in result_str else result_str
                 self._add_log("TEMİZLİK", "error", f"❌ Batch hatası: {error}")
                 self._scav_checking = False
 
@@ -19202,12 +19550,19 @@ class TribalWarsBot(QMainWindow):
         self._gold_append_log(msg)
         self.gold_status_label.setText("Durum: Dönüşüm tamam — yeniden planlanıyor")
         self.gold_status_label.setStyleSheet("font-size: 10px; color: #228822;")
+        self._botprot_note_success()
         self._gold_next_action = time.time() + 15
 
     def _gold_on_exchange_failure(self, err: str, cooldown_sec: int = 25):
         import time
-        self._gold_append_log(f"Tüccar hata: {err}")
-        self.gold_status_label.setText(f"Durum: Hata — {err[:60]}")
+        raw = str(err or "")
+        if not raw.startswith(("BOTPROT", "OPAQUE", "ERROR")):
+            raw = f"ERROR|{raw}"
+        kind = self._botprot_handle_module_result("altın", raw)
+        show = raw.split("|", 1)[-1] if "|" in raw else raw
+        self._gold_append_log(f"Tüccar hata: {show}")
+        label = "Doğrulama" if kind in ("strong", "opaque") else f"Hata — {show[:60]}"
+        self.gold_status_label.setText(f"Durum: {label}")
         self.gold_status_label.setStyleSheet("font-size: 10px; color: #cc4444;")
         self._gold_next_action = time.time() + cooldown_sec
 
@@ -19253,6 +19608,7 @@ class TribalWarsBot(QMainWindow):
                 if (!window.__tw_bot_results) window.__tw_bot_results = {{}};
                 if (window.__tw_bot_results[cmdId]) return;
                 window.__tw_bot_results[cmdId] = 'SENDING';
+                {self._botprot_js_strong_check_fn()}
 
                 function parseJsonResponse(data) {{
                     if (!data || typeof data !== 'object') return false;
@@ -19303,8 +19659,16 @@ class TribalWarsBot(QMainWindow):
                     body: body
                 }}).then(function(r) {{
                     return r.text().then(function(text) {{
+                        if (twBotprotStrong(text)) {{
+                            window.__tw_bot_results[cmdId] = 'BOTPROT|market_html';
+                            return;
+                        }}
                         if (!r.ok) {{
-                            window.__tw_bot_results[cmdId] = 'ERROR|HTTP_' + r.status;
+                            if (twLooksLikeHtml(text) && !htmlShowsExchangeError(text)) {{
+                                window.__tw_bot_results[cmdId] = 'OPAQUE|HTTP_' + r.status;
+                            }} else {{
+                                window.__tw_bot_results[cmdId] = 'ERROR|HTTP_' + r.status;
+                            }}
                             return;
                         }}
                         var data = null;
@@ -19322,7 +19686,14 @@ class TribalWarsBot(QMainWindow):
                         window.__tw_bot_results[cmdId] = 'VERIFY';
                     }});
                 }}).catch(function(e) {{
-                    window.__tw_bot_results[cmdId] = 'ERROR|' + String(e);
+                    var s = String(e || '');
+                    if (twBotprotStrong(s)) {{
+                        window.__tw_bot_results[cmdId] = 'BOTPROT|' + s.substring(0, 80);
+                    }} else if (/failed to fetch|networkerror|abort/i.test(s)) {{
+                        window.__tw_bot_results[cmdId] = 'OPAQUE|' + s.substring(0, 80);
+                    }} else {{
+                        window.__tw_bot_results[cmdId] = 'ERROR|' + s;
+                    }}
                 }});
             }})();
             """
@@ -19399,9 +19770,8 @@ class TribalWarsBot(QMainWindow):
                 self._gold_on_exchange_success(ex)
                 return
 
-            err = res_str.split("|", 1)[-1] if "|" in res_str else res_str
             self._gold_finish_exchange(cmd_id)
-            self._gold_on_exchange_failure(err)
+            self._gold_on_exchange_failure(res_str)
 
         self.browser.page().runJavaScript(check_js, on_poll)
 
@@ -19860,7 +20230,7 @@ class TribalWarsBot(QMainWindow):
             self.browser.page().runJavaScript(f"try {{ window[{k}] = null; }} catch (e) {{}}")
 
     def _rt_escalate_train_botprot(self, *, vid=None, unit_name: str = "", soft_reload: bool = False) -> None:
-        """Asker train bot koruması şüphesi → duraklat; soft-reload yalnızca güçlü sinyalde."""
+        """Asker train bot koruması şüphesi → ortak escalate."""
         for st in (getattr(self, "_rt_village_states", None) or {}).values():
             if not isinstance(st, dict):
                 continue
@@ -19874,23 +20244,15 @@ class TribalWarsBot(QMainWindow):
                     row.setForeground(4, QColor("#cc4444"))
                 except Exception:
                     pass
-        self._botprot_start_fast_poll(120)
-        try:
-            self._botprot_hold_until = time.time() + 45.0
-        except Exception:
-            self._botprot_hold_until = 0.0
-        self._set_human_verification_state(
-            True,
-            ["asker basımı engellendi (muhtemel doğrulama)"],
-            hidden=True,
+        detail = "asker basımı engellendi (muhtemel doğrulama)"
+        if unit_name:
+            detail = f"{detail}: {unit_name}"
+        self._botprot_escalate_from_module(
+            "asker",
+            detail,
+            soft_reload=soft_reload,
+            reveal_reason="asker train botprot",
         )
-        QTimer.singleShot(100, self._poll_bot_protection)
-        # Soft-reload yalnızca net botprot HTML'de — aksi halde fetch yarım kalıp zaman aşımı olur
-        if soft_reload:
-            QTimer.singleShot(
-                500,
-                lambda: self._botprot_reveal_captcha(reason="asker train botprot"),
-            )
 
     def _rt_process_building(self, vid, bld_key):
         """Belirli bir bina kuyruğunu işle (kışla/ahır/atölye bağımsız)."""
@@ -20097,9 +20459,10 @@ class TribalWarsBot(QMainWindow):
                         row.setBackground(c, self._rt_bg("trained"))
                 self._add_log("ASKER", "success",
                     f"✅ [{bld_label}] {unit_name} ×1 → köy {vid} — ~{mins}dk {secs}sn")
-                self._rt_page_miss_streak = 0
+                self._botprot_note_success()
 
             elif result_str.startswith("BUSY|"):
+                self._botprot_note_success()
                 remain = 60
                 try:
                     remain = int(result_str.split("|")[1])
@@ -20133,8 +20496,6 @@ class TribalWarsBot(QMainWindow):
 
             elif result_str.startswith("PAGE_MISS|"):
                 import random as _rnd3
-                streak = int(getattr(self, "_rt_page_miss_streak", 0) or 0) + 1
-                self._rt_page_miss_streak = streak
                 wait_sec = _rnd3.randint(20, 40)
                 bst["next_fire"] = now + wait_sec
                 if row:
@@ -20145,22 +20506,24 @@ class TribalWarsBot(QMainWindow):
                 self._add_log(
                     "ASKER",
                     "warn",
-                    f"[{bld_label}] Köy {vid}: eğitim formu okunamadı ({streak}/2) — {wait_sec}sn sonra tekrar",
+                    f"[{bld_label}] Köy {vid}: eğitim formu okunamadı — {wait_sec}sn sonra tekrar",
                 )
-                self._botprot_start_fast_poll(45)
-                QTimer.singleShot(100, self._poll_bot_protection)
-                if streak >= 2:
-                    self._rt_page_miss_streak = 0
-                    self._add_log(
-                        "ASKER",
-                        "warn",
-                        "Ardışık form miss — bot koruması şüphesi, soft-reload.",
-                    )
-                    self._rt_escalate_train_botprot(vid=vid, unit_name=unit_name, soft_reload=True)
+                escalated = self._botprot_note_opaque_fail(
+                    "asker",
+                    f"eğitim formu yok (köy {vid})",
+                    soft_reload_on_escalate=True,
+                )
+                if escalated and row:
+                    row.setText(4, f"[{bld_label}] Doğrulama şüphesi — durdu")
+                    row.setForeground(4, QColor("#cc4444"))
+                    for c in range(5):
+                        row.setBackground(c, self._rt_bg("error"))
 
             elif result_str.startswith("BLOCKED|") or result_str.startswith("NO_UNIT|"):
                 import random as _rnd2
-                self._rt_page_miss_streak = 0
+                # Bilinen oyun engeli — botprot değil; BLOCKED streak sıfırlar
+                if result_str.startswith("BLOCKED|"):
+                    self._botprot_note_success()
                 bld_units = self._rt_get_building_units(vid, bld_key)
                 bst["next_index"] = (bst["next_index"] + 1) % max(len(bld_units), 1)
 
@@ -20790,9 +21153,11 @@ class TribalWarsBot(QMainWindow):
     def _incomings_on_auto_tag_toggled(self, checked: bool) -> None:
         """Otomatik etiketleme açık/kapalı: zamanlayıcıyı başlat veya durdur."""
         if checked:
+            self._automation_mark_started("incomings")
             self._incomings_schedule_next_auto_refresh()
             QTimer.singleShot(2000, self._incomings_auto_refresh_tick)
         else:
+            self._automation_mark_stopped("incomings")
             self._incomings_auto_timer.stop()
             self._incomings_pending_auto_label = False
             self._incomings_reschedule_after_this_fetch = False
@@ -21008,15 +21373,27 @@ class TribalWarsBot(QMainWindow):
             .then(function(r) { return r.text(); })
             .then(function(html) {
                 var doc = new DOMParser().parseFromString(html, 'text/html');
+                var hl = String(html || '').toLowerCase();
+                var botprotStrong = !!doc.getElementById('botprotection_quest')
+                    || /botprotection|bot_protection/.test(hl)
+                    || hl.indexOf('bot koruma kontrol') >= 0;
                 var table = doc.getElementById('incomings_table')
                     || doc.querySelector('table#incomings_table');
                 if (!table) {
-                    window.__tw_incomings_fetch = JSON.stringify({
-                        status: 'OK',
-                        rows: [],
-                        fetchUrl: url,
-                        parseNote: 'no #incomings_table in HTML'
-                    });
+                    if (botprotStrong) {
+                        window.__tw_incomings_fetch = JSON.stringify({
+                            status: 'BOTPROT',
+                            message: 'bot koruması HTML',
+                            fetchUrl: url
+                        });
+                    } else {
+                        window.__tw_incomings_fetch = JSON.stringify({
+                            status: 'OPAQUE',
+                            message: 'no #incomings_table in HTML',
+                            fetchUrl: url,
+                            parseNote: 'no #incomings_table in HTML'
+                        });
+                    }
                     return;
                 }
                 var rows = table.querySelectorAll('tr');
@@ -21071,8 +21448,13 @@ class TribalWarsBot(QMainWindow):
                 });
             })
             .catch(function(err) {
+                var s = String(err || '');
+                var low = s.toLowerCase();
+                var st = 'ERROR';
+                if (low.indexOf('botprotection') >= 0 || low.indexOf('bot koruma') >= 0) st = 'BOTPROT';
+                else if (/failed to fetch|networkerror|abort/i.test(s)) st = 'OPAQUE';
                 window.__tw_incomings_fetch = JSON.stringify({
-                    status: 'ERROR', message: String(err)
+                    status: st, message: s
                 });
             });
         })();
@@ -21144,12 +21526,32 @@ class TribalWarsBot(QMainWindow):
             if data.get("status") == "ERROR":
                 self._incomings_tick_origin_mono = None
                 msg = data.get("message", "?")
+                self._botprot_handle_module_result("gelen", f"ERROR|{msg}")
                 self.incomings_status_label.setText("Hata: " + str(msg)[:80])
                 if not silent:
                     self._add_log("GELEN", "error", f"Gelen yükleme: {msg}")
                 return
 
+            if data.get("status") == "BOTPROT":
+                self._incomings_tick_origin_mono = None
+                msg = data.get("message", "bot koruması")
+                self._botprot_note_strong_hit("gelen", str(msg)[:120], soft_reload=True)
+                self.incomings_status_label.setText("Bot koruması algılandı")
+                if not silent:
+                    self._add_log("GELEN", "warn", f"Gelen yükleme: bot koruması — {msg}")
+                return
+
+            if data.get("status") == "OPAQUE":
+                self._incomings_tick_origin_mono = None
+                msg = data.get("message", "opak yanıt")
+                self._botprot_note_opaque_fail("gelen", str(msg)[:120], soft_reload_on_escalate=True)
+                self.incomings_status_label.setText("Tablo yok (şüpheli)")
+                if not silent:
+                    self._add_log("GELEN", "warn", f"Gelen yükleme opak: {msg}")
+                return
+
             rows = data.get("rows", [])
+            self._botprot_note_success()
             self.incomings_tree.clear()
             if not rows:
                 self._incomings_tick_origin_mono = None
@@ -24789,6 +25191,8 @@ class TribalWarsBot(QMainWindow):
                 f"Dünya: {data.get('world', '?')}")
             self._refresh_support_plan_groups()
             self._refresh_scav_groups()
+            if hasattr(self, "scav_vsel_table"):
+                self._scav_refresh_vsel()
 
             QTimer.singleShot(200, self._poll_bot_protection)
 
@@ -25435,6 +25839,8 @@ class TribalWarsBot(QMainWindow):
             self._rt_refresh_villages()
         if hasattr(self, "scav_group_combo"):
             self._refresh_scav_groups()
+        if hasattr(self, "scav_vsel_table"):
+            self._scav_refresh_vsel()
 
     def _update_villages_list(self, data):
         """Köyler sekmesindeki tüm köy tablosunu güncelle."""
@@ -25993,6 +26399,184 @@ class TribalWarsBot(QMainWindow):
 
         self.browser.page().runJavaScript(fetch_js, on_result)
 
+    @staticmethod
+    def _botprot_text_has_strong_markers(text: str) -> bool:
+        """HTML/metinde güçlü bot koruması iğnesi (asker train ile aynı)."""
+        hl = (text or "").lower()
+        if not hl:
+            return False
+        return (
+            "botprotection_quest" in hl
+            or "botprotection" in hl
+            or "bot_protection" in hl
+            or "bot koruma kontrol" in hl
+        )
+
+    @staticmethod
+    def _botprot_js_strong_check_fn() -> str:
+        """JS: twBotprotStrong(text) + twLooksLikeHtml(text) — fetch yanıtları için."""
+        return (
+            "function twBotprotStrong(text){"
+            "  var hl=String(text||'').toLowerCase();"
+            "  return hl.indexOf('botprotection_quest')>=0"
+            "    || /botprotection|bot_protection/.test(hl)"
+            "    || hl.indexOf('bot koruma kontrol')>=0;"
+            "}"
+            "function twLooksLikeHtml(text){"
+            "  var t=String(text||'');"
+            "  return /<!doctype|<html[\\s>]|botprotection/i.test(t);"
+            "}"
+        )
+
+    def _botprot_note_success(self) -> None:
+        """Başarılı otomasyon işlemi — opak hata streak sıfırla."""
+        self._botprot_opaque_fail_streak = 0
+        self._rt_page_miss_streak = 0
+
+    def _botprot_escalate_from_module(
+        self,
+        source: str,
+        detail: str,
+        *,
+        soft_reload: bool = False,
+        reveal_reason: str = "",
+    ) -> None:
+        """Modül botprot şüphesi → duraklat + Telegram; soft-reload isteğe bağlı."""
+        self._botprot_opaque_fail_streak = 0
+        self._rt_page_miss_streak = 0
+        src = (source or "otomasyon").strip() or "otomasyon"
+        det = (detail or "muhtemel doğrulama").strip() or "muhtemel doğrulama"
+        part = f"{src}: {det}"
+        self._botprot_start_fast_poll(120)
+        try:
+            self._botprot_hold_until = time.time() + 45.0
+        except Exception:
+            self._botprot_hold_until = 0.0
+        self._set_human_verification_state(True, [part], hidden=True)
+        QTimer.singleShot(100, self._poll_bot_protection)
+        if soft_reload:
+            why = reveal_reason or f"{src} botprot"
+            QTimer.singleShot(
+                500,
+                lambda w=why: self._botprot_reveal_captcha(reason=w),
+            )
+
+    def _botprot_note_strong_hit(
+        self,
+        source: str,
+        detail: str = "",
+        *,
+        soft_reload: bool = True,
+    ) -> None:
+        """Net botprot işareti — hemen escalate."""
+        det = detail or "HTML'de bot koruması"
+        self._add_log(
+            "GÜVENLİK",
+            "warn",
+            f"Bot koruması ({source}): {det} — otomasyon duraklatılıyor.",
+        )
+        self._botprot_escalate_from_module(
+            source,
+            det,
+            soft_reload=soft_reload,
+            reveal_reason=f"{source} botprot",
+        )
+
+    def _botprot_note_opaque_fail(
+        self,
+        source: str,
+        detail: str = "",
+        *,
+        soft_reload_on_escalate: bool = True,
+    ) -> bool:
+        """
+        Beklenen içerik yok / HTML / boş yanıt — streak++.
+        streak >= 2 → escalate. Dönüş: escalate edildi mi.
+        """
+        streak = int(getattr(self, "_botprot_opaque_fail_streak", 0) or 0) + 1
+        self._botprot_opaque_fail_streak = streak
+        det = detail or "beklenen içerik yok"
+        self._add_log(
+            "GÜVENLİK",
+            "warn",
+            f"Opak yanıt ({source}): {det} ({streak}/2) — bot koruması şüphesi.",
+        )
+        self._botprot_start_fast_poll(45)
+        QTimer.singleShot(100, self._poll_bot_protection)
+        if streak < 2:
+            return False
+        self._add_log(
+            "GÜVENLİK",
+            "warn",
+            f"Ardışık opak hata ({source}) — bot koruması şüphesi, soft-reload.",
+        )
+        self._botprot_escalate_from_module(
+            source,
+            f"ardışık opak hata: {det}",
+            soft_reload=soft_reload_on_escalate,
+            reveal_reason=f"{source} opaque x2",
+        )
+        return True
+
+    def _botprot_handle_module_result(
+        self,
+        source: str,
+        result_str: str,
+        *,
+        soft_reload: bool = True,
+    ) -> str:
+        """
+        Modül poll sonucu: 'ok' | 'strong' | 'opaque' | 'other'.
+        BOTPROT| / OPAQUE| / ERROR|botprot… işler; streak yönetir.
+        """
+        s = str(result_str or "").strip()
+        low = s.lower()
+        if s.startswith("BOTPROT") or low.startswith("botprot|") or "|botprot|" in low:
+            msg = s.split("|", 1)[-1] if "|" in s else "bot koruması"
+            self._botprot_note_strong_hit(source, msg, soft_reload=soft_reload)
+            return "strong"
+        if s.startswith("OPAQUE") or low.startswith("opaque|"):
+            msg = s.split("|", 1)[-1] if "|" in s else "opak yanıt"
+            self._botprot_note_opaque_fail(source, msg, soft_reload_on_escalate=soft_reload)
+            return "opaque"
+        if s.startswith("ERROR"):
+            err = s.replace("ERROR|", "", 1) if s.startswith("ERROR|") else s[5:].lstrip("|")
+            if self._botprot_text_has_strong_markers(err) or self._dispatch_error_suggests_botprot(err):
+                self._botprot_note_strong_hit(source, err[:120], soft_reload=soft_reload)
+                return "strong"
+            el = (err or "").lower().strip()
+            opaque_hints = (
+                not el,
+                el in ("undefined", "null", "[object object]"),
+                "<!doctype" in el or "<html" in el,
+                "reddedildi" in el and "yeterli" not in el,
+                "failed to fetch" in el,
+                "networkerror" in el,
+                "abort" in el and "timeout" in el,
+            )
+            if any(opaque_hints):
+                self._botprot_note_opaque_fail(
+                    source, (err or "boş/opak hata")[:120], soft_reload_on_escalate=soft_reload
+                )
+                return "opaque"
+            return "other"
+        return "other"
+
+    def _botprot_any_automation_active(self) -> bool:
+        """Farm/scav/gold/asker/bq/ana bot veya gelen auto-tag açık mı."""
+        try:
+            if self._automation_collect_running():
+                return True
+        except Exception:
+            pass
+        try:
+            cb = getattr(self, "incomings_auto_tag_cb", None)
+            if cb is not None and cb.isChecked():
+                return True
+        except Exception:
+            pass
+        return False
+
     def _botprot_in_fast_mode(self) -> bool:
         """Doğrulama aktif veya yakın zamanda şüpheli sinyal — hızlı DOM taraması."""
         if self._human_verification_required:
@@ -26158,7 +26742,9 @@ class TribalWarsBot(QMainWindow):
         if self._human_verification_required and not getattr(self, "_botprot_hidden_hint", False):
             return
         last = float(getattr(self, "_botprot_net_probe_at", 0) or 0)
-        if now - last < 35.0:
+        # Aktif otomasyonda daha sık overview HTML kontrolü (~12–15 sn)
+        min_gap = 12.0 if self._botprot_any_automation_active() else 35.0
+        if now - last < min_gap:
             return
         self._botprot_net_probe_at = now
         vid = ""
@@ -26471,6 +27057,8 @@ class TribalWarsBot(QMainWindow):
                 self._botprot_hidden_hint = False
                 self._botprot_hidden_since = 0.0
                 self._botprot_last_parts = []
+                self._botprot_opaque_fail_streak = 0
+                self._rt_page_miss_streak = 0
                 self._botprot_clear_fast_poll()
                 self._update_botprot_ui()
                 self._add_log(

@@ -1,5 +1,5 @@
 {
-  "version": "1.4.7",
-  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.7/TribalWarsBot-1.4.7.zip",
-  "changelog_tr": "Temizlik: köy köy liste kaldırıldı; şablonlu destek gibi köy grubu seçimi.\nGelen: ~3 dk native Etiket (hepsini seç); snob ikonu tespiti; Telegram misyoner bildirimi (3+ tren ~200ms±30ms) + ekran görüntüsü.\nDepo Denge: Türkçe etiketler; Gönder butonu yeşil.\nAltın Para: düzenli UI; işlem günlüğü tema uyumu.\nv1.4.6 botprot/asker düzeltmeleri dahil."
+  "version": "1.4.8",
+  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.8/TribalWarsBot-1.4.8.zip",
+  "changelog_tr": "Bot koruması: asker olmadan farm/temizlik/altın/gelen hatalarında tespit + Telegram.\nTemizlik: köy köy liste geri geldi (toplu grup seçici duruyor).\nFake planı: koç/mancınık zorunluluğu kalktı; seçilen birimlerden 1 asker yeter (fake limiti pasif dünyalar).\nv1.4.7 gelen Etiket / Telegram misyoner dahil."
 }
