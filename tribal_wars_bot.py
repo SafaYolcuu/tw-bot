@@ -196,7 +196,7 @@ from license_client import (  # noqa: E402
 # ─────────────────────────────────────────────
 
 # EXE'nin guncel oldugunu dogrulamak icin her onemli degisiklikte artirin.
-APP_VERSION = "1.4.9"
+APP_VERSION = "1.4.10"
 
 # Otomatik guncelleme — kullaniciya GitHub adresi gosterilmez; yalnizca bu URL okunur.
 UPDATE_MANIFEST_URL = "https://safayolcuu.github.io/tw-bot/bot-update.json"
@@ -428,13 +428,51 @@ def _tw_version_tuple(version_str: str):
     return tuple(parts[:3])
 
 
+def _tw_ssl_context(*, insecure: bool = False):
+    """Guncelleme / HTTPS: once certifi; insecure veya eksik CA icin dogrulamasiz."""
+    if insecure:
+        return ssl._create_unverified_context()
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        try:
+            return ssl.create_default_context()
+        except Exception:
+            return ssl._create_unverified_context()
+
+
 def _tw_http_get_bytes(url: str, *, timeout: float = 30.0) -> bytes:
+    """HTTPS GET — SSL hatasinda bir kez dogrulamasiz dene (Windows CA / antivirus)."""
     req = urllib.request.Request(
         url,
         headers={"User-Agent": UPDATE_USER_AGENT, "Accept": "*/*"},
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+    last_err = None
+    for insecure in (False, True):
+        try:
+            ctx = _tw_ssl_context(insecure=insecure)
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}),
+                urllib.request.HTTPSHandler(context=ctx),
+            )
+            with opener.open(req, timeout=timeout) as resp:
+                return resp.read()
+        except Exception as ex:
+            last_err = ex
+            msg = str(ex).lower()
+            ssl_fail = (
+                "certificate" in msg
+                or "ssl" in msg
+                or "certifi" in msg
+                or isinstance(ex, ssl.SSLError)
+            )
+            if insecure or not ssl_fail:
+                break
+            # Dogrulanmis baglanti basarisiz → bir kez unverified dene
+            continue
+    raise last_err if last_err else RuntimeError("HTTP GET basarisiz")
 
 
 def _tw_http_get_json(url: str, *, timeout: float = 20.0) -> dict:
@@ -5171,9 +5209,11 @@ class TribalWarsBot(QMainWindow):
         self._botprot_hold_until = 0.0  # asker/gönderim şüphesi: erken "kalktı" deme
         self._botprot_hidden_since = 0.0  # gizli doğrulama başlangıcı
         self._botprot_net_probe_at = 0.0
+        # Sonraki ağ probe zamanı (jitter) — ritmik istekten kaçın
+        self._botprot_net_probe_next_at = time.time() + random.uniform(40.0, 75.0)
         self._botprot_opaque_fail_streak = 0  # farm/scav/gold/gelen/asker opak hata sayacı
         self._rt_page_miss_streak = 0
-        # Otomasyon başlangıç zamanları — botprot Telegram yalnızca aktif işler için
+        # Otomasyon başlangıç zamanları — botprot Telegram için süre bilgisi
         self._automation_started_at = {}  # key -> unix
         self._botprot_telegram_last_at = 0.0
         self._last_scraped_village_id = None
@@ -5713,10 +5753,19 @@ class TribalWarsBot(QMainWindow):
 
         if not isinstance(result, dict) or not result.get("ok"):
             err = (result or {}).get("error", "?") if isinstance(result, dict) else "?"
+            tip = ""
+            el = str(err).lower()
+            if "certificate" in el or "ssl" in el:
+                tip = (
+                    "\n\nSSL / sertifika hatası: antivirüs veya eksik Windows CA olabilir.\n"
+                    "Geçici çözüm: tarayıcıdan indirin:\n"
+                    "https://github.com/SafaYolcuu/tw-bot/releases\n"
+                    "ZIP’i açıp eski klasörün üzerine kopyalayın (tw_config.json kalsın)."
+                )
             QMessageBox.warning(
                 self,
                 "Güncelleme",
-                f"İndirme başarısız.\n\n{err[:400]}",
+                f"İndirme başarısız.\n\n{err[:400]}{tip}",
             )
             self._add_log("SİSTEM", "warn", f"Güncelleme indirilemedi: {err[:120]}")
             return
@@ -6048,14 +6097,15 @@ class TribalWarsBot(QMainWindow):
         return "\n".join(lines)
 
     def _notify_telegram_security(self, parts) -> None:
-        """Yalnızca o anda aktif otomasyon varsa Telegram; rate-limit uygulanır."""
+        """Bot koruması Telegram: oyunda iken bildir (asker / aktif görev şart değil)."""
         jobs = self._automation_collect_running()
-        if not jobs:
+        in_game = self._login_state == "in_game"
+        # Hesap yöneticisi senaryosu: otomasyon listesi boş olsa da oturum açıksa bildir
+        if not in_game and not jobs:
             self._add_log(
                 "GÜVENLİK",
                 "info",
-                "Telegram atlandı: duraklayan aktif otomasyon yok "
-                "(yalnızca Başlatılmış temizlik/asker/farm vb. için bildirilir).",
+                "Telegram atlandı: oyun oturumu yok.",
             )
             return
         now = time.time()
@@ -6068,12 +6118,21 @@ class TribalWarsBot(QMainWindow):
             )
             return
         self._botprot_telegram_last_at = now
-        labels = ", ".join(f"{lbl} ({self._automation_format_duration(now - t0)})" for _, lbl, t0 in jobs)
-        self._add_log(
-            "GÜVENLİK",
-            "warn",
-            f"Telegram: aktif görevler durdu → bildirim ({labels})",
-        )
+        if jobs:
+            labels = ", ".join(
+                f"{lbl} ({self._automation_format_duration(now - t0)})" for _, lbl, t0 in jobs
+            )
+            self._add_log(
+                "GÜVENLİK",
+                "warn",
+                f"Telegram: bot koruması → bildirim ({labels})",
+            )
+        else:
+            self._add_log(
+                "GÜVENLİK",
+                "warn",
+                "Telegram: bot koruması → bildirim (oturum açık).",
+            )
         tw_telegram_send_message_threaded(
             self, self._format_telegram_security_message(parts, paused_jobs=jobs)
         )
@@ -26732,7 +26791,11 @@ class TribalWarsBot(QMainWindow):
         self._botprot_try_soft_reload(reason="ertelenmiş")
 
     def _botprot_network_probe(self) -> None:
-        """DOM takılıyken fetch ile bot koruması HTML'ini ara (görünmez captcha)."""
+        """
+        Seyrek + jitter'lı overview fetch (sayfa değiştirmez).
+        Ritmik 12–15 sn yerine ~55–95 sn; hot-path'te atlanır (çakışma / rate-limit).
+        Net botprot HTML → escalate + soft-reload (F5); aksi halde sessiz.
+        """
         if not self.browser:
             return
         if self._login_state != "in_game":
@@ -26741,11 +26804,17 @@ class TribalWarsBot(QMainWindow):
         # Zaten görünür doğrulama varsa probe gerekmez
         if self._human_verification_required and not getattr(self, "_botprot_hidden_hint", False):
             return
-        last = float(getattr(self, "_botprot_net_probe_at", 0) or 0)
-        # Aktif otomasyonda daha sık overview HTML kontrolü (~12–15 sn)
-        min_gap = 12.0 if self._botprot_any_automation_active() else 35.0
-        if now - last < min_gap:
+        # Gönderim anında ekstra istek atma
+        if self._botprot_automation_hot_path():
             return
+        next_at = float(getattr(self, "_botprot_net_probe_next_at", 0) or 0)
+        if next_at <= 0:
+            next_at = now + random.uniform(40.0, 75.0)
+            self._botprot_net_probe_next_at = next_at
+        if now < next_at:
+            return
+        # Bir sonraki probe'u önce planla (sabit ritim yok)
+        self._botprot_net_probe_next_at = now + random.uniform(55.0, 95.0)
         self._botprot_net_probe_at = now
         vid = ""
         try:
@@ -26800,7 +26869,16 @@ class TribalWarsBot(QMainWindow):
                 ["ağ probe (bot koruması HTML)"],
                 hidden=True,
             )
-            QTimer.singleShot(200, lambda: self._botprot_reveal_captcha(reason="ağ probe"))
+            # Soft-reload yalnızca net hit; hot-path bitince (defer) veya hemen
+            if self._botprot_automation_hot_path():
+                self._botprot_reload_deferred = True
+                self._add_log(
+                    "GÜVENLİK",
+                    "info",
+                    "F5 ertelendi — aktif gönderim bitince yenilenecek.",
+                )
+            else:
+                QTimer.singleShot(200, lambda: self._botprot_reveal_captcha(reason="ağ probe"))
 
         try:
             self.browser.page().runJavaScript(js, on_probe)

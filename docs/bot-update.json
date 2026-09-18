@@ -1,5 +1,5 @@
 {
-  "version": "1.4.9",
-  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.9/TribalWarsBot-1.4.9.zip",
-  "changelog_tr": "Misyoner dalga aralığı 200 ms → 100 ms (dünya ~100±30).\nGelen Telegram tren tespiti buna göre güncellendi.\nv1.4.8 botprot/temizlik/fake değişiklikleri dahil."
+  "version": "1.4.10",
+  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.10/TribalWarsBot-1.4.10.zip",
+  "changelog_tr": "Güncelleme indirme: SSL sertifika hatasında certifi + güvenli geri dönüş (Windows CA / antivirus).\nBot koruması: seyrek jitter’lı ağ probe; Telegram oyunda iken (asker şart değil).\nv1.4.9 misyoner 100 ms dahil."
 }
