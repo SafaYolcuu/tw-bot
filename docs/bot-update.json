@@ -1,5 +1,5 @@
 {
-  "version": "1.4.8",
-  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.8/TribalWarsBot-1.4.8.zip",
-  "changelog_tr": "Bot koruması: asker olmadan farm/temizlik/altın/gelen hatalarında tespit + Telegram.\nTemizlik: köy köy liste geri geldi (toplu grup seçici duruyor).\nFake planı: koç/mancınık zorunluluğu kalktı; seçilen birimlerden 1 asker yeter (fake limiti pasif dünyalar).\nv1.4.7 gelen Etiket / Telegram misyoner dahil."
+  "version": "1.4.9",
+  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.9/TribalWarsBot-1.4.9.zip",
+  "changelog_tr": "Misyoner dalga aralığı 200 ms → 100 ms (dünya ~100±30).\nGelen Telegram tren tespiti buna göre güncellendi.\nv1.4.8 botprot/temizlik/fake değişiklikleri dahil."
 }

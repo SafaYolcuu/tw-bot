@@ -196,7 +196,7 @@ from license_client import (  # noqa: E402
 # ─────────────────────────────────────────────
 
 # EXE'nin guncel oldugunu dogrulamak icin her onemli degisiklikte artirin.
-APP_VERSION = "1.4.8"
+APP_VERSION = "1.4.9"
 
 # Otomatik guncelleme — kullaniciya GitHub adresi gosterilmez; yalnizca bu URL okunur.
 UPDATE_MANIFEST_URL = "https://safayolcuu.github.io/tw-bot/bot-update.json"
@@ -3587,7 +3587,7 @@ class MisyonerMultiWaveDialog(QDialog):
         hint = QLabel(
             "Kaynak, hedef ve komut türü «Ordu Gönder» sekmesinden alınır. "
             "Varış veya gönderim zamanı seçin; birinci dalgaya göre sonraki her dalga yaklaşık "
-            f"{getattr(bot, 'SA_DISPATCH_WAVE_GAP_MS', 200)} ms arayla eklenir (oyunla uyumlu).\n"
+            f"{getattr(bot, 'SA_DISPATCH_WAVE_GAP_MS', 100)} ms arayla eklenir (oyunla uyumlu).\n"
             "Pencere açıkken bot ve tarayıcıda gezebilirsiniz; bitince Kapat veya İptal."
         )
         hint.setWordWrap(True)
@@ -3913,7 +3913,7 @@ class MisyonerMultiWaveDialog(QDialog):
         else:
             base_send_dt = input_dt
 
-        gap_ms = int(getattr(bot, "SA_DISPATCH_WAVE_GAP_MS", 200) or 200)
+        gap_ms = int(getattr(bot, "SA_DISPATCH_WAVE_GAP_MS", 100) or 100)
         added = 0
         errs = []
         for w, troops_map in enumerate(troops_list):
@@ -5105,8 +5105,8 @@ class TribalWarsBot(QMainWindow):
 
     # Aynı gönderim anında tek onay formunda birleştirilebilecek en fazla dalga (oyun üst sınırı ile uyumlu).
     SA_DISPATCH_MAX_BATCH = 5
-    # Çok dalgada ardışık satırların gönderim zamanı farkı (oyun yaklaşık 200 ms kullanır; onay formu alanları + kuyruk).
-    SA_DISPATCH_WAVE_GAP_MS = 200
+    # Çok dalgada ardışık satırların gönderim zamanı farkı (bu dünya ~100 ms ±30 ms).
+    SA_DISPATCH_WAVE_GAP_MS = 100
     # Tamamlanan ordu satırları (gönderildi/hata) — ana kuyruktan ayrı; yeniden gönderilmez.
     SA_ARMY_HISTORY_MAX_ROWS = 400
 
@@ -9772,7 +9772,7 @@ class TribalWarsBot(QMainWindow):
                     else:
                         skipped.append(f"{src_text}: {err}")
                 elif ut == "snob":
-                    gap_ms = int(getattr(self, "SA_DISPATCH_WAVE_GAP_MS", 200) or 200)
+                    gap_ms = int(getattr(self, "SA_DISPATCH_WAVE_GAP_MS", 100) or 100)
                     snob_waves = min(
                         noble_parts, self._sa_troop_count(troops_avail, "snob")
                     )
@@ -11290,7 +11290,7 @@ class TribalWarsBot(QMainWindow):
             tb = self._dispatch_parse_time_str(sb)
             if ta is None or tb is None:
                 return False
-            gap = int(getattr(self, "SA_DISPATCH_WAVE_GAP_MS", 200) or 200)
+            gap = int(getattr(self, "SA_DISPATCH_WAVE_GAP_MS", 100) or 100)
             dms = (tb - ta).total_seconds() * 1000
             if abs(dms - gap) > 2.0:
                 return False
@@ -20644,7 +20644,7 @@ class TribalWarsBot(QMainWindow):
         self.incomings_tg_snob_cb.setCursor(Qt.PointingHandCursor)
         self.incomings_tg_snob_cb.setToolTip(
             "Snob ikonu («Misyoner İçeriyor») olan yeni komutları Telegram’a bildirir.\n"
-            "Aynı hedefe ≥3 snob ve varışlar ~200 ms aralıklı (±30 ms) ise «N’li misyoner treni».\n"
+            "Aynı hedefe ≥3 snob ve varışlar ~100 ms aralıklı (±30 ms) ise «N’li misyoner treni».\n"
             "Ayarlar → Telegram açık ve token/chat dolu olmalı."
         )
         self.incomings_tg_snob_cb.setChecked(
@@ -20708,7 +20708,7 @@ class TribalWarsBot(QMainWindow):
             "«Otomatik etiketleme» ~3 dk’da bir sessiz yeniler; etiketsiz komutlara oyunun "
             "Etiket butonu (hepsini seç) uygulanır. Snob ikonu kesin misyonerdir; hız etiketi "
             "(M/HA/…) tahmindir. «Telegram ile misyonerleri haber ver» açıkken yeni snob’lar "
-            "ve ~200 ms aralıklı 3’lü/4’lü trenler bildirim + mümkünse ekran görüntüsü alır. "
+            "ve ~100 ms aralıklı 3’lü/4’lü trenler bildirim + mümkünse ekran görüntüsü alır. "
             "Kapalıyken yalnızca «Gelenleri Yükle» ile manuel güncelleme yapılır."
         )
         self.incomings_foot.setWordWrap(True)
@@ -21073,13 +21073,13 @@ class TribalWarsBot(QMainWindow):
                     ae = 0.0
                 if ae > 0:
                     arrivals.append(ae)
-            # Oyun: misyoner treni ~200 ms aralık, ±30 ms sapma
-            # n komut → ilk–son en fazla (n-1)*230 ms; 3’lü ve üzeri tren
+            # Oyun: misyoner treni ~100 ms aralık, ±30 ms sapma
+            # n komut → ilk–son en fazla (n-1)*130 ms; 3’lü ve üzeri tren
             n_snob = len(rows_sorted)
             span_ok = False
             if arrivals and n_snob >= 3:
                 span_ms = max(arrivals) - min(arrivals)
-                max_span_ms = (n_snob - 1) * 230.0
+                max_span_ms = (n_snob - 1) * 130.0
                 span_ok = span_ms <= max_span_ms
             is_train = n_snob >= 3 and span_ok
             if is_train:
