@@ -1,5 +1,5 @@
 {
-  "version": "1.4.10",
-  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.10/TribalWarsBot-1.4.10.zip",
-  "changelog_tr": "Güncelleme indirme: SSL sertifika hatasında certifi + güvenli geri dönüş (Windows CA / antivirus).\nBot koruması: seyrek jitter’lı ağ probe; Telegram oyunda iken (asker şart değil).\nv1.4.9 misyoner 100 ms dahil."
+  "version": "1.4.11",
+  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.11/TribalWarsBot-1.4.11.zip",
+  "changelog_tr": "Misyoner/çoklu dalga: onay POST’ta train[2]… train[N] (oyunla aynı; train[1] yok) — 4’lü tren düzeltmesi.\nÇoklu tarayıcı sekmesi (ortak oturum, en fazla 6) ve F5 ile yenileme.\nHarita koordinat seçici filtreleri.\nv1.4.10 güncelleme SSL / botprot dahil."
 }

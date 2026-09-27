@@ -142,7 +142,9 @@ try:
         Qt, QUrl, QTimer, QTime, QDate, QSize, pyqtSignal, QObject, QSettings, pyqtSlot,
         QByteArray, QBuffer, QIODevice,
     )
-    from PyQt5.QtGui import QFont, QColor, QBrush, QPainter, QPen, QPixmap, QIcon, QPalette
+    from PyQt5.QtGui import (
+        QFont, QColor, QBrush, QPainter, QPen, QPixmap, QIcon, QPalette, QKeySequence,
+    )
     from PyQt5.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QTabWidget, QLabel, QPushButton, QLineEdit, QComboBox, QCheckBox,
@@ -152,7 +154,7 @@ try:
         QSizePolicy, QFormLayout, QMessageBox, QTableWidget, QTableWidgetItem,
         QTimeEdit, QDateEdit, QAbstractItemView, QDoubleSpinBox, QSlider,
         QDialog, QDialogButtonBox, QRadioButton, QButtonGroup, QInputDialog,
-        QMenuBar, QAction, QProgressDialog,
+        QMenuBar, QAction, QProgressDialog, QShortcut,
     )
     from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage, QWebEngineProfile, QWebEngineSettings
     from PyQt5.QtWebChannel import QWebChannel
@@ -196,7 +198,7 @@ from license_client import (  # noqa: E402
 # ─────────────────────────────────────────────
 
 # EXE'nin guncel oldugunu dogrulamak icin her onemli degisiklikte artirin.
-APP_VERSION = "1.4.10"
+APP_VERSION = "1.4.11"
 
 # Otomatik guncelleme — kullaniciya GitHub adresi gosterilmez; yalnizca bu URL okunur.
 UPDATE_MANIFEST_URL = "https://safayolcuu.github.io/tw-bot/bot-update.json"
@@ -233,6 +235,28 @@ def sa_sendable_unit_defs(unit_defs):
 SA_QUEUE_TABLE_TROOP_KEYS = [
     k for k, _ in DEFAULT_UNIT_DEFS if k not in NON_SENDABLE_UNIT_KEYS
 ]
+
+# Mancınık hedefi — oyun place formu `building` anahtarı.
+# Seçilmezse / boşsa varsayılan: duvar (wall) — boş bırakmak bina vurmaz, sorun çıkarır.
+SA_CATAPULT_DEFAULT_BUILDING = "wall"
+SA_CATAPULT_UI_TARGETS = (
+    ("Duvar", "wall"),
+    ("Merkez binası", "main"),
+    ("Depo", "storage"),
+    ("Kışla", "barracks"),
+    ("Ahır", "stable"),
+    ("Atölye", "garage"),
+    ("Demirci", "smith"),
+    ("Oduncu", "wood"),
+    ("Taşçı", "stone"),
+    ("Demir madeni", "iron"),
+    ("Çiftlik", "farm"),
+    ("Market", "market"),
+    ("Toplanma yeri", "place"),
+    ("Akademi", "snob"),
+    ("Kilise", "church"),
+    ("Gözlem kulesi", "watchtower"),
+)
 
 
 UNIT_LABELS_TR = dict(DEFAULT_UNIT_DEFS)
@@ -1108,17 +1132,34 @@ def generate_villages(count=90):
 #  ANTİ-DETECTİON TARAYICI
 # ─────────────────────────────────────────────
 
+# Gömülü tarayıcı: aynı anda açık web sekmesi üst sınırı (bellek / Chromium çökmesi)
+TW_BROWSER_MAX_TABS = 6
+
+
 class StealthWebPage(QWebEnginePage):
     """Bot tespitini önleyen özel sayfa sınıfı."""
 
-    def __init__(self, profile, parent=None):
+    def __init__(self, profile, parent=None, create_window_cb=None):
         super().__init__(profile, parent)
+        self._create_window_cb = create_window_cb
         # Proxy kimliği: --proxy-server’da user:pass kullanmak Chromium’da ERR_NO_SUPPORTED_PROXIES
         # üretebiliyor; QAuthenticator ile (Qt 5.8+) verilir.
         self.proxyAuthenticationRequired.connect(self._on_proxy_authentication_required)
 
     def javaScriptConsoleMessage(self, level, message, line, source):
         pass
+
+    def createWindow(self, _type):
+        """target=_blank / window.open → iç sekme (callback); yoksa aynı sayfada aç."""
+        cb = getattr(self, "_create_window_cb", None)
+        if callable(cb):
+            try:
+                page = cb(_type)
+                if isinstance(page, QWebEnginePage):
+                    return page
+            except Exception:
+                pass
+        return self
 
     def _on_proxy_authentication_required(self, _request_url, authenticator, _proxy_host):
         s = QSettings(QSETTINGS_ORG, QSETTINGS_APP)
@@ -1136,16 +1177,27 @@ class StealthWebPage(QWebEnginePage):
 class StealthBrowser(QWebEngineView):
     """Anti-detection özellikleri olan gömülü Chromium tarayıcı."""
 
-    def __init__(self, parent=None, scheme_resolver=None):
+    def __init__(self, parent=None, scheme_resolver=None, profile=None, create_window_cb=None):
         super().__init__(parent)
         self._scheme_resolver = scheme_resolver
+        self._create_window_cb = create_window_cb
 
-        # Özel profil oluştur
-        self.profile = QWebEngineProfile("tribal_bot", self)
-        self._configure_profile()
+        # Paylaşılan profil (çoklu sekme = aynı cookie/oturum) veya yeni profil
+        if profile is not None:
+            self.profile = profile
+        else:
+            self.profile = QWebEngineProfile("tribal_bot", self)
+        if not getattr(self.profile, "_tw_bot_configured", False):
+            self._configure_profile()
+            try:
+                self.profile._tw_bot_configured = True
+            except Exception:
+                pass
 
         # Stealth sayfa
-        self.stealth_page = StealthWebPage(self.profile, self)
+        self.stealth_page = StealthWebPage(
+            self.profile, self, create_window_cb=create_window_cb
+        )
         self.setPage(self.stealth_page)
 
         # Anti-detection JS enjeksiyonu
@@ -3120,25 +3172,6 @@ class MapArmySendDialog(QDialog):
 class SaCommandEditDialog(QDialog):
     """Kuyruk satırı: iki sütunlu ayar paneli; varış/gönderim senkron; ana pencere koyu modu."""
 
-    _CATAPULT_UI_TARGETS = (
-        ("(varsayılan)", ""),
-        ("Duvar", "wall"),
-        ("Merkez binası", "main"),
-        ("Depo", "storage"),
-        ("Gizli depo", "hide"),
-        ("Kışla", "barracks"),
-        ("Ahır", "stable"),
-        ("Atölye", "garage"),
-        ("Demirci", "smith"),
-        ("Oduncu", "wood"),
-        ("Taşçı", "stone"),
-        ("Demir madeni", "iron"),
-        ("Çiftlik", "farm"),
-        ("Market", "market"),
-        ("Toplanma yeri", "place"),
-        ("Gözlem kulesi", "watchtower"),
-    )
-
     @staticmethod
     def _sec_to_hms(sec: int) -> str:
         sec = int(max(0, sec))
@@ -3339,10 +3372,12 @@ class SaCommandEditDialog(QDialog):
 
         rv.addWidget(QLabel("Mancınık hedefi:"))
         self._combo_catapult = QComboBox()
-        for lab, val in self._CATAPULT_UI_TARGETS:
+        for lab, val in SA_CATAPULT_UI_TARGETS:
             self._combo_catapult.addItem(lab, val)
         saved_cat = item.data(0, bot.SA_QUEUE_ITEM_ROLE_CATAPULT)
-        sv = (saved_cat or "").strip() if saved_cat else ""
+        sv = (saved_cat or "").strip() if saved_cat else SA_CATAPULT_DEFAULT_BUILDING
+        if not sv:
+            sv = SA_CATAPULT_DEFAULT_BUILDING
         for j in range(self._combo_catapult.count()):
             if self._combo_catapult.itemData(j) == sv:
                 self._combo_catapult.setCurrentIndex(j)
@@ -3584,7 +3619,9 @@ class SaCommandEditDialog(QDialog):
         self._item.setData(0, self._bot.SA_QUEUE_ITEM_ROLE_TIME_MODE, mode)
 
         cv = self._combo_catapult.currentData()
-        if cv:
+        cv = str(cv or "").strip() or SA_CATAPULT_DEFAULT_BUILDING
+        troops_now = self._troops_map()
+        if int(troops_now.get("catapult", 0) or 0) > 0:
             self._item.setData(0, self._bot.SA_QUEUE_ITEM_ROLE_CATAPULT, cv)
         else:
             self._item.setData(0, self._bot.SA_QUEUE_ITEM_ROLE_CATAPULT, None)
@@ -4030,13 +4067,14 @@ class ArmyAuxToolsDialog(QDialog):
         self._hint_fake = QLabel(
             "Her hedefe en fazla N fake. Önce farklı köyler (az kullanılan), aynı hedefe en uzak "
             "yetinen; kuyruk sırası atışa en az süre kalanlara göre (Sophie). Köy başına en fazla N. "
-            "Hedef: Tarayıcı → «Koordinatlar» → «Bot'a aktar»."
+            "Hedef: Tarayıcı → «Koordinatlar» → «Bot'a aktar». "
+            "Bitiş saati boş = tek varış; doluysa her fake rastgele bu aralıkta (SS:DD:SS:ms)."
         )
         self._hint_fake.setWordWrap(True)
         v_fake.addWidget(self._hint_fake)
         arrive_row = QHBoxLayout()
         arrive_row.setSpacing(6)
-        arrive_lbl = QLabel("Varış zamanı:")
+        arrive_lbl = QLabel("Varış:")
         arrive_lbl.setStyleSheet("font-weight: bold;")
         arrive_row.addWidget(arrive_lbl)
         self.fake_arrive_date = QLineEdit()
@@ -4046,10 +4084,22 @@ class ArmyAuxToolsDialog(QDialog):
         arrive_row.addWidget(self.fake_arrive_date)
         arrive_row.addWidget(QLabel("'de"))
         self.fake_arrive_clock = QLineEdit()
-        self.fake_arrive_clock.setPlaceholderText("SS:DD:SS:ms")
-        self.fake_arrive_clock.setFixedWidth(108)
+        self.fake_arrive_clock.setPlaceholderText("başlangıç SS:DD:SS:ms")
+        self.fake_arrive_clock.setFixedWidth(118)
         self.fake_arrive_clock.setAlignment(Qt.AlignCenter)
+        self.fake_arrive_clock.setToolTip("Tek saat veya aralık başlangıcı.")
         arrive_row.addWidget(self.fake_arrive_clock)
+        arrive_row.addWidget(QLabel("–"))
+        self.fake_arrive_clock_end = QLineEdit()
+        self.fake_arrive_clock_end.setPlaceholderText("bitiş (opsiyonel)")
+        self.fake_arrive_clock_end.setFixedWidth(118)
+        self.fake_arrive_clock_end.setAlignment(Qt.AlignCenter)
+        self.fake_arrive_clock_end.setToolTip(
+            "Boş bırakırsan tek varış saati kullanılır.\n"
+            "Doluysa her fake bu aralıkta rastgele SS:DD:SS:ms alır.\n"
+            "Bitiş < başlangıç ise ertesi güne taşınır."
+        )
+        arrive_row.addWidget(self.fake_arrive_clock_end)
         b_fake_from_main = QPushButton("Ana sekmeden al")
         b_fake_from_main.setCursor(Qt.PointingHandCursor)
         b_fake_from_main.setToolTip("Ordu Gönder sekmesindeki tarih/saati buraya kopyalar.")
@@ -4108,6 +4158,27 @@ class ArmyAuxToolsDialog(QDialog):
             self.fake_unit_checks[ukey] = cb
             unit_grid.addWidget(cb, i // 6, i % 6)
         v_fake.addWidget(unit_wrap)
+        v_fake.addWidget(QLabel("Kaynak köyler (işaretli köylerden fake planlanır):"))
+        fake_src_btns = QHBoxLayout()
+        b_fake_src_all = QPushButton("Tümünü seç")
+        b_fake_src_all.setCursor(Qt.PointingHandCursor)
+        b_fake_src_all.clicked.connect(lambda: self._fake_set_all_source_villages(True))
+        fake_src_btns.addWidget(b_fake_src_all)
+        b_fake_src_none = QPushButton("Hiçbiri")
+        b_fake_src_none.setCursor(Qt.PointingHandCursor)
+        b_fake_src_none.clicked.connect(lambda: self._fake_set_all_source_villages(False))
+        fake_src_btns.addWidget(b_fake_src_none)
+        b_fake_src_ref = QPushButton("Listeyi yenile")
+        b_fake_src_ref.setCursor(Qt.PointingHandCursor)
+        b_fake_src_ref.setToolTip("Oyundaki köy listesini yeniden yükler (seçimler korunur).")
+        b_fake_src_ref.clicked.connect(self._fake_refresh_source_villages)
+        fake_src_btns.addWidget(b_fake_src_ref)
+        fake_src_btns.addStretch()
+        v_fake.addLayout(fake_src_btns)
+        self.fake_source_list = QListWidget()
+        self.fake_source_list.setMaximumHeight(140)
+        self.fake_source_list.setSelectionMode(QAbstractItemView.NoSelection)
+        v_fake.addWidget(self.fake_source_list)
         b_fake = QPushButton("Fake planla ve kuyruğa ekle")
         b_fake.setCursor(Qt.PointingHandCursor)
         b_fake.clicked.connect(self._do_fake_plan)
@@ -4289,6 +4360,9 @@ class ArmyAuxToolsDialog(QDialog):
             self.fake_arrive_date.setText(td)
         if tc:
             self.fake_arrive_clock.setText(tc)
+        tc_end = (s.value("fake_plan/arrive_clock_end", "") or "").strip()
+        if hasattr(self, "fake_arrive_clock_end"):
+            self.fake_arrive_clock_end.setText(tc_end)
         units_raw = (s.value("fake_plan/units", "") or "").strip()
         if units_raw:
             selected = {u.strip() for u in units_raw.split(",") if u.strip()}
@@ -4303,6 +4377,8 @@ class ArmyAuxToolsDialog(QDialog):
         fl = s.value("fake_plan/limit")
         if fl is not None:
             self.cb_fake_limit.setChecked(bool(fl) if not isinstance(fl, str) else fl.lower() in ("1", "true", "yes"))
+        # Kaynak köy listesi (seçimler QSettings'ten)
+        self._fake_refresh_source_villages()
 
     def _fake_save_settings(self) -> None:
         """Fake planı tercihlerini diske yaz."""
@@ -4311,10 +4387,102 @@ class ArmyAuxToolsDialog(QDialog):
         s = QSettings(QSETTINGS_ORG, QSETTINGS_APP)
         s.setValue("fake_plan/arrive_date", self.fake_arrive_date.text().strip())
         s.setValue("fake_plan/arrive_clock", self.fake_arrive_clock.text().strip())
+        if hasattr(self, "fake_arrive_clock_end"):
+            s.setValue(
+                "fake_plan/arrive_clock_end",
+                self.fake_arrive_clock_end.text().strip(),
+            )
         s.setValue("fake_plan/units", ",".join(self._fake_selected_unit_keys()))
         s.setValue("fake_plan/per_village", int(self.sp_fake_per_village.value()))
         s.setValue("fake_plan/limit", self.cb_fake_limit.isChecked())
+        if hasattr(self, "fake_source_list"):
+            s.setValue(
+                "fake_plan/source_village_ids",
+                json.dumps(self._fake_selected_source_ids(), ensure_ascii=False),
+            )
         s.sync()
+
+    def _fake_selected_source_ids(self) -> list:
+        """İşaretli kaynak köy id'leri (str)."""
+        out = []
+        lst = getattr(self, "fake_source_list", None)
+        if lst is None:
+            return out
+        for i in range(lst.count()):
+            item = lst.item(i)
+            if item is None:
+                continue
+            if item.checkState() != Qt.Checked:
+                continue
+            vid = item.data(Qt.UserRole)
+            if vid is None or vid == "":
+                continue
+            out.append(str(vid))
+        return out
+
+    def _fake_set_all_source_villages(self, checked: bool) -> None:
+        lst = getattr(self, "fake_source_list", None)
+        if lst is None:
+            return
+        state = Qt.Checked if checked else Qt.Unchecked
+        for i in range(lst.count()):
+            item = lst.item(i)
+            if item is not None:
+                item.setCheckState(state)
+
+    def _fake_refresh_source_villages(self) -> None:
+        """Oyundaki köyleri listele; önceki seçimleri koru (ilk açılışta hepsi seçili)."""
+        lst = getattr(self, "fake_source_list", None)
+        if lst is None:
+            return
+        prev_checked = set(self._fake_selected_source_ids())
+        s = QSettings(QSETTINGS_ORG, QSETTINGS_APP)
+        saved_raw = s.value("fake_plan/source_village_ids", None)
+        first_populate = lst.count() == 0
+        if first_populate and saved_raw is not None:
+            try:
+                data = json.loads(str(saved_raw) or "[]")
+                if isinstance(data, list):
+                    prev_checked = {str(x) for x in data if str(x).strip()}
+            except (json.JSONDecodeError, TypeError):
+                prev_checked = set()
+            # Kayıt yokmuş gibi boş liste + hiç köy seçili değil: yine hepsini seç
+            select_all_default = False
+        elif first_populate:
+            select_all_default = True
+        else:
+            select_all_default = False
+
+        villages = []
+        try:
+            villages = [
+                v
+                for v in (self.bot._game_data.get("all_villages") or [])
+                if v and not self.bot._sa_is_barbar_village(v)
+            ]
+            villages = _tw_sorted_player_villages(villages)
+        except Exception:
+            villages = list(self.bot._game_data.get("all_villages") or [])
+
+        lst.clear()
+        for v in villages:
+            vid = v.get("id")
+            if vid is None or vid == "":
+                continue
+            sx, sy = self.bot._sa_village_xy(v)
+            name = (v.get("name") or "?").strip() or "?"
+            if sx is not None and sy is not None:
+                label = f"{name} ({int(sx)}|{int(sy)})"
+            else:
+                label = f"{name} [id={vid}]"
+            item = QListWidgetItem(label)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setData(Qt.UserRole, str(vid))
+            if select_all_default or str(vid) in prev_checked:
+                item.setCheckState(Qt.Checked)
+            else:
+                item.setCheckState(Qt.Unchecked)
+            lst.addItem(item)
 
     def closeEvent(self, event):
         self._fake_save_settings()
@@ -4367,6 +4535,7 @@ class ArmyAuxToolsDialog(QDialog):
             if hasattr(self, "cb_fake_limit"):
                 self.cb_fake_limit.setText(self.bot._fake_limit_checkbox_text())
             self._fake_prefill_arrival_time_if_empty()
+            self._fake_refresh_source_villages()
         if idx == 2:
             self._support_prefill_arrival_time_if_empty()
             self.bot._refresh_support_plan_groups()
@@ -4448,11 +4617,15 @@ class ArmyAuxToolsDialog(QDialog):
         b = self.bot
         td = self.fake_arrive_date.text().strip()
         tc = self.fake_arrive_clock.text().strip()
+        tc_end = ""
+        if hasattr(self, "fake_arrive_clock_end"):
+            tc_end = self.fake_arrive_clock_end.text().strip()
         if not td or not tc:
             QMessageBox.warning(
                 self._mb_parent(),
                 "Fake planı",
-                "Varış tarihi (GG.AA) ve saati (SS:DD:SS:ms) doldurun.",
+                "Varış tarihi (GG.AA) ve başlangıç saati (SS:DD:SS:ms) doldurun.\n"
+                "Bitiş saati opsiyonel (boş = tek saat).",
             )
             return
         ba = b._sa_parse_time_input(td, tc)
@@ -4460,15 +4633,35 @@ class ArmyAuxToolsDialog(QDialog):
             QMessageBox.warning(
                 self._mb_parent(),
                 "Fake planı",
-                "Tarih/saat formatı hatalı (GG.AA ve SS:DD:SS:ms).",
+                "Başlangıç tarih/saat formatı hatalı (GG.AA ve SS:DD:SS:ms).",
             )
             return
+        ba_end = ba
+        if tc_end:
+            ba_end = b._sa_parse_time_input(td, tc_end)
+            if ba_end is None:
+                QMessageBox.warning(
+                    self._mb_parent(),
+                    "Fake planı",
+                    "Bitiş saati formatı hatalı (SS:DD:SS:ms).",
+                )
+                return
+            if ba_end < ba:
+                ba_end = ba_end + datetime.timedelta(days=1)
         units = self._fake_selected_unit_keys()
         if not units:
             QMessageBox.warning(
                 self._mb_parent(),
                 "Fake planı",
                 "En az bir birim seçin (ör. balta).",
+            )
+            return
+        source_ids = self._fake_selected_source_ids()
+        if not source_ids:
+            QMessageBox.warning(
+                self._mb_parent(),
+                "Fake planı",
+                "En az bir kaynak köy seçin.",
             )
             return
         b._sa_plan_mass_fakes_with(
@@ -4478,6 +4671,8 @@ class ArmyAuxToolsDialog(QDialog):
             self.cb_fake_limit.isChecked(),
             ba,
             msg_parent=self.bot,
+            base_arrive_end=ba_end,
+            allowed_village_ids=source_ids,
         )
         self._fake_save_settings()
         self._refresh_targets()
@@ -5234,6 +5429,12 @@ class TribalWarsBot(QMainWindow):
         # Bot koruması: adaptif DOM taraması (sunucuya istek gitmez — yalnızca runJavaScript).
         self._schedule_next_botprot_poll()
         self._schedule_next_troops_watch_poll()
+        # Otomatik bakıcılık (IGM) — ayarlardan açıksa zamanlayıcı
+        self._sitter_auto_timer = QTimer(self)
+        self._sitter_auto_timer.setSingleShot(True)
+        self._sitter_auto_timer.timeout.connect(self._sitter_auto_tick)
+        self._sitter_busy = False
+        QTimer.singleShot(4000, self._sitter_sync_timer_from_settings)
 
         self._telegram_test_finished.connect(self._on_telegram_test_finished)
         self._telegram_send_error.connect(self._on_telegram_send_error_slot)
@@ -5905,7 +6106,17 @@ class TribalWarsBot(QMainWindow):
         self._tw_reapply_browser_color_scheme()
 
     def _tw_reapply_browser_color_scheme(self) -> None:
-        """Açık oyun sayfasına seçilen renk modunu yeniden uygula."""
+        """Açık oyun sayfalarına seçilen renk modunu yeniden uygula (tüm web sekmeleri)."""
+        tabs = getattr(self, "browser_tabs", None)
+        if tabs is not None:
+            for i in range(tabs.count()):
+                w = tabs.widget(i)
+                if w and hasattr(w, "_inject_color_scheme_js"):
+                    try:
+                        w._inject_color_scheme_js()
+                    except Exception:
+                        pass
+            return
         browser = getattr(self, "browser", None)
         if not browser or not hasattr(browser, "_inject_color_scheme_js"):
             return
@@ -5958,6 +6169,22 @@ class TribalWarsBot(QMainWindow):
             tg_ssl = self.settings_tg_insecure_ssl_cb.isChecked()
             self._settings.setValue("notify/telegram_insecure_ssl", tg_ssl)
             _tw_save_config({"telegram_insecure_ssl": tg_ssl})
+        if hasattr(self, "settings_sitter_enable_cb"):
+            self._settings.setValue(
+                "sitter/auto_enabled", self.settings_sitter_enable_cb.isChecked()
+            )
+            self._settings.setValue(
+                "sitter/trigger_subject",
+                self.settings_sitter_subject.text().strip()
+                if hasattr(self, "settings_sitter_subject")
+                else "",
+            )
+            # Boş alan = kaydı sil (kullanıcı temizledi); dolu = güncelle
+            if hasattr(self, "settings_sitter_password"):
+                self._settings.setValue(
+                    "sitter/account_password", self.settings_sitter_password.text()
+                )
+            self._sitter_sync_timer_from_settings()
         if hasattr(self, "settings_bright_enable_cb"):
             self._settings.setValue(
                 "bright/enabled", self.settings_bright_enable_cb.isChecked()
@@ -5989,8 +6216,8 @@ class TribalWarsBot(QMainWindow):
             "Ayarlar",
             "Ayarlar kaydedildi.\n\n"
             "Proxy değişikliğinin tarayıcıda tam uygulanması için uygulamayı kapatıp yeniden açın.\n"
-            "Proxy şifresi, Telegram bot token’ı ve Bright API token’ı yalnızca bu bilgisayardaki "
-            "Qt ayarlarında tutulur (tw_config.json’a yazılmaz).",
+            "Proxy şifresi, Telegram bot token’ı, bakıcılık oyun şifresi ve Bright API token’ı "
+            "yalnızca bu bilgisayardaki Qt ayarlarında tutulur (tw_config.json’a yazılmaz).",
         )
 
     def _automation_mark_started(self, key: str) -> None:
@@ -6047,6 +6274,11 @@ class TribalWarsBot(QMainWindow):
                     getattr(self, "incomings_auto_tag_cb", None) is not None
                     and self.incomings_auto_tag_cb.isChecked()
                 ),
+            ),
+            (
+                "sitter",
+                "Otomatik bakıcılık (IGM)",
+                lambda: bool(self._sitter_settings_enabled()),
             ),
             (
                 "main",
@@ -6662,7 +6894,8 @@ class TribalWarsBot(QMainWindow):
         self.reload_btn = QPushButton("⟳")
         self.reload_btn.setFixedWidth(32)
         self.reload_btn.setCursor(Qt.PointingHandCursor)
-        self.reload_btn.clicked.connect(lambda: self.browser.reload() if self.browser else None)
+        self.reload_btn.setToolTip("Sayfayı yenile (F5)")
+        self.reload_btn.clicked.connect(self._tw_browser_reload)
         tb_layout.addWidget(self.reload_btn)
 
         self.url_bar = QLineEdit()
@@ -6704,37 +6937,206 @@ class TribalWarsBot(QMainWindow):
         self.btn_depo_denge.clicked.connect(self._wb_open_dialog)
         tb_layout.addWidget(self.btn_depo_denge)
 
+        self.btn_new_browser_tab = QPushButton("+")
+        self.btn_new_browser_tab.setFixedWidth(32)
+        self.btn_new_browser_tab.setCursor(Qt.PointingHandCursor)
+        self.btn_new_browser_tab.setToolTip(
+            f"Yeni tarayıcı sekmesi (en fazla {TW_BROWSER_MAX_TABS}; aynı oturum/cookie)."
+        )
+        self.btn_new_browser_tab.clicked.connect(self._tw_browser_new_tab_clicked)
+        tb_layout.addWidget(self.btn_new_browser_tab)
+
         toolbar.setFixedHeight(36)
         toolbar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout.addWidget(toolbar)
 
-        # Gömülü Chromium tarayıcı
-        self.browser = StealthBrowser(
-            scheme_resolver=lambda: getattr(self, "_browser_color_scheme_mode", TW_BROWSER_COLOR_DEFAULT)
-        )
+        # Ortak profil + WebChannel (çoklu sekme = aynı login)
+        self._tw_browser_profile = QWebEngineProfile("tribal_bot", self)
         self._tw_planner_bridge = TwPlannerBridge(self)
         self._tw_map_coord_bridge = TwMapCoordBridge(self)
-        self._tw_web_channel = QWebChannel(self.browser.stealth_page)
+        self._tw_web_channel = QWebChannel(self)
         self._tw_web_channel.registerObject("twPlannerBridge", self._tw_planner_bridge)
         self._tw_web_channel.registerObject("twMapCoordBridge", self._tw_map_coord_bridge)
         self._map_picked_fake_targets = ""
-        self.browser.stealth_page.setWebChannel(self._tw_web_channel)
-        self.browser.stealth_page.loadFinished.connect(self._tw_inject_planner_webchannel_hook)
-        self.browser.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.browser.setMinimumHeight(400)
-        self.browser.urlChanged.connect(self._on_url_changed)
-        self.browser.loadStarted.connect(lambda: self._url_bar_set_loading(True))
-        self.browser.loadFinished.connect(lambda ok: self._url_bar_set_loading(False))
-        self.browser.titleChanged.connect(
-            lambda title: self.setWindowTitle(f"⚔ Tribal Wars Bot — {title}") if title else None)
-        layout.addWidget(self.browser, 1)  # stretch=1 ile tüm alanı kapla
 
-        self.tabs.addTab(tab, "🌐 Tarayıcı")
+        self.browser_tabs = QTabWidget()
+        self.browser_tabs.setTabsClosable(True)
+        self.browser_tabs.setDocumentMode(True)
+        self.browser_tabs.setMovable(True)
+        self.browser_tabs.currentChanged.connect(self._tw_browser_on_current_changed)
+        self.browser_tabs.tabCloseRequested.connect(self._tw_browser_close_tab)
+        layout.addWidget(self.browser_tabs, 1)
 
-        # İlk sunucu adresini yükle (WebEngine hazir olsun diye kisa gecikme)
+        # İlk sekme
+        self.browser = None
         initial_url = SERVERS[0][1]
         self.url_bar.setText(initial_url)
-        QTimer.singleShot(400, lambda: self.browser.navigate(initial_url) if self.browser else None)
+        first = self._tw_browser_add_tab(url=None, switch_to=True)
+        if first is not None:
+            QTimer.singleShot(400, lambda: first.navigate(initial_url) if first else None)
+
+        self._browser_panel = tab
+        self.tabs.addTab(tab, "🌐 Tarayıcı")
+
+        # F5 → aktif web sekmesini yenile (WebEngine odağı F5'i yutsa bile)
+        self._browser_f5_shortcut = QShortcut(QKeySequence(Qt.Key_F5), self)
+        self._browser_f5_shortcut.setContext(Qt.ApplicationShortcut)
+        self._browser_f5_shortcut.activated.connect(self._tw_browser_reload_shortcut)
+
+    def _tw_browser_reload(self) -> None:
+        if self.browser:
+            try:
+                self.browser.reload()
+            except Exception:
+                pass
+
+    def _tw_browser_reload_shortcut(self) -> None:
+        """F5: Tarayıcı sekmesindeyken aktif sayfayı yenile."""
+        main_tabs = getattr(self, "tabs", None)
+        panel = getattr(self, "_browser_panel", None)
+        if main_tabs is None or panel is None:
+            return
+        if main_tabs.currentWidget() is not panel:
+            return
+        self._tw_browser_reload()
+
+    def _tw_browser_scheme_resolver(self):
+        return getattr(self, "_browser_color_scheme_mode", TW_BROWSER_COLOR_DEFAULT)
+
+    def _tw_browser_wire_view(self, view: "StealthBrowser") -> None:
+        """URL bar, WebChannel ve planner hook — her web sekmesi için."""
+        view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        view.setMinimumHeight(400)
+        page = view.stealth_page
+        if getattr(self, "_tw_web_channel", None) is not None:
+            page.setWebChannel(self._tw_web_channel)
+        page.loadFinished.connect(self._tw_inject_planner_webchannel_hook)
+        view.urlChanged.connect(self._on_url_changed)
+        view.loadStarted.connect(self._tw_browser_on_load_started)
+        view.loadFinished.connect(self._tw_browser_on_load_finished)
+        view.titleChanged.connect(self._tw_browser_on_title_changed)
+
+    def _tw_browser_add_tab(self, url=None, *, switch_to=True):
+        """Yeni StealthBrowser sekmesi; limit doluysa None."""
+        tabs = getattr(self, "browser_tabs", None)
+        if tabs is None:
+            return None
+        if tabs.count() >= TW_BROWSER_MAX_TABS:
+            return None
+        profile = getattr(self, "_tw_browser_profile", None)
+        view = StealthBrowser(
+            parent=tabs,
+            profile=profile,
+            scheme_resolver=self._tw_browser_scheme_resolver,
+            create_window_cb=self._tw_browser_on_create_window,
+        )
+        self._tw_browser_wire_view(view)
+        idx = tabs.addTab(view, "Yeni sekme")
+        if switch_to:
+            tabs.setCurrentIndex(idx)
+        # currentChanged bazen ilk sekmede tetiklenmez
+        if tabs.currentWidget() is view:
+            self.browser = view
+        elif self.browser is None:
+            self.browser = view
+        if url:
+            try:
+                view.navigate(url)
+            except Exception:
+                pass
+        self._tw_browser_update_new_tab_button()
+        return view
+
+    def _tw_browser_new_tab_clicked(self):
+        # Sekme değişmeden önce aktif URL’yi al
+        try:
+            cur = self.browser.url().toString() if self.browser else ""
+        except Exception:
+            cur = ""
+        if not cur and getattr(self, "url_bar", None):
+            cur = (self.url_bar.text() or "").strip()
+        view = self._tw_browser_add_tab(url=cur or None, switch_to=True)
+        if view is None:
+            QMessageBox.information(
+                self,
+                "Sekme limiti",
+                f"En fazla {TW_BROWSER_MAX_TABS} tarayıcı sekmesi açılabilir.",
+            )
+
+    def _tw_browser_on_create_window(self, _type):
+        """window.open / target=_blank → yeni sekme; limitte aktif sayfada aç."""
+        view = self._tw_browser_add_tab(url=None, switch_to=True)
+        if view is None:
+            if self.browser is not None:
+                return self.browser.page()
+            return None
+        return view.page()
+
+    def _tw_browser_on_current_changed(self, index: int) -> None:
+        tabs = getattr(self, "browser_tabs", None)
+        if tabs is None or index < 0:
+            return
+        w = tabs.widget(index)
+        if not isinstance(w, StealthBrowser):
+            return
+        self.browser = w
+        try:
+            self.url_bar.setText(w.url().toString())
+        except Exception:
+            pass
+        try:
+            self._url_bar_set_loading(False)
+        except Exception:
+            pass
+        try:
+            title = w.title() or ""
+            if title:
+                self.setWindowTitle(f"⚔ Tribal Wars Bot — {title}")
+        except Exception:
+            pass
+
+    def _tw_browser_close_tab(self, index: int) -> None:
+        tabs = getattr(self, "browser_tabs", None)
+        if tabs is None:
+            return
+        if tabs.count() <= 1:
+            return
+        w = tabs.widget(index)
+        tabs.removeTab(index)
+        if w is not None:
+            try:
+                w.deleteLater()
+            except Exception:
+                pass
+        self._tw_browser_update_new_tab_button()
+
+    def _tw_browser_update_new_tab_button(self) -> None:
+        btn = getattr(self, "btn_new_browser_tab", None)
+        tabs = getattr(self, "browser_tabs", None)
+        if btn is None or tabs is None:
+            return
+        btn.setEnabled(tabs.count() < TW_BROWSER_MAX_TABS)
+
+    def _tw_browser_on_load_started(self) -> None:
+        if self.sender() is self.browser:
+            self._url_bar_set_loading(True)
+
+    def _tw_browser_on_load_finished(self, _ok) -> None:
+        if self.sender() is self.browser:
+            self._url_bar_set_loading(False)
+
+    def _tw_browser_on_title_changed(self, title: str) -> None:
+        view = self.sender()
+        tabs = getattr(self, "browser_tabs", None)
+        if not isinstance(view, StealthBrowser) or tabs is None:
+            return
+        idx = tabs.indexOf(view)
+        if idx >= 0:
+            raw = (title or "").strip() or "Sekme"
+            short = raw if len(raw) <= 36 else (raw[:35] + "…")
+            tabs.setTabText(idx, short)
+        if view is self.browser and title:
+            self.setWindowTitle(f"⚔ Tribal Wars Bot — {title}")
 
     def _navigate_to_url(self):
         url = self.url_bar.text().strip()
@@ -6744,6 +7146,10 @@ class TribalWarsBot(QMainWindow):
             self.browser.navigate(url)
 
     def _on_url_changed(self, url):
+        # Yalnızca aktif sekmenin URL’si çubuğu güncellesin
+        sender = self.sender()
+        if sender is not None and sender is not self.browser:
+            return
         self.url_bar.setText(url.toString())
 
     def _tw_resolve_arascript_path(self):
@@ -8099,6 +8505,22 @@ class TribalWarsBot(QMainWindow):
         self.cmd_type_combo.setFixedWidth(80)
         action_row.addWidget(self.cmd_type_combo)
 
+        action_row.addWidget(QLabel("Man hedef:"))
+        self.sa_catapult_combo = QComboBox()
+        for lab, val in SA_CATAPULT_UI_TARGETS:
+            self.sa_catapult_combo.addItem(lab, val)
+        # Varsayılan: Duvar (seçilmezse bina vurulmaz — sorun)
+        for j in range(self.sa_catapult_combo.count()):
+            if self.sa_catapult_combo.itemData(j) == SA_CATAPULT_DEFAULT_BUILDING:
+                self.sa_catapult_combo.setCurrentIndex(j)
+                break
+        self.sa_catapult_combo.setMinimumWidth(130)
+        self.sa_catapult_combo.setToolTip(
+            "Mancınıklı saldırıda vurulacak bina.\n"
+            "Varsayılan: Duvar. Değiştirmezsen sur vurulur."
+        )
+        action_row.addWidget(self.sa_catapult_combo)
+
         action_row.addSpacing(15)
 
         # Varış zamanı ayarla butonu
@@ -8798,10 +9220,15 @@ class TribalWarsBot(QMainWindow):
             k: self.sa_troop_inputs[k].value() for k, _ in self._sa_sendable_unit_defs()
         }
         cmd_attack = self.cmd_type_combo.currentIndex() == 0
+        cat_b = ""
+        if hasattr(self, "sa_catapult_combo"):
+            cat_b = (self.sa_catapult_combo.currentData() or "") or ""
+            cat_b = str(cat_b).strip()
 
         ok, err = self._sa_append_row_from_values(
             src_text, src_x, src_y, tgt_x, tgt_y, troops_map, cmd_attack,
             self._sa_time_mode, input_dt,
+            catapult_building=cat_b,
         )
         if not ok:
             QMessageBox.warning(self, "Uyarı", err or "Komut eklenemedi")
@@ -9038,6 +9465,7 @@ class TribalWarsBot(QMainWindow):
         duplicate_dialog=True,
         msg_parent=None,
         exclude_items=None,
+        catapult_building=None,
     ):
         """Gönderim kuyruğuna tek satır ekler. (True, None) veya (False, hata_metni)."""
         troops_map = dict(troops_map)
@@ -9146,6 +9574,11 @@ class TribalWarsBot(QMainWindow):
         row_data = [src_text, tgt] + troop_values + [cmd_type, send_str, arrive_str, return_str, task_id]
         item = QTreeWidgetItem(row_data)
         item.setData(0, self.SA_QUEUE_ITEM_ROLE_TIME_MODE, time_mode)
+        cat_b = str(catapult_building or "").strip()
+        if int(troops_map.get("catapult", 0) or 0) > 0:
+            if not cat_b:
+                cat_b = SA_CATAPULT_DEFAULT_BUILDING
+            item.setData(0, self.SA_QUEUE_ITEM_ROLE_CATAPULT, cat_b)
 
         for col in range(2, 14):
             item.setTextAlignment(col, Qt.AlignCenter)
@@ -10644,9 +11077,22 @@ class TribalWarsBot(QMainWindow):
         enforce_fake_limit,
         base_arrive,
         msg_parent=None,
+        base_arrive_end=None,
+        allowed_village_ids=None,
     ):
-        """Fake kuyruğu: hedef başına farklı köy önceliği, kuyruk sırası Sophie (acil atış)."""
+        """Fake kuyruğu: hedef başına farklı köy önceliği, kuyruk sırası Sophie (acil atış).
+
+        base_arrive_end verilirse her satıra [start, end] aralığında rastgele varış atanır.
+        allowed_village_ids: sadece bu köy id'lerinden planla (None = hepsi).
+        """
         parent = _tw_aux_msgbox_parent(msg_parent or self)
+        ba_start = base_arrive
+        ba_end = base_arrive_end if base_arrive_end is not None else base_arrive
+        if ba_end < ba_start:
+            ba_end = ba_end + datetime.timedelta(days=1)
+        allowed_ids = None
+        if allowed_village_ids is not None:
+            allowed_ids = {str(x).strip() for x in allowed_village_ids if str(x).strip()}
         ws, us = self._sa_get_travel_speed_factors()
         if not getattr(self, "_world_speed_from_settings", False):
             self._add_log(
@@ -10675,22 +11121,28 @@ class TribalWarsBot(QMainWindow):
             for v in (self._game_data.get("all_villages") or [])
             if v and not self._sa_is_barbar_village(v)
         ]
+        if allowed_ids is not None:
+            villages = [
+                v for v in villages if str(v.get("id") or "").strip() in allowed_ids
+            ]
         if not villages:
             QMessageBox.warning(
                 parent,
                 "Fake planı",
-                "Köy / birlik verisi yok. Tarayıcıdan birlikleri yenileyin.",
+                "Seçili kaynak köy yok veya köy / birlik verisi yok.\n"
+                "Fake planı sekmesinde köy seçin; tarayıcıdan birlikleri yenileyin.",
             )
             return
 
         max_per_source = max(1, int(max_per_source or 1))
         now = self._server_now_dt() or datetime.datetime.now()
-        if base_arrive <= now:
+        if ba_end <= now:
             QMessageBox.warning(
                 parent,
                 "Fake planı",
-                f"Varış zamanı sunucu saatinden önce veya aynı anda.\n\n"
-                f"Varış: {base_arrive.strftime('%d.%m %H:%M:%S')}\n"
+                f"Varış aralığı sunucu saatinden önce veya aynı anda biter.\n\n"
+                f"Başlangıç: {ba_start.strftime('%d.%m %H:%M:%S')}\n"
+                f"Bitiş: {ba_end.strftime('%d.%m %H:%M:%S')}\n"
                 f"Sunucu: {now.strftime('%d.%m %H:%M:%S')}\n\n"
                 "Fake planı sekmesinde varışı ileri alın (en uzak köye yetecek kadar).",
             )
@@ -10790,9 +11242,16 @@ class TribalWarsBot(QMainWindow):
                     travel_sec = self._sa_calc_travel_time(
                         dist, troop_keys, troops_map=troops_map, cmd_attack=True
                     )
-                    launch_dt = base_arrive - datetime.timedelta(
-                        seconds=travel_sec
+                    # Geçerli varış penceresi: [max(start, now+travel+1ms), end]
+                    earliest = now + datetime.timedelta(
+                        seconds=float(travel_sec), milliseconds=1
                     )
+                    lo = ba_start if ba_start >= earliest else earliest
+                    hi = ba_end
+                    if lo > hi:
+                        n_late += 1
+                        continue
+                    launch_dt = lo - datetime.timedelta(seconds=travel_sec)
                     if launch_dt <= now:
                         n_late += 1
                         continue
@@ -10812,6 +11271,8 @@ class TribalWarsBot(QMainWindow):
                             "ref_pts": ref_pts,
                             "troops_map": troops_map,
                             "stock": stock,
+                            "arrive_lo": lo,
+                            "arrive_hi": hi,
                         }
                     )
 
@@ -10846,6 +11307,15 @@ class TribalWarsBot(QMainWindow):
                 troops_map = pick["troops_map"]
                 stock = pick["stock"]
                 ref_pts = pick["ref_pts"]
+                lo = pick["arrive_lo"]
+                hi = pick["arrive_hi"]
+                span = (hi - lo).total_seconds()
+                if span <= 0:
+                    arrive_dt = lo
+                else:
+                    arrive_dt = lo + datetime.timedelta(
+                        seconds=random.uniform(0.0, span)
+                    )
 
                 if enforce_fake_limit:
                     violate, detail = self._sa_evaluate_fake_violation(
@@ -10872,7 +11342,7 @@ class TribalWarsBot(QMainWindow):
                         dict(troops_map),
                         True,
                         "arrive",
-                        base_arrive,
+                        arrive_dt,
                         fake_dialog=False,
                         check_fake_limit=enforce_fake_limit,
                         duplicate_dialog=False,
@@ -11385,8 +11855,38 @@ class TribalWarsBot(QMainWindow):
                 break
         return indices
 
+    def _sa_item_has_catapult(self, item) -> bool:
+        if item is None:
+            return False
+        try:
+            idx = SA_QUEUE_TABLE_TROOP_KEYS.index("catapult")
+            return int(item.text(2 + idx) or 0) > 0
+        except (ValueError, TypeError):
+            return False
+
+    def _sa_resolve_catapult_building(self, building, *, has_catapult: bool) -> str:
+        """Mancınık varsa boş hedef → duvar (wall)."""
+        b = str(building or "").strip()
+        if b:
+            return b
+        if has_catapult:
+            return SA_CATAPULT_DEFAULT_BUILDING
+        return ""
+
+    def _sa_item_catapult_building(self, item) -> str:
+        """Kuyruk satırındaki mancınık bina hedefi (oyun `building` anahtarı)."""
+        if item is None:
+            return ""
+        try:
+            raw = str(item.data(0, self.SA_QUEUE_ITEM_ROLE_CATAPULT) or "").strip()
+        except Exception:
+            raw = ""
+        return self._sa_resolve_catapult_building(
+            raw, has_catapult=self._sa_item_has_catapult(item)
+        )
+
     def _dispatch_build_extra_train_rows(self, batch_indices):
-        """Dalga 2..N için train[1]..train[N-1] gövdesi (try=confirm yalnızca 1. dalgayı taşır)."""
+        """Dalga 2..N için train[2]..train[N] gövdesi (1. dalga ana form; oyun train[1] kullanmaz)."""
         rows = []
         for idx in batch_indices[1:]:
             item = self.sa_table.topLevelItem(idx)
@@ -11395,11 +11895,14 @@ class TribalWarsBot(QMainWindow):
             d = {}
             for col_idx, (key, _) in enumerate(self._sa_sendable_unit_defs()):
                 try:
-                    val = int(item.text(col_idx + 2))
-                    if val > 0:
-                        d[key] = val
+                    val = int(item.text(col_idx + 2) or 0)
                 except ValueError:
-                    pass
+                    val = 0
+                # Oyun boş birimleri de gönderir (train[2][sword]=); 0 dahil tüm anahtarlar
+                d[key] = val
+            # Mancınık hedefi: train[N][building] (boşsa duvar)
+            if int(d.get("catapult", 0) or 0) > 0:
+                d["_building"] = self._sa_item_catapult_building(item) or SA_CATAPULT_DEFAULT_BUILDING
             rows.append(d)
         return rows
 
@@ -11602,6 +12105,7 @@ class TribalWarsBot(QMainWindow):
         attack_type = "attack" if cmd_type == "Sld" else "support"
         cache_key = item.data(1, Qt.UserRole) or ""
         cmd_id = f"cmd_{row_idx}_{id(item)}"
+        building_js = json.dumps(self._sa_item_catapult_building(item))
 
         # Gönderime kalan süreyi hesapla (setTimeout için göreli gecikme)
         send_str = item.text(15)
@@ -11642,6 +12146,7 @@ class TribalWarsBot(QMainWindow):
             var targetY = '{target_y}';
             var troops = {troops_js_obj};
             var attackType = '{attack_type}';
+            var buildingTarget = {building_js};
             var extraTrainRows = {extra_train_json};
 
             if (!window.__tw_bot_results) window.__tw_bot_results = {{}};
@@ -11729,13 +12234,16 @@ class TribalWarsBot(QMainWindow):
                 var trainM = inpName.match(/^train\\[(\\d+)\\]\\[([^\\]]+)\\]$/);
                 if (!trainM) return false;
                 var tix = parseInt(trainM[1], 10);
+                /* Oyun: 1. dalga ana form; ek saldırılar train[2]..train[N+1] (train[1] yok) */
+                var erowIdx = tix - 2;
+                if (erowIdx < 0 || erowIdx >= extraTrainRows.length) return false;
                 var ukey = trainM[2];
-                if (tix < 1 || tix > extraTrainRows.length) return false;
-                var erow = extraTrainRows[tix - 1];
+                var erow = extraTrainRows[erowIdx];
                 return !!(erow && Object.prototype.hasOwnProperty.call(erow, ukey));
             }}
-            function __twAppendConfirmBody(cf, html, extraTrainRows) {{
+            function __twAppendConfirmBody(cf, html, extraTrainRows, buildingTarget) {{
                 extraTrainRows = extraTrainRows || [];
+                buildingTarget = buildingTarget || '';
                 var cd = new URLSearchParams();
                 cf.querySelectorAll('input[type="hidden"], input[name="ch"], input[type="submit"][name="ch"], button[name="ch"]').forEach(function(h) {{
                     if (h.name && h.name !== 'submit_confirm') cd.append(h.name, h.value || '');
@@ -11762,15 +12270,31 @@ class TribalWarsBot(QMainWindow):
                         if (cb.checked) cd.append(cb.name, cb.value || '1');
                     }});
                 }}
+                /* Mancınık hedefi formun her yerinde olabilir (#place_confirm_units dışı) */
+                cf.querySelectorAll('select[name="building"], input[name="building"]').forEach(function(el) {{
+                    if (!el.name) return;
+                    cd.append(el.name, el.value || '');
+                }});
+                if (buildingTarget) {{
+                    try {{ cd.delete('building'); }} catch (eDel) {{}}
+                    cd.set('building', buildingTarget);
+                }}
                 for (var ti = 0; ti < extraTrainRows.length; ti++) {{
                     var row = extraTrainRows[ti];
                     if (!row || typeof row !== 'object') continue;
-                    var tidx = ti + 1;
+                    var tidx = ti + 2;
                     for (var uk in row) {{
                         if (!Object.prototype.hasOwnProperty.call(row, uk)) continue;
+                        if (uk === '_building' || uk.charAt(0) === '_') continue;
                         var nv = parseInt(row[uk], 10);
                         if (!isNaN(nv) && nv > 0)
                             cd.append('train[' + tidx + '][' + uk + ']', String(nv));
+                        else
+                            cd.append('train[' + tidx + '][' + uk + ']', '');
+                    }}
+                    var tb = row._building || buildingTarget || '';
+                    if (tb && parseInt(row.catapult || 0, 10) > 0) {{
+                        cd.append('train[' + tidx + '][building]', String(tb));
                     }}
                 }}
                 cd.append('submit_confirm', __twSubmitConfirmValue(cf));
@@ -11798,6 +12322,9 @@ class TribalWarsBot(QMainWindow):
                 fd.set('y', targetY);
                 if (attackType === 'attack') {{ fd.append('attack', 'true'); }}
                 else {{ fd.append('support', 'true'); }}
+                if (buildingTarget && parseInt(troops.catapult || '0', 10) > 0) {{
+                    fd.set('building', buildingTarget);
+                }}
 
                 var formAction = tokenData.__form_action || '/game.php?village=' + villageId + '&screen=place&try=confirm';
 
@@ -11815,7 +12342,7 @@ class TribalWarsBot(QMainWindow):
                     var cf = __twFindConfirmForm(doc2);
                     if (!cf || !__twFormHasCh(cf, confirmHtml)) return;
 
-                    var bodyStr = __twAppendConfirmBody(cf, confirmHtml, extraTrainRows);
+                    var bodyStr = __twAppendConfirmBody(cf, confirmHtml, extraTrainRows, buildingTarget);
                     var actionUrl = cf.getAttribute('action');
                     if (!actionUrl) return;
 
@@ -11942,6 +12469,7 @@ class TribalWarsBot(QMainWindow):
         cmd_id = preconfirm_cmd_id or f"cmd_{row_idx}_{id(item)}"
 
         cache_key = item.data(1, Qt.UserRole) or ""
+        building_js = json.dumps(self._sa_item_catapult_building(item))
 
         batch_indices = self._dispatch_batch_indices_from(row_idx)
         extra_train_rows = self._dispatch_build_extra_train_rows(batch_indices)
@@ -11958,6 +12486,7 @@ class TribalWarsBot(QMainWindow):
             var targetY = '{target_y}';
             var troops = {troops_js_obj};
             var attackType = '{attack_type}';
+            var buildingTarget = {building_js};
             var cmdId = '{cmd_id}';
             var cacheKey = '{cache_key}';
             var extraTrainRows = {extra_train_json};
@@ -12028,12 +12557,15 @@ class TribalWarsBot(QMainWindow):
                 if (!trainM) return false;
                 var tix = parseInt(trainM[1], 10);
                 var ukey = trainM[2];
-                if (tix < 1 || tix > extraTrainRows.length) return false;
-                var erow = extraTrainRows[tix - 1];
+                /* Oyun: 1. dalga ana form; ek saldırılar train[2]..train[N+1] (train[1] yok) */
+                var erowIdx = tix - 2;
+                if (erowIdx < 0 || erowIdx >= extraTrainRows.length) return false;
+                var erow = extraTrainRows[erowIdx];
                 return !!(erow && Object.prototype.hasOwnProperty.call(erow, ukey));
             }}
-            function __twAppendConfirmBody(cf, html, extraTrainRows) {{
+            function __twAppendConfirmBody(cf, html, extraTrainRows, buildingTarget) {{
                 extraTrainRows = extraTrainRows || [];
+                buildingTarget = buildingTarget || '';
                 var cd = new URLSearchParams();
                 cf.querySelectorAll('input[type="hidden"], input[name="ch"], input[type="submit"][name="ch"], button[name="ch"]').forEach(function(h) {{
                     if (h.name && h.name !== 'submit_confirm') cd.append(h.name, h.value || '');
@@ -12060,15 +12592,30 @@ class TribalWarsBot(QMainWindow):
                         if (cb.checked) cd.append(cb.name, cb.value || '1');
                     }});
                 }}
+                cf.querySelectorAll('select[name="building"], input[name="building"]').forEach(function(el) {{
+                    if (!el.name) return;
+                    cd.append(el.name, el.value || '');
+                }});
+                if (buildingTarget) {{
+                    try {{ cd.delete('building'); }} catch (eDel) {{}}
+                    cd.set('building', buildingTarget);
+                }}
                 for (var ti = 0; ti < extraTrainRows.length; ti++) {{
                     var row = extraTrainRows[ti];
                     if (!row || typeof row !== 'object') continue;
-                    var tidx = ti + 1;
+                    var tidx = ti + 2;
                     for (var uk in row) {{
                         if (!Object.prototype.hasOwnProperty.call(row, uk)) continue;
+                        if (uk === '_building' || uk.charAt(0) === '_') continue;
                         var nv = parseInt(row[uk], 10);
                         if (!isNaN(nv) && nv > 0)
                             cd.append('train[' + tidx + '][' + uk + ']', String(nv));
+                        else
+                            cd.append('train[' + tidx + '][' + uk + ']', '');
+                    }}
+                    var tb = row._building || buildingTarget || '';
+                    if (tb && parseInt(row.catapult || 0, 10) > 0) {{
+                        cd.append('train[' + tidx + '][building]', String(tb));
                     }}
                 }}
                 cd.append('submit_confirm', __twSubmitConfirmValue(cf));
@@ -12128,6 +12675,9 @@ class TribalWarsBot(QMainWindow):
                 fd.set('y', targetY);
                 if (attackType === 'attack') {{ fd.append('attack', 'true'); }}
                 else {{ fd.append('support', 'true'); }}
+                if (buildingTarget && parseInt(troops.catapult || '0', 10) > 0) {{
+                    fd.set('building', buildingTarget);
+                }}
 
                 var formAction = tokenData.__form_action || '/game.php?village=' + villageId + '&screen=place&try=confirm';
 
@@ -12163,7 +12713,7 @@ class TribalWarsBot(QMainWindow):
                     window.__tw_bot_results[cmdId] = 'ERROR|ch token bulunamadi';
                     return;
                 }}
-                var bodyStr = __twAppendConfirmBody(cf, confirmHtml, extraTrainRows);
+                var bodyStr = __twAppendConfirmBody(cf, confirmHtml, extraTrainRows, buildingTarget);
                 var actionUrl = cf.getAttribute('action');
                 if (!actionUrl) {{
                     window.__tw_bot_results[cmdId] = 'ERROR|Form action yok';
@@ -12190,8 +12740,10 @@ class TribalWarsBot(QMainWindow):
         """
 
         wave_tag = f" [{len(batch_items)} dalga]" if len(batch_items) > 1 else ""
+        cat_b = self._sa_item_catapult_building(item)
         self._add_log("GÖNDERİM", "info",
-            f"Komut gönderiliyor{wave_tag}: {src_text} → ({tgt_text}) | {cmd_type}")
+            f"Komut gönderiliyor{wave_tag}: {src_text} → ({tgt_text}) | {cmd_type}"
+            + (f" | Man→{cat_b}" if cat_b else ""))
 
         self.browser.page().runJavaScript(send_js)
 
@@ -21437,7 +21989,8 @@ class TribalWarsBot(QMainWindow):
                     || /botprotection|bot_protection/.test(hl)
                     || hl.indexOf('bot koruma kontrol') >= 0;
                 var table = doc.getElementById('incomings_table')
-                    || doc.querySelector('table#incomings_table');
+                    || doc.querySelector('table#incomings_table')
+                    || doc.querySelector('table.incomings_table');
                 if (!table) {
                     if (botprotStrong) {
                         window.__tw_incomings_fetch = JSON.stringify({
@@ -21445,14 +21998,39 @@ class TribalWarsBot(QMainWindow):
                             message: 'bot koruması HTML',
                             fetchUrl: url
                         });
-                    } else {
-                        window.__tw_incomings_fetch = JSON.stringify({
-                            status: 'OPAQUE',
-                            message: 'no #incomings_table in HTML',
-                            fetchUrl: url,
-                            parseNote: 'no #incomings_table in HTML'
-                        });
+                        return;
                     }
+                    /* Boş gelen / filtre: tablo hiç render edilmeyebilir — botprot değil */
+                    var looksGame = !!doc.getElementById('paged_view_content')
+                        || !!doc.getElementById('content_value')
+                        || !!doc.querySelector('#overview_menu, .modemenu, #menu_row')
+                        || /mode=incomings|screen=overview_villages/.test(hl)
+                        || /gelen komut|no incoming|keine ankommend|brak nadchodz|aucun ordre/i.test(hl);
+                    var looksLogin = (!!doc.querySelector('form[action*="login"], input[name="username"]'))
+                        || /page\\/auth|page\\/login/.test(hl);
+                    if (looksLogin && !looksGame) {
+                        window.__tw_incomings_fetch = JSON.stringify({
+                            status: 'ERROR',
+                            message: 'oturum/login HTML (gelen tablosu yok)',
+                            fetchUrl: url
+                        });
+                        return;
+                    }
+                    if (looksGame || (html && html.length > 6000)) {
+                        window.__tw_incomings_fetch = JSON.stringify({
+                            status: 'OK',
+                            rows: [],
+                            fetchUrl: url,
+                            parseNote: 'no #incomings_table — empty/OK'
+                        });
+                        return;
+                    }
+                    window.__tw_incomings_fetch = JSON.stringify({
+                        status: 'OPAQUE',
+                        message: 'no #incomings_table in HTML',
+                        fetchUrl: url,
+                        parseNote: 'no #incomings_table in HTML'
+                    });
                     return;
                 }
                 var rows = table.querySelectorAll('tr');
@@ -21603,13 +22181,29 @@ class TribalWarsBot(QMainWindow):
             if data.get("status") == "OPAQUE":
                 self._incomings_tick_origin_mono = None
                 msg = data.get("message", "opak yanıt")
-                self._botprot_note_opaque_fail("gelen", str(msg)[:120], soft_reload_on_escalate=True)
-                self.incomings_status_label.setText("Tablo yok (şüpheli)")
-                if not silent:
-                    self._add_log("GELEN", "warn", f"Gelen yükleme opak: {msg}")
-                return
+                msg_l = str(msg).lower()
+                # Tablo yok = çoğu zaman boş gelen / sayfa yapısı; tüm otomasyonu durdurma.
+                if "incomings_table" in msg_l or "no #incomings" in msg_l:
+                    self.incomings_status_label.setText("Gelen tablosu yok (boş sayıldı)")
+                    self._add_log(
+                        "GELEN",
+                        "warn",
+                        f"Gelen tablosu yok — bot koruması sayılmadı: {msg}",
+                    )
+                    # Boş liste gibi devam: auto-label atlanır, streak şişmesin
+                    data = {"status": "OK", "rows": []}
+                else:
+                    self._botprot_note_opaque_fail(
+                        "gelen", str(msg)[:120], soft_reload_on_escalate=True
+                    )
+                    self.incomings_status_label.setText("Tablo yok (şüpheli)")
+                    if not silent:
+                        self._add_log("GELEN", "warn", f"Gelen yükleme opak: {msg}")
+                    return
 
             rows = data.get("rows", [])
+            if not isinstance(rows, list):
+                rows = []
             self._botprot_note_success()
             self.incomings_tree.clear()
             if not rows:
@@ -21753,7 +22347,16 @@ class TribalWarsBot(QMainWindow):
                 try:
                     self._incomings_notify_snobs(snob_rows)
                 finally:
-                    self._incomings_after_fetch_cycle_cleanup()
+                    # Etiket sonrası tabloyu «Gelenleri Yükle» gibi yenile (yeniden etiket yok)
+                    self._incomings_pending_auto_label = False
+                    self._incomings_reschedule_after_this_fetch = True
+                    self.incomings_status_label.setText(
+                        "Etiket uygulandı — tablo güncelleniyor…"
+                    )
+                    QTimer.singleShot(
+                        600,
+                        lambda: self._incomings_refresh(silent=True),
+                    )
 
             if do_auto_label and unlabeled_ids and not self._botprot_automation_hot_path():
                 cleanup_deferred = True
@@ -22549,6 +23152,56 @@ class TribalWarsBot(QMainWindow):
         tg_group.setLayout(tg_lay)
         layout.addWidget(tg_group)
 
+        sitter_group = QGroupBox("Otomatik bakıcılık (IGM)")
+        sitter_lay = QFormLayout()
+        sitter_lay.setSpacing(6)
+        self.settings_sitter_enable_cb = QCheckBox(
+            "Belirli mesaj konusu gelince gönderene bakıcılık isteği yolla"
+        )
+        self.settings_sitter_enable_cb.setChecked(
+            self._settings.value("sitter/auto_enabled", False, type=bool)
+        )
+        self.settings_sitter_enable_cb.setToolTip(
+            "Gelen kutuda tetikleyici başlıkla yeni mesaj olursa, "
+            "gönderen oyuncuya Hesap bakıcılığı isteği gönderilir."
+        )
+        sitter_lay.addRow(self.settings_sitter_enable_cb)
+        self.settings_sitter_subject = QLineEdit()
+        self.settings_sitter_subject.setText(
+            (self._settings.value("sitter/trigger_subject", "") or "").strip()
+        )
+        self.settings_sitter_subject.setPlaceholderText("Örn. BAKICI veya gizli bir konu")
+        sitter_lay.addRow("Tetikleyici mesaj başlığı:", self.settings_sitter_subject)
+        self.settings_sitter_password = QLineEdit()
+        self.settings_sitter_password.setEchoMode(QLineEdit.Password)
+        self.settings_sitter_password.setText(
+            (self._settings.value("sitter/account_password", "") or "")
+        )
+        self.settings_sitter_password.setPlaceholderText(
+            "Bakıcılık isteği için oyun hesabı şifresi (bot giriş şifresi değil)"
+        )
+        sitter_lay.addRow("Oyun şifresi:", self.settings_sitter_password)
+        self.settings_sitter_help = QLabel(
+            "Bot’a giriş şifresi kullanılmaz. Bu alan yalnızca oyun «Bakıcılık iste» "
+            "formundaki şifre onayı içindir; yıldızlı saklanır, tw_config.json’a yazılmaz. "
+            "Karşı taraf kabul ederse hesap kontrolü ona geçer. "
+            "Konu eşleşmesi tam eşit (büyük/küçük harf duyarsız; sondaki «(2)» sayacı yok sayılır). "
+            "Açıkken ~2–3 dk’da bir kontrol; test için «Şimdi kontrol et»."
+        )
+        self.settings_sitter_help.setWordWrap(True)
+        self.settings_sitter_help.setObjectName("settingsProxyHelp")
+        sitter_lay.addRow(self.settings_sitter_help)
+        self.settings_sitter_now_btn = QPushButton("Şimdi kontrol et")
+        self.settings_sitter_now_btn.setCursor(Qt.PointingHandCursor)
+        self.settings_sitter_now_btn.setToolTip(
+            "Gelen kutusunu hemen tarayıp tetikleyici başlık varsa bakıcılık isteği dener."
+        )
+        self.settings_sitter_now_btn.clicked.connect(self._sitter_manual_check)
+        sitter_lay.addRow(self.settings_sitter_now_btn)
+        sitter_group.setLayout(sitter_lay)
+        layout.addWidget(sitter_group)
+        self.settings_sitter_enable_cb.toggled.connect(self._sitter_on_auto_toggled)
+
         bright_group = QGroupBox("Bright Data — Web Unlocker (deneme)")
         bright_lay = QFormLayout()
         bright_lay.setSpacing(6)
@@ -22727,6 +23380,681 @@ class TribalWarsBot(QMainWindow):
         save_row.addStretch()
         outer.addLayout(save_row)
         self.tabs.addTab(tab, "⚙️ Ayarlar")
+
+    # ── OTOMATİK BAKICILIK (IGM → sitter_offer) ─
+
+    def _sitter_settings_enabled(self) -> bool:
+        if hasattr(self, "settings_sitter_enable_cb"):
+            return bool(self.settings_sitter_enable_cb.isChecked())
+        return bool(self._settings.value("sitter/auto_enabled", False, type=bool))
+
+    def _sitter_trigger_subject(self) -> str:
+        if hasattr(self, "settings_sitter_subject"):
+            return (self.settings_sitter_subject.text() or "").strip()
+        return (self._settings.value("sitter/trigger_subject", "") or "").strip()
+
+    def _sitter_account_password(self) -> str:
+        if hasattr(self, "settings_sitter_password"):
+            return self.settings_sitter_password.text() or ""
+        return self._settings.value("sitter/account_password", "") or ""
+
+    def _sitter_norm_subject(self, s: str) -> str:
+        # Konuşma sayacı: "tehlike2 (2)" → "tehlike2"
+        t = re.sub(r"\s*\(\d+\)\s*$", "", str(s or "").strip())
+        return " ".join(t.lower().split())
+
+    def _sitter_subjects_match(self, mail_subject: str, trigger: str) -> bool:
+        t = self._sitter_norm_subject(trigger)
+        if not t:
+            return False
+        return self._sitter_norm_subject(mail_subject) == t
+
+    def _sitter_manual_check(self) -> None:
+        """Ayarlar: gelen kutuyu hemen tara (timer beklemeden)."""
+        if not self._sitter_settings_enabled():
+            QMessageBox.information(
+                self, "Bakıcılık",
+                "Önce «otomatik bakıcılık» kutusunu işaretleyip Kaydet’e basın.",
+            )
+            return
+        if not self._sitter_trigger_subject():
+            QMessageBox.warning(self, "Bakıcılık", "Tetikleyici mesaj başlığı boş.")
+            return
+        if not self._sitter_account_password():
+            QMessageBox.warning(
+                self, "Bakıcılık",
+                "Oyun şifresi gerekli (Ayarlar’daki yıldızlı alan).",
+            )
+            return
+        if getattr(self, "_login_state", "") != "in_game":
+            QMessageBox.warning(self, "Bakıcılık", "Önce oyuna giriş yapın.")
+            return
+        self._add_log("BAKICI", "info", "Manuel gelen kutusu kontrolü başlatıldı.")
+        # Busy kilidini zorla aşma; zaten çalışıyorsa bilgi ver
+        if getattr(self, "_sitter_busy", False):
+            QMessageBox.information(
+                self, "Bakıcılık", "Kontrol zaten sürüyor — loglara bakın."
+            )
+            return
+        self._sitter_auto_tick()
+
+    def _sitter_load_processed_ids(self) -> list:
+        raw = (self._settings.value("sitter/processed_ids", "") or "").strip()
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                return [str(x) for x in data if str(x).strip()]
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return [p.strip() for p in raw.split(",") if p.strip()]
+
+    def _sitter_save_processed_ids(self, ids: list) -> None:
+        cleaned = []
+        seen = set()
+        for x in ids:
+            s = str(x).strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            cleaned.append(s)
+        cleaned = cleaned[-200:]
+        self._settings.setValue("sitter/processed_ids", json.dumps(cleaned, ensure_ascii=False))
+        self._settings.sync()
+
+    def _sitter_mark_processed(self, igm_id: str) -> None:
+        ids = self._sitter_load_processed_ids()
+        ids.append(str(igm_id))
+        self._sitter_save_processed_ids(ids)
+
+    def _sitter_on_auto_toggled(self, checked: bool) -> None:
+        if checked:
+            self._automation_mark_started("sitter")
+            self._sitter_schedule_next()
+            QTimer.singleShot(2500, self._sitter_auto_tick)
+        else:
+            self._automation_mark_stopped("sitter")
+            t = getattr(self, "_sitter_auto_timer", None)
+            if t is not None:
+                t.stop()
+
+    def _sitter_sync_timer_from_settings(self) -> None:
+        """Kaydet / açılış: checkbox durumuna göre timer."""
+        if self._sitter_settings_enabled():
+            if "sitter" not in (getattr(self, "_automation_started_at", None) or {}):
+                self._automation_mark_started("sitter")
+            self._sitter_schedule_next()
+        else:
+            self._automation_mark_stopped("sitter")
+            t = getattr(self, "_sitter_auto_timer", None)
+            if t is not None:
+                t.stop()
+
+    def _sitter_schedule_next(self) -> None:
+        t = getattr(self, "_sitter_auto_timer", None)
+        if t is None:
+            return
+        if not self._sitter_settings_enabled():
+            t.stop()
+            return
+        delay_ms = random.randint(120_000, 180_000)
+        t.stop()
+        t.start(delay_ms)
+
+    def _sitter_auto_tick(self) -> None:
+        if not self._sitter_settings_enabled():
+            return
+        if getattr(self, "_sitter_busy", False):
+            self._sitter_schedule_next()
+            return
+        if getattr(self, "_human_verification_required", False):
+            self._sitter_schedule_next()
+            return
+        if self._botprot_automation_hot_path():
+            self._sitter_schedule_next()
+            return
+        if not getattr(self, "browser", None):
+            self._sitter_schedule_next()
+            return
+        if getattr(self, "_login_state", "") != "in_game":
+            self._sitter_schedule_next()
+            return
+        trigger = self._sitter_trigger_subject()
+        password = self._sitter_account_password()
+        if not trigger:
+            self._add_log("BAKICI", "warn", "Otomatik bakıcılık: tetikleyici başlık boş — atlandı.")
+            self._sitter_schedule_next()
+            return
+        if not password:
+            self._add_log(
+                "BAKICI", "warn",
+                "Otomatik bakıcılık: oyun şifresi Ayarlar’da yok — atlandı.",
+            )
+            self._sitter_schedule_next()
+            return
+        village_id = (self._game_data.get("village") or {}).get("id", "") or ""
+        if not village_id:
+            self._add_log("BAKICI", "warn", "Köy id yok — bakıcılık kontrolü ertelendi.")
+            self._sitter_schedule_next()
+            return
+        self._add_log(
+            "BAKICI", "info",
+            f"Gelen kutusu taranıyor (tetikleyici: «{trigger}»)…",
+        )
+        self._sitter_busy = True
+        self._sitter_fetch_inbox(str(village_id), trigger, password)
+
+    def _sitter_fetch_inbox(self, village_id: str, trigger: str, password: str) -> None:
+        fetch_js = """
+        (function() {
+            window.__tw_sitter_mail = 'LOADING';
+            var villageId = """ + json.dumps(str(village_id)) + """;
+            var url = '/game.php?village=' + encodeURIComponent(villageId) +
+                '&screen=mail&mode=in';
+            fetch(url, {credentials: 'same-origin'})
+            .then(function(r) { return r.text(); })
+            .then(function(html) {
+                var doc = new DOMParser().parseFromString(html, 'text/html');
+                var hl = String(html || '').toLowerCase();
+                var botprotStrong = !!doc.getElementById('botprotection_quest')
+                    || /botprotection|bot_protection/.test(hl)
+                    || hl.indexOf('bot koruma kontrol') >= 0;
+                if (botprotStrong) {
+                    window.__tw_sitter_mail = JSON.stringify({
+                        status: 'BOTPROT', message: 'bot koruması HTML'
+                    });
+                    return;
+                }
+                var rows = [];
+                var trs = doc.querySelectorAll('#content_value table.vis tr');
+                if (!trs || !trs.length) {
+                    trs = doc.querySelectorAll('table.vis tr');
+                }
+                var i, tr, aSub, aPl, href, idM, subject, sender, isNew, img, tdSender;
+                for (i = 0; i < trs.length; i++) {
+                    tr = trs[i];
+                    if (tr.querySelector('th')) continue;
+                    aSub = tr.querySelector('a[href*="mode=view"][href*="view="]');
+                    if (!aSub) aSub = tr.querySelector('a[href*="view="]');
+                    if (!aSub) continue;
+                    href = aSub.getAttribute('href') || '';
+                    idM = /[?&]view=(\\d+)/.exec(href);
+                    if (!idM) continue;
+                    subject = (aSub.textContent || '').replace(/\\s+/g, ' ').trim();
+                    isNew = false;
+                    img = aSub.querySelector('img');
+                    if (img) {
+                        var src = (img.getAttribute('src') || '') + ' ' + (img.getAttribute('title') || '');
+                        if (/new_mail/i.test(src) || /yeni/i.test(img.getAttribute('title') || ''))
+                            isNew = true;
+                    }
+                    if (!isNew && /new_mail/i.test(aSub.innerHTML || '')) isNew = true;
+                    if (!isNew && /\\bnew\\b/i.test(tr.className || '')) isNew = true;
+                    sender = '';
+                    aPl = tr.querySelector('a[href*="info_player"]');
+                    if (aPl) {
+                        sender = (aPl.textContent || '').replace(/\\s+/g, ' ').trim();
+                    } else {
+                        var tds = tr.querySelectorAll('td');
+                        tdSender = tds.length >= 2 ? tds[1] : null;
+                        if (tdSender) {
+                            aPl = tdSender.querySelector('a');
+                            if (aPl) sender = (aPl.textContent || '').replace(/\\s+/g, ' ').trim();
+                            if (!sender) {
+                                sender = (tdSender.textContent || '').replace(/\\s+/g, ' ').trim();
+                                sender = sender.replace(/^(Cevapland[iı]|Answered|Re)\\s+/i, '').trim();
+                            }
+                        }
+                    }
+                    rows.push({
+                        id: idM[1],
+                        subject: subject,
+                        sender: sender,
+                        is_new: isNew
+                    });
+                }
+                window.__tw_sitter_mail = JSON.stringify({
+                    status: 'OK', rows: rows, fetchUrl: url, rowCount: rows.length
+                });
+            })
+            .catch(function(err) {
+                window.__tw_sitter_mail = JSON.stringify({
+                    status: 'ERROR', message: String(err || '')
+                });
+            });
+        })();
+        """
+        self.browser.page().runJavaScript(fetch_js)
+        QTimer.singleShot(self.TW_JS_POLL_MS, lambda: self._sitter_poll_inbox(0, trigger, password))
+
+    def _sitter_poll_inbox(self, attempt: int, trigger: str, password: str) -> None:
+        max_attempts = 40
+        if attempt >= max_attempts:
+            self._sitter_busy = False
+            self._add_log("BAKICI", "warn", "Mail kutusu zaman aşımı.")
+            self._sitter_schedule_next()
+            self.browser.page().runJavaScript("window.__tw_sitter_mail=null;")
+            return
+
+        def on_poll(result):
+            result_str = "WAITING" if result is None else str(result).strip()
+            if result_str in ("WAITING", "LOADING", ""):
+                QTimer.singleShot(
+                    self.TW_JS_POLL_MS,
+                    lambda: self._sitter_poll_inbox(attempt + 1, trigger, password),
+                )
+                return
+            self.browser.page().runJavaScript("window.__tw_sitter_mail=null;")
+            self._sitter_handle_inbox_result(result_str, trigger, password)
+
+        self.browser.page().runJavaScript(
+            "(function(){ var x = window.__tw_sitter_mail; "
+            "if (x === undefined || x === null) return 'WAITING'; return x; })();",
+            on_poll,
+        )
+
+    def _sitter_is_system_sender(self, sender: str) -> bool:
+        s = self._sitter_norm_subject(sender)
+        if not s:
+            return True
+        bad = (
+            "klanlar takimi",
+            "tribal wars",
+            "system",
+            "sistem",
+            "support",
+            "destek",
+        )
+        return any(b in s for b in bad)
+
+    def _sitter_handle_inbox_result(self, result_str: str, trigger: str, password: str) -> None:
+        try:
+            data = json.loads(result_str)
+        except Exception:
+            self._sitter_busy = False
+            self._add_log("BAKICI", "warn", "Mail JSON parse edilemedi.")
+            self._sitter_schedule_next()
+            return
+
+        status = data.get("status")
+        if status == "BOTPROT":
+            self._sitter_busy = False
+            self._botprot_note_strong_hit(
+                "bakici", str(data.get("message") or "bot koruması")[:120], soft_reload=True
+            )
+            self._sitter_schedule_next()
+            return
+        if status == "ERROR":
+            self._sitter_busy = False
+            msg = str(data.get("message") or "?")
+            # Soft: botprot escalate etme
+            self._add_log("BAKICI", "warn", f"Mail yükleme: {msg[:120]}")
+            self._sitter_schedule_next()
+            return
+        if status != "OK":
+            self._sitter_busy = False
+            self._sitter_schedule_next()
+            return
+
+        self._botprot_note_success()
+        rows = data.get("rows") or []
+        if not isinstance(rows, list):
+            rows = []
+        processed = set(self._sitter_load_processed_ids())
+        trigger_n = self._sitter_norm_subject(trigger)
+        candidates = []
+        match_read = 0
+        match_new = 0
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            igm_id = str(r.get("id") or "").strip()
+            if not igm_id or igm_id in processed:
+                continue
+            subj = str(r.get("subject") or "")
+            if not self._sitter_subjects_match(subj, trigger):
+                continue
+            # Yeni olsun olmasın: tetikleyici konu + işlenmemiş id yeterli
+            # (mail açılınca "yeni" düşer; aksi halde test/gerçek kullanım kaçıyor)
+            if r.get("is_new"):
+                match_new += 1
+            else:
+                match_read += 1
+            sender = str(r.get("sender") or "").strip()
+            sender = re.sub(
+                r"^(cevapland[iı]|answered|re)\s+", "", sender, flags=re.I
+            ).strip()
+            if not sender:
+                self._add_log(
+                    "BAKICI", "warn",
+                    f"Gönderen adı okunamadı (id={igm_id}, konu=«{subj[:40]}») — atlandı, tekrar denenecek.",
+                )
+                continue
+            if self._sitter_is_system_sender(sender):
+                self._add_log(
+                    "BAKICI", "info",
+                    f"Sistem gönderen atlandı (id={igm_id}): {sender or '?'}",
+                )
+                self._sitter_mark_processed(igm_id)
+                continue
+            candidates.append({
+                "id": igm_id,
+                "subject": subj,
+                "sender": sender,
+                "is_new": bool(r.get("is_new")),
+            })
+
+        self._add_log(
+            "BAKICI", "info",
+            f"Mail kontrol: {len(rows)} satır, tetikleyici «{trigger_n}», "
+            f"eşleşen {len(candidates)} "
+            f"(yeni={match_new}, okunmuş={match_read}, işlenmiş hariç)",
+        )
+
+        if not candidates:
+            self._sitter_busy = False
+            self._sitter_schedule_next()
+            return
+
+        # Sırayla bir tane işle (rate / güvenlik)
+        self._sitter_offer_queue = candidates
+        self._sitter_offer_password = password
+        self._sitter_process_next_offer()
+
+    def _sitter_process_next_offer(self) -> None:
+        q = getattr(self, "_sitter_offer_queue", None) or []
+        if not q:
+            self._sitter_busy = False
+            self._sitter_schedule_next()
+            return
+        item = q.pop(0)
+        self._sitter_offer_queue = q
+        self._sitter_send_offer(item)
+
+    def _sitter_send_offer(self, item: dict) -> None:
+        """Bakıcı sayfasını aç → Oyuncu İsmi=gönderen, Şifre=ayarlar → Bakıcılık iste."""
+        sender = (item.get("sender") or "").strip()
+        igm_id = str(item.get("id") or "")
+        password = getattr(self, "_sitter_offer_password", "") or ""
+        village_id = (self._game_data.get("village") or {}).get("id", "") or ""
+        if not sender or not password or not village_id:
+            self._add_log("BAKICI", "warn", f"Bakıcılık isteği eksik veri (id={igm_id}).")
+            if igm_id:
+                self._sitter_mark_processed(igm_id)
+            self._sitter_process_next_offer()
+            return
+
+        self._add_log(
+            "BAKICI", "info",
+            f"Bakıcı formu dolduruluyor → Oyuncu: {sender}, mesaj id={igm_id}",
+        )
+        self._sitter_offer_item = item
+        self._sitter_offer_fill_done = False
+        try:
+            cur = self.browser.url().toString() if self.browser else ""
+        except Exception:
+            cur = ""
+        self._sitter_offer_return_url = cur
+        vac_url = (
+            f"/game.php?village={quote(str(village_id))}"
+            f"&screen=settings&mode=vacation"
+        )
+        # Absolute gerekebilir
+        try:
+            base = self.browser.url()
+            target = QUrl(base).resolved(QUrl(vac_url))
+        except Exception:
+            target = QUrl(vac_url)
+        self.browser.load(target)
+        QTimer.singleShot(
+            max(400, int(getattr(self, "TW_JS_POLL_MS", 250) or 250)),
+            lambda: self._sitter_poll_vacation_form(0, item, password),
+        )
+
+    def _sitter_poll_vacation_form(self, attempt: int, item: dict, password: str) -> None:
+        """Vacation sayfasında formu doldurup Bakıcılık iste’ye bas."""
+        if attempt >= 50:
+            self._add_log("BAKICI", "warn", "Bakıcı formu bulunamadı (zaman aşımı).")
+            self._sitter_process_next_offer()
+            return
+        if getattr(self, "_sitter_offer_fill_done", False):
+            return
+
+        sender = (item.get("sender") or "").strip()
+        fill_js = f"""
+        (function() {{
+            if (document.getElementById('botprotection_quest'))
+                return JSON.stringify({{status: 'BOTPROT', message: 'bot koruması'}});
+            var form = document.querySelector('form[action*="sitter_offer"]');
+            if (!form) {{
+                var href = String(location.href || '');
+                if (href.indexOf('mode=vacation') < 0 && href.indexOf('screen=settings') < 0)
+                    return 'WAITING';
+                return 'WAITING';
+            }}
+            var sitterIn = form.querySelector('input[name="sitter"]');
+            var passIn = form.querySelector('input[name="password"]');
+            var btn = form.querySelector('input[type="submit"], button[type="submit"]');
+            if (!sitterIn || !passIn)
+                return JSON.stringify({{status: 'ERROR', message: 'form alanları yok'}});
+            var name = {json.dumps(sender)};
+            var pw = {json.dumps(password)};
+            sitterIn.focus();
+            sitterIn.value = name;
+            try {{
+                sitterIn.dispatchEvent(new Event('input', {{bubbles: true}}));
+                sitterIn.dispatchEvent(new Event('change', {{bubbles: true}}));
+            }} catch (e) {{}}
+            passIn.focus();
+            passIn.value = pw;
+            try {{
+                passIn.dispatchEvent(new Event('input', {{bubbles: true}}));
+                passIn.dispatchEvent(new Event('change', {{bubbles: true}}));
+            }} catch (e) {{}}
+            if (btn) {{
+                btn.click();
+            }} else {{
+                form.submit();
+            }}
+            return JSON.stringify({{
+                status: 'SUBMITTED',
+                sitter: name,
+                message: 'Bakıcılık iste tıklandı'
+            }});
+        }})();
+        """
+
+        def on_fill(result):
+            result_str = "WAITING" if result is None else str(result).strip()
+            if result_str in ("WAITING", "LOADING", ""):
+                QTimer.singleShot(
+                    self.TW_JS_POLL_MS,
+                    lambda: self._sitter_poll_vacation_form(attempt + 1, item, password),
+                )
+                return
+            try:
+                data = json.loads(result_str)
+            except Exception:
+                self._add_log("BAKICI", "warn", f"Form yanıtı bozuk: {result_str[:80]}")
+                self._sitter_process_next_offer()
+                return
+            status = data.get("status")
+            if status == "BOTPROT":
+                self._sitter_handle_offer_result(result_str, item)
+                return
+            if status == "ERROR":
+                self._sitter_handle_offer_result(result_str, item)
+                return
+            if status == "SUBMITTED":
+                self._sitter_offer_fill_done = True
+                self._add_log(
+                    "BAKICI", "info",
+                    f"«Bakıcılık iste» tıklandı → {sender}",
+                )
+                # Sayfa yenilenince sonucu oku
+                QTimer.singleShot(
+                    800,
+                    lambda: self._sitter_poll_offer_page(0, item),
+                )
+                return
+            QTimer.singleShot(
+                self.TW_JS_POLL_MS,
+                lambda: self._sitter_poll_vacation_form(attempt + 1, item, password),
+            )
+
+        self.browser.page().runJavaScript(fill_js, on_fill)
+
+    def _sitter_poll_offer_page(self, attempt: int, item: dict) -> None:
+        """Submit sonrası vacation sayfasında başarı/hata metni ara."""
+        if attempt >= 40:
+            # Form gönderildi varsay — çoğu sunucu redirect ile 200 döner
+            self._sitter_handle_offer_result(
+                json.dumps({
+                    "status": "OK",
+                    "message": "form gönderildi (yanıt belirsiz, zaman aşımı)",
+                }),
+                item,
+            )
+            return
+
+        check_js = r"""
+        (function() {
+            if (document.getElementById('botprotection_quest'))
+                return JSON.stringify({status: 'BOTPROT', message: 'bot koruması'});
+            var body = (document.body && document.body.innerText) || '';
+            var html = document.documentElement ? document.documentElement.innerHTML : '';
+            var hl = (html || '').toLowerCase();
+            if (/botprotection|bot_protection|bot koruma kontrol/.test(hl))
+                return JSON.stringify({status: 'BOTPROT', message: 'bot koruması'});
+            var form = document.querySelector('form[action*="sitter_offer"]');
+            if (/yanl[iı][sş].*[sş]ifre|hatal[iı].*[sş]ifre|password.*wrong/i.test(body))
+                return JSON.stringify({status: 'ERROR', message: 'şifre hatalı'});
+            if (/bulunamad[iı]|mevcut de[gğ]il/i.test(body) && /oyuncu|bak[iı]c|sitter/i.test(body))
+                return JSON.stringify({status: 'ERROR', message: 'oyuncu bulunamadı'});
+            var errBox = document.querySelector('.error, .error_box, #error');
+            if (errBox) {
+                var et = (errBox.innerText || '').trim();
+                if (et && /[sş]ifre|bulunamad|hata|error|izin/i.test(et))
+                    return JSON.stringify({status: 'ERROR', message: et.slice(0, 120)});
+            }
+            if (/istek|teklif|g[oö]nderildi|bekliyor|pending/i.test(body) && /bak[iı]c/i.test(body))
+                return JSON.stringify({status: 'OK', message: 'bakıcılık isteği gönderildi'});
+            if (form && location.href.indexOf('mode=vacation') >= 0)
+                return 'WAITING_RESULT';
+            return 'WAITING';
+        })();
+        """
+
+        def on_check(result):
+            result_str = "WAITING" if result is None else str(result).strip()
+            if result_str in ("WAITING", "WAITING_RESULT", "LOADING", ""):
+                # WAITING_RESULT: form var, bir süre sonra OK say
+                if result_str == "WAITING_RESULT" and attempt >= 8:
+                    self._sitter_handle_offer_result(
+                        json.dumps({
+                            "status": "OK",
+                            "message": "form gönderildi",
+                        }),
+                        item,
+                    )
+                    return
+                QTimer.singleShot(
+                    self.TW_JS_POLL_MS,
+                    lambda: self._sitter_poll_offer_page(attempt + 1, item),
+                )
+                return
+            self._sitter_handle_offer_result(result_str, item)
+
+        self.browser.page().runJavaScript(check_js, on_check)
+
+    def _sitter_poll_offer(self, attempt: int, item: dict) -> None:
+        """Eski fetch-poll yolu (artık form tıklama kullanılıyor)."""
+        self._sitter_poll_offer_page(attempt, item)
+
+    def _sitter_handle_offer_result(self, result_str: str, item: dict) -> None:
+        igm_id = str(item.get("id") or "")
+        sender = str(item.get("sender") or "?")
+        try:
+            data = json.loads(result_str)
+        except Exception:
+            self._add_log("BAKICI", "warn", f"İstek yanıtı parse edilemedi ({sender}).")
+            self._sitter_process_next_offer()
+            return
+
+        status = data.get("status")
+        msg = str(data.get("message") or "")
+        account_name = ""
+        try:
+            account_name = str(
+                ((self._game_data or {}).get("player") or {}).get("name") or ""
+            ).strip()
+        except Exception:
+            account_name = ""
+        if not account_name:
+            try:
+                account_name = self._license_account_name()
+            except Exception:
+                account_name = ""
+        account_name = account_name or "?"
+
+        if status == "BOTPROT":
+            self._botprot_note_strong_hit("bakici", msg[:120] or "bot koruması", soft_reload=True)
+            # mesajı işaretleme — tekrar denenebilir
+            self._sitter_offer_queue = []
+            self._sitter_busy = False
+            self._sitter_schedule_next()
+            return
+        if status == "OK":
+            self._botprot_note_success()
+            if igm_id:
+                self._sitter_mark_processed(igm_id)
+            self._add_log(
+                "BAKICI", "success",
+                f"Bakıcılık isteği gönderildi → {sender}"
+                + (f" ({msg})" if msg else ""),
+            )
+            try:
+                tw_telegram_send_message_threaded(
+                    self,
+                    f"Tribal Wars – Bakıcı verildi\n"
+                    f"Hesap: {account_name}\n"
+                    f"Bakıcı verilen oyuncu: {sender}\n"
+                    f"Mesaj id: {igm_id}\n"
+                    f"Kabul ederse hesap kontrolü ona geçer.",
+                )
+            except Exception:
+                pass
+        elif status == "OPAQUE":
+            # Escalate etme; id işaretleme (yanlış pozitif tekrarını önle)
+            if igm_id:
+                self._sitter_mark_processed(igm_id)
+            self._add_log(
+                "BAKICI", "warn",
+                f"Bakıcılık yanıtı belirsiz → {sender}: {msg or 'opak'} (işlendi sayıldı)",
+            )
+            try:
+                tw_telegram_send_message_threaded(
+                    self,
+                    f"Tribal Wars – Bakıcı isteği (yanıt belirsiz)\n"
+                    f"Hesap: {account_name}\n"
+                    f"Bakıcı verilen oyuncu: {sender}\n"
+                    f"Mesaj id: {igm_id}\n"
+                    f"İstek gönderilmiş olabilir; oyunda kontrol et.",
+                )
+            except Exception:
+                pass
+        else:
+            # Hatalı şifre / oyuncu yok — id işaretle ki döngüye girme
+            if igm_id:
+                self._sitter_mark_processed(igm_id)
+            self._add_log(
+                "BAKICI", "error",
+                f"Bakıcılık isteği başarısız → {sender}: {msg or '?'}",
+            )
+
+        # Sonraki aday (kısa gecikme)
+        QTimer.singleShot(1500, self._sitter_process_next_offer)
 
     # ── LOGLAR ─────────────────────────────────
 
@@ -25287,36 +26615,54 @@ class TribalWarsBot(QMainWindow):
                 pass
 
     def _fetch_world_settings(self):
-        """Sunucunun /page/settings sayfasından dünya hızı, birim hızı ve fake limitini çek."""
+        """Sunucunun /page/settings + get_config ile dünya hızı, birim hızı ve fake limitini çek."""
         fetch_js = """
         (function() {
             var base = window.location.origin;
             var url = base + '/page/settings';
+            var cfgUrl = base + '/interface.php?func=get_config';
             window.__tw_world_settings = 'LOADING';
             function normTr(s) {
-                return s.replace(/\\s+/g, ' ').trim().toLowerCase()
-                    .replace(/\\u0131/g, 'i').replace(/\\u0130/g, 'i');
+                return String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase()
+                    .replace(/\\u0131/g, 'i').replace(/\\u0130/g, 'i')
+                    .replace(/\\u015f/g, 's').replace(/\\u015e/g, 's')
+                    .replace(/\\u011f/g, 'g').replace(/\\u011e/g, 'g')
+                    .replace(/\\u00fc/g, 'u').replace(/\\u00dc/g, 'u')
+                    .replace(/\\u00f6/g, 'o').replace(/\\u00d6/g, 'o')
+                    .replace(/\\u00e7/g, 'c').replace(/\\u00c7/g, 'c');
+            }
+            function fakePctFromConfigNumber(n) {
+                if (n == null || isNaN(n)) return null;
+                n = Number(n);
+                if (n <= 0) return 0;
+                if (n > 0 && n < 1) return n * 100;
+                return n;
             }
             function parseFakePctFromValue(value) {
-                if (!value) return null;
+                if (value == null) return null;
                 var v = normTr(value);
-                if (v === 'pasif' || v === 'inaktif' || v === 'inactive' || v === 'passive') return 0;
+                if (!v) return null;
+                if (v === 'pasif' || v === 'inaktif' || v === 'inactive' || v === 'passive'
+                    || v === 'kapali' || v === 'disabled' || v === 'deaktiviert' || v === 'aus'
+                    || v === 'yok' || v === 'devre disi' || v.indexOf('pasif') === 0) return 0;
                 var m = String(value).match(/(\\d+(?:\\.\\d+)?)\\s*%/);
                 if (m) return parseFloat(m[1]);
                 return null;
             }
             function isFakeLimitLabel(label) {
                 if (!label) return false;
+                /* TR: "Aldatma sınırlandırması" / "Aldatma sınırı" */
                 if (label.indexOf('aldatma') !== -1 && label.indexOf('sinir') !== -1) return true;
                 if (label.indexOf('fake limit') !== -1) return true;
                 if (label.indexOf('fake-limit') !== -1) return true;
+                if (label.indexOf('fakelimit') !== -1) return true;
                 return false;
             }
             function parseFakeLimitFromRawHtml(html) {
                 var out = {};
                 if (!html) return out;
                 var row = html.match(
-                    /<td>\\s*(?:Aldatma[\\s\\S]*?|Fake\\s*limit)[\\s\\S]*?<\\/td>\\s*<td>\\s*([^<]+)/i
+                    /<(?:td|th)[^>]*>\\s*(?:Aldatma[\\s\\S]*?|Fake\\s*[-]?\\s*limit)[\\s\\S]*?<\\/(?:td|th)>\\s*<(?:td|th)[^>]*>\\s*([^<]+)/i
                 );
                 if (row) {
                     var pct = parseFakePctFromValue(row[1]);
@@ -25328,11 +26674,15 @@ class TribalWarsBot(QMainWindow):
                     : html.substring(0, Math.min(html.length, 300000));
                 var wc = slice.match(/"fake_limit"\\s*:\\s*(\\d+(?:\\.\\d+)?)/);
                 if (wc && out.fake_min_pop_percent == null) {
-                    var n = parseFloat(wc[1]);
-                    if (n > 0 && n < 1) out.fake_min_pop_percent = n * 100;
-                    else out.fake_min_pop_percent = n;
+                    out.fake_min_pop_percent = fakePctFromConfigNumber(parseFloat(wc[1]));
                 }
                 return out;
+            }
+            function parseFakeLimitFromConfigXml(xml) {
+                if (!xml) return null;
+                var m = String(xml).match(/<fake_limit>\\s*([^<]+)\\s*<\\/fake_limit>/i);
+                if (!m) return null;
+                return fakePctFromConfigNumber(parseFloat(String(m[1]).replace(',', '.')));
             }
             function parseSpeedFromRawHtml(html) {
                 var out = {};
@@ -25347,18 +26697,20 @@ class TribalWarsBot(QMainWindow):
                 if (m2) out.unit_speed = parseFloat(m2[1]);
                 /* Klanlar /page/settings: <td>Oyun hızı</td><td>1.7</td> (DOM bazen bozuk) */
                 if (!out.world_speed) {
-                    var t1 = html.match(/<td>\\s*Oyun[\\s\\S]*?<\\/td>\\s*<td>\\s*([0-9]+(?:\\.[0-9]+)?)/i);
+                    var t1 = html.match(/<(?:td|th)[^>]*>\\s*Oyun[\\s\\S]*?<\\/(?:td|th)>\\s*<(?:td|th)[^>]*>\\s*([0-9]+(?:\\.[0-9]+)?)/i);
                     if (t1) out.world_speed = parseFloat(t1[1]);
                 }
                 if (!out.unit_speed) {
-                    var t2 = html.match(/<td>\\s*Birim[\\s\\S]*?<\\/td>\\s*<td>\\s*([0-9]+(?:\\.[0-9]+)?)/i);
+                    var t2 = html.match(/<(?:td|th)[^>]*>\\s*Birim[\\s\\S]*?<\\/(?:td|th)>\\s*<(?:td|th)[^>]*>\\s*([0-9]+(?:\\.[0-9]+)?)/i);
                     if (t2) out.unit_speed = parseFloat(t2[1]);
                 }
                 return out;
             }
             function parseSettingsTable(doc) {
                 var result = {};
-                var rows = doc.querySelectorAll('table.data-table tr, table.vis tr, .data-table tr');
+                var rows = doc.querySelectorAll(
+                    'table.data-table tr, table.vis tr, .data-table tr, table tr'
+                );
                 rows.forEach(function(row) {
                     var cells = row.querySelectorAll('td, th');
                     if (cells.length < 2) return;
@@ -25384,27 +26736,36 @@ class TribalWarsBot(QMainWindow):
                 });
                 return result;
             }
-            fetch(url, {credentials: 'same-origin'})
-            .then(function(r) { return r.text(); })
-            .then(function(html) {
+            function finish(result) {
+                window.__tw_world_settings = JSON.stringify(result || {});
+            }
+            Promise.all([
+                fetch(url, {credentials: 'same-origin'}).then(function(r) { return r.text(); }).catch(function() { return ''; }),
+                fetch(cfgUrl, {credentials: 'same-origin'}).then(function(r) { return r.text(); }).catch(function() { return ''; })
+            ]).then(function(parts) {
+                var html = parts[0] || '';
+                var cfgXml = parts[1] || '';
                 var doc = new DOMParser().parseFromString(html, 'text/html');
                 var rawSpeed = parseSpeedFromRawHtml(html);
                 var rawFake = parseFakeLimitFromRawHtml(html);
                 var table = parseSettingsTable(doc);
+                var cfgFake = parseFakeLimitFromConfigXml(cfgXml);
                 var result = {};
                 if (rawSpeed.world_speed) result.world_speed = rawSpeed.world_speed;
                 if (rawSpeed.unit_speed) result.unit_speed = rawSpeed.unit_speed;
                 if (!result.world_speed && table.world_speed) result.world_speed = table.world_speed;
                 if (!result.unit_speed && table.unit_speed) result.unit_speed = table.unit_speed;
-                if (rawFake.fake_min_pop_percent != null) {
+                /* get_config <fake_limit> otoriter (0 = pasif, örn. tr104) */
+                if (cfgFake != null) {
+                    result.fake_min_pop_percent = cfgFake;
+                } else if (rawFake.fake_min_pop_percent != null) {
                     result.fake_min_pop_percent = rawFake.fake_min_pop_percent;
                 } else if (table.fake_min_pop_percent != null) {
                     result.fake_min_pop_percent = table.fake_min_pop_percent;
                 }
-                window.__tw_world_settings = JSON.stringify(result);
-            })
-            .catch(function(err) {
-                window.__tw_world_settings = JSON.stringify({error: String(err)});
+                finish(result);
+            }).catch(function(err) {
+                finish({error: String(err)});
             });
         })();
         """
@@ -26622,7 +27983,7 @@ class TribalWarsBot(QMainWindow):
         return "other"
 
     def _botprot_any_automation_active(self) -> bool:
-        """Farm/scav/gold/asker/bq/ana bot veya gelen auto-tag açık mı."""
+        """Farm/scav/gold/asker/bq/ana bot veya gelen auto-tag / bakıcılık açık mı."""
         try:
             if self._automation_collect_running():
                 return True
@@ -26631,6 +27992,11 @@ class TribalWarsBot(QMainWindow):
         try:
             cb = getattr(self, "incomings_auto_tag_cb", None)
             if cb is not None and cb.isChecked():
+                return True
+        except Exception:
+            pass
+        try:
+            if self._sitter_settings_enabled():
                 return True
         except Exception:
             pass
