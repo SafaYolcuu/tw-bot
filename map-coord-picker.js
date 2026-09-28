@@ -2,7 +2,8 @@
  * Map Coord Picker — tw-bot
  * Filtreler: header flexible gap (köy / hammadde arası)
  * Sonuç: #map_config (sağ panel) + floating widget
- * Haritada gezinince eşleşen köyler birikir. «Bot'a aktar» → twMapCoordBridge.setCoords
+ * Yalnızca o an görünen harita alanı (TWMap.map.pos + TWMap.size) taranır.
+ * «Bot'a aktar» → twMapCoordBridge.setCoords
  */
 (function () {
     'use strict';
@@ -18,7 +19,10 @@
 
     // Önceki UI temizle
     if (window.__twMapCoordPickerLoaded) {
-        jQuery('#ra-map-coord-picker, #twMapCoordFilters, #twMapCoordResultPanel').remove();
+        jQuery(
+            '#ra-map-coord-picker, #twMapCoordFilters, #twMapCoordResultPanel, #twMapCoordColorGroupPanel'
+        ).remove();
+        unwrapMapColorGroupLayout();
         if (TWMap.mapHandler._twSpawnSectorOrig) {
             TWMap.mapHandler.spawnSector = TWMap.mapHandler._twSpawnSectorOrig;
         }
@@ -133,6 +137,56 @@
         return false;
     }
 
+    /** Görünen harita dikdörtgeni (oyun koordinatı, inclusive). */
+    function getVisibleBounds() {
+        // Bazı sürümlerde hazır viewport
+        if (TWMap.map && TWMap.map.viewport && TWMap.map.viewport.length >= 4) {
+            var vp = TWMap.map.viewport;
+            return {
+                minX: Math.floor(Number(vp[0])),
+                minY: Math.floor(Number(vp[1])),
+                maxX: Math.floor(Number(vp[2])),
+                maxY: Math.floor(Number(vp[3])),
+            };
+        }
+        var map = TWMap.map;
+        var size = TWMap.size;
+        var tile = TWMap.tileSize || [53, 38];
+        var minX, minY, w, h;
+        if (map && map.pos && size && size[0] > 0 && size[1] > 0) {
+            // pos = görünür alanın sol-üst köşesi (kaydırırken float olabilir)
+            minX = Math.floor(Number(map.pos[0]));
+            minY = Math.floor(Number(map.pos[1]));
+            w = parseInt(size[0], 10) || 0;
+            h = parseInt(size[1], 10) || 0;
+        } else if (map && map.pos) {
+            var el = document.getElementById('map');
+            minX = Math.floor(Number(map.pos[0]));
+            minY = Math.floor(Number(map.pos[1]));
+            w = el ? Math.max(1, Math.ceil(el.clientWidth / (tile[0] || 53))) : 0;
+            h = el ? Math.max(1, Math.ceil(el.clientHeight / (tile[1] || 38))) : 0;
+        } else {
+            return null;
+        }
+        if (!(w > 0 && h > 0) || isNaN(minX) || isNaN(minY)) return null;
+        return {
+            minX: minX,
+            minY: minY,
+            maxX: minX + w - 1,
+            maxY: minY + h - 1,
+        };
+    }
+
+    function isInVisibleBounds(x, y, bounds) {
+        if (!bounds) return false;
+        return (
+            x >= bounds.minX &&
+            x <= bounds.maxX &&
+            y >= bounds.minY &&
+            y <= bounds.maxY
+        );
+    }
+
     function addCoord(coord) {
         if (!coord) return false;
         if (selectedVillages.indexOf(coord) >= 0) return false;
@@ -165,6 +219,12 @@
         }
         if (opts.clearFirst) {
             selectedVillages = [];
+            jQuery('[id^=map_village_]').css({ filter: 'none' });
+        }
+        var bounds = getVisibleBounds();
+        if (!bounds) {
+            refreshList();
+            return;
         }
         var villages = TWMap.villages || {};
         var key;
@@ -175,6 +235,7 @@
             var n = parseInt(key, 10);
             var x = Math.floor(n / 1000);
             var y = n % 1000;
+            if (!isInVisibleBounds(x, y, bounds)) continue;
             if (!villageMatchesFilters(v, fs)) continue;
             var coord = coordFromVillage(v, x, y);
             if (addCoord(coord)) highlightVillage(v, true);
@@ -185,6 +246,8 @@
     function scanSectorVillages(data, sector) {
         var fs = filterState();
         if (!fs.any) return;
+        var bounds = getVisibleBounds();
+        if (!bounds) return;
         var beginX = sector.x - data.x;
         var endX = beginX + mapOverlay.mapSubSectorSize;
         var beginY = sector.y - data.y;
@@ -198,6 +261,7 @@
                 if (y < beginY || y >= endY) continue;
                 xCoord = data.x + x;
                 yCoord = data.y + y;
+                if (!isInVisibleBounds(xCoord, yCoord, bounds)) continue;
                 v = mapOverlay.villages[xCoord * 1000 + yCoord];
                 if (!v) continue;
                 coord = coordFromVillage(v, xCoord, yCoord);
@@ -220,14 +284,44 @@
 
     function onFilterChange() {
         syncFilterInputsEnabled();
-        // Filtre değişince yüklü köyleri yeniden tara (liste birikir = clearFirst false;
-        // pratikte eski filtre kalıntısı kalmasın diye clear + rescan)
+        lastViewportKey = '';
         selectedVillages = [];
         jQuery('[id^=map_village_]').css({ filter: 'none' });
         scanLoadedVillages({ clearFirst: true });
         try {
             TWMap.reload();
         } catch (e) {}
+    }
+
+    var lastViewportKey = '';
+    var viewScanTimer = null;
+
+    function viewportKey() {
+        var map = TWMap.map;
+        var size = TWMap.size || [0, 0];
+        if (!map || !map.pos) return '';
+        return (
+            Math.floor(Number(map.pos[0])) +
+            '|' +
+            Math.floor(Number(map.pos[1])) +
+            '|' +
+            size[0] +
+            'x' +
+            size[1]
+        );
+    }
+
+    /** Harita kayınca yalnızca yeni görünen eşleşmeleri ekle (mevcut liste silinmez). */
+    function scheduleViewportRescan() {
+        if (viewScanTimer) clearTimeout(viewScanTimer);
+        viewScanTimer = setTimeout(function () {
+            var fs = filterState();
+            if (!fs.any) return;
+            var key = viewportKey();
+            if (!key || key === lastViewportKey) return;
+            lastViewportKey = key;
+            scanLoadedVillages({ clearFirst: false });
+        }, 180);
     }
 
     function pushToBot() {
@@ -261,6 +355,384 @@
                 UI.SuccessMessage('Kopyalandı.', 3000);
             }
         }
+    }
+
+    function uiError(msg) {
+        if (typeof UI !== 'undefined' && UI.ErrorMessage) UI.ErrorMessage(msg, 4000);
+        else window.alert(msg);
+    }
+
+    function uiOk(msg) {
+        if (typeof UI !== 'undefined' && UI.SuccessMessage) UI.SuccessMessage(msg, 3500);
+    }
+
+    function showVillageColors() {
+        var $vc = jQuery('#village_colors');
+        if ($vc.length && !$vc.is(':visible')) $vc.show();
+    }
+
+    function randomBrightHex() {
+        var r = 80 + Math.floor(Math.random() * 175);
+        var g = 80 + Math.floor(Math.random() * 175);
+        var b = 80 + Math.floor(Math.random() * 175);
+        function h(n) {
+            var s = n.toString(16);
+            return s.length === 1 ? '0' + s : s;
+        }
+        return '#' + h(r) + h(g) + h(b);
+    }
+
+    function hexToRgb(hex) {
+        var m = String(hex || '')
+            .replace('#', '')
+            .match(/^([0-9a-fA-F]{6})$/);
+        if (!m) return { r: 254, g: 0, b: 0 };
+        var n = m[1];
+        return {
+            r: parseInt(n.slice(0, 2), 16),
+            g: parseInt(n.slice(2, 4), 16),
+            b: parseInt(n.slice(4, 6), 16),
+        };
+    }
+
+    function existingOtherGroupIds() {
+        var ids = {};
+        jQuery('#for_color_groups .colorgroup-other-entry').each(function () {
+            var id = jQuery(this).attr('data-id');
+            if (id != null && id !== '') ids[String(id)] = true;
+        });
+        return ids;
+    }
+
+    function refreshGroupSelect(preferId) {
+        var $sel = jQuery('#twMapCoordGroupSelect');
+        if (!$sel.length) return;
+        var prev = preferId != null ? String(preferId) : $sel.val();
+        $sel.empty();
+        $sel.append(jQuery('<option></option>').attr('value', '__new__').text('Yeni grup…'));
+        jQuery('#for_color_groups .colorgroup-other-entry').each(function () {
+            var $row = jQuery(this);
+            var id = String($row.attr('data-id') || '');
+            if (!id) return;
+            var name = jQuery('#groupname_' + id).text().trim() || ('Grup ' + id);
+            $sel.append(jQuery('<option></option>').attr('value', id).text(name));
+        });
+        if (prev && $sel.find('option[value="' + prev + '"]').length) {
+            $sel.val(prev);
+        } else if ($sel.find('option').length > 1) {
+            $sel.prop('selectedIndex', 1);
+        } else {
+            $sel.val('__new__');
+        }
+        toggleNewGroupFields();
+    }
+
+    function toggleNewGroupFields() {
+        var isNew = jQuery('#twMapCoordGroupSelect').val() === '__new__';
+        jQuery('#twMapCoordNewGroupFields').toggle(!!isNew);
+        if (isNew) {
+            var $name = jQuery('#twMapCoordNewGroupName');
+            if ($name.length && !jQuery.trim($name.val())) {
+                var d = new Date();
+                var pad = function (n) {
+                    return n < 10 ? '0' + n : String(n);
+                };
+                $name.val(
+                    'Seçim ' +
+                        pad(d.getHours()) +
+                        ':' +
+                        pad(d.getMinutes())
+                );
+            }
+            if (!jQuery('#twMapCoordNewGroupColor').val()) {
+                jQuery('#twMapCoordNewGroupColor').val(randomBrightHex());
+            }
+        }
+    }
+
+    function bindOtherEntryRow($row) {
+        if (!$row || !$row.length || typeof ColorGroups === 'undefined') return;
+        var id = $row.attr('data-id');
+        if (id == null) return;
+        id = parseInt(id, 10);
+        $row
+            .find('.colorgroup-other-activate')
+            .off('change.twmcp')
+            .on('change.twmcp', function () {
+                if (jQuery(this).is(':checked')) ColorGroups.Other.activateGroup(id);
+                else ColorGroups.Other.deactivateGroup(id);
+            });
+        $row
+            .find('.colorgroup-other-delete')
+            .off('click.twmcp')
+            .on('click.twmcp', function (e) {
+                e.preventDefault();
+                UI.addConfirmBox(
+                    typeof _ === 'function'
+                        ? _('1d7a209e5461c92be4a38e7cfef02380')
+                        : 'Bu grubu silmek istiyor musun?',
+                    function () {
+                        ColorGroups.Other.deleteGroup(id);
+                    }
+                );
+            });
+        $row
+            .find('.color_picker_launcher')
+            .off('click.twmcp')
+            .on('click.twmcp', function (e) {
+                e.preventDefault();
+                ColorGroups.color_picker.openPopup(jQuery(this), ColorGroups.TYPE_OTHER);
+            });
+    }
+
+    function paintAddedVillages(resp) {
+        if (!resp || !resp.villages || !resp.villages.length) return;
+        resp.villages.forEach(function (item) {
+            if (typeof MapHighlighter === 'undefined') return;
+            MapHighlighter.alterVillage(item.village_id, item.color);
+            if (typeof TWMap.villageKey[item.village_id] !== 'undefined') {
+                MapHighlighter.colorVillage(TWMap.villages[TWMap.villageKey[item.village_id]]);
+            }
+            TWMap.minimap_cache_stamp++;
+        });
+        try {
+            TWMap.minimap.reload(true);
+        } catch (e1) {}
+        try {
+            TWMap.map.reload(true);
+        } catch (e2) {}
+    }
+
+    function addVillagesToGroup(groupId, coordsNl, done) {
+        TribalWars.post(
+            'map',
+            { ajaxaction: 'colorgroup_add_multiple_villages' },
+            { group_id: groupId, coordinates: coordsNl },
+            function (resp) {
+                paintAddedVillages(resp);
+                if (typeof done === 'function') done(resp);
+            }
+        );
+    }
+
+    function createForGroup(name, done) {
+        var $form = jQuery('#new_group form');
+        if (!$form.length) {
+            uiError('Yeni grup formu bulunamadı (Harita vurguları).');
+            return;
+        }
+        var before = existingOtherGroupIds();
+        var url = $form.attr('action');
+        var data = $form.serializeArray();
+        var hasName = false;
+        var i;
+        for (i = 0; i < data.length; i++) {
+            if (data[i].name === 'new_group_name') {
+                data[i].value = name;
+                hasName = true;
+            }
+        }
+        if (!hasName) data.push({ name: 'new_group_name', value: name });
+        data.push({ name: 'for_new_group', value: 'Oluştur' });
+
+        jQuery.ajax({
+            url: url,
+            type: 'POST',
+            data: jQuery.param(data),
+            dataType: 'html',
+            success: function (html) {
+                var $entries = jQuery();
+                try {
+                    var doc = new DOMParser().parseFromString(html, 'text/html');
+                    $entries = jQuery(doc).find('#for_color_groups .colorgroup-other-entry');
+                } catch (parseErr) {
+                    var $parsed = jQuery('<div>').append(jQuery.parseHTML(html));
+                    $entries = $parsed.find('#for_color_groups .colorgroup-other-entry');
+                }
+                var $newRow = null;
+                $entries.each(function () {
+                    var id = String(jQuery(this).attr('data-id') || '');
+                    if (id && !before[id]) {
+                        $newRow = jQuery(this);
+                        return false;
+                    }
+                });
+                if (!$newRow || !$newRow.length) {
+                    $newRow = $entries.last();
+                    if ($newRow.length && before[String($newRow.attr('data-id'))]) {
+                        $newRow = null;
+                    }
+                }
+                if (!$newRow || !$newRow.length) {
+                    uiError('Yeni grup oluşturuldu ama satır okunamadı. Sayfayı yenileyip tekrar dene.');
+                    return;
+                }
+                var $clone = jQuery($newRow.prop('outerHTML'));
+                jQuery('#for_color_groups').append($clone);
+                bindOtherEntryRow($clone);
+                var groupId = String($clone.attr('data-id'));
+                if (typeof done === 'function') done(groupId, $clone);
+            },
+            error: function () {
+                uiError('Grup oluşturma isteği başarısız.');
+            },
+        });
+    }
+
+    function pushSelectionToColorGroup() {
+        if (typeof ColorGroups === 'undefined' || !ColorGroups.Other) {
+            uiError('Renk grupları (ColorGroups) yok — PA / Harita vurguları gerekli.');
+            return;
+        }
+        if (!selectedVillages.length) {
+            uiError('Seçili köy yok.');
+            return;
+        }
+        showVillageColors();
+
+        var sel = jQuery('#twMapCoordGroupSelect').val();
+        var coordsNl = selectedVillages.join('\n');
+        var count = selectedVillages.length;
+
+        function afterAdd(groupId, createdNew, rgb) {
+            function finish(resp) {
+                var ok = !resp || resp.status !== false;
+                if (ok) {
+                    uiOk(
+                        count +
+                            ' köy gruba eklendi' +
+                            (createdNew ? ' (yeni grup)' : '') +
+                            '.'
+                    );
+                } else if (resp && resp.message) {
+                    uiError(resp.message);
+                } else {
+                    uiError('Köyler eklenemedi.');
+                }
+                refreshGroupSelect(groupId);
+            }
+
+            function doAdd() {
+                addVillagesToGroup(groupId, coordsNl, finish);
+            }
+
+            if (createdNew && rgb) {
+                TribalWars.post(
+                    'map',
+                    { ajaxaction: 'colorgroup_change_color' },
+                    { group_id: groupId, r: rgb.r, g: rgb.g, b: rgb.b },
+                    function (e) {
+                        try {
+                            MapLegend.updateHighlight(
+                                MapLegend.CATEGORY_OTHER,
+                                groupId,
+                                e.group_name,
+                                { r: rgb.r, g: rgb.g, b: rgb.b }
+                            );
+                        } catch (err1) {}
+                        try {
+                            ColorGroups.Other.handleBigChange(e);
+                        } catch (err2) {}
+                        var $row = jQuery('.colorgroup-other-entry[data-id="' + groupId + '"]');
+                        $row
+                            .find('.marker')
+                            .css(
+                                'background-color',
+                                'rgb(' + rgb.r + ',' + rgb.g + ',' + rgb.b + ')'
+                            );
+                        $row
+                            .find('.color_picker_launcher')
+                            .data('r', rgb.r)
+                            .data('g', rgb.g)
+                            .data('b', rgb.b);
+                        doAdd();
+                    }
+                );
+            } else {
+                doAdd();
+            }
+        }
+
+        if (sel === '__new__') {
+            var name = jQuery.trim(jQuery('#twMapCoordNewGroupName').val() || '');
+            if (!name) {
+                uiError('Yeni grup için bir ad yaz.');
+                return;
+            }
+            var rgb = hexToRgb(jQuery('#twMapCoordNewGroupColor').val());
+            createForGroup(name, function (groupId) {
+                refreshGroupSelect(groupId);
+                afterAdd(groupId, true, rgb);
+            });
+            return;
+        }
+
+        if (!sel) {
+            uiError('Bir grup seç veya Yeni grup… seç.');
+            return;
+        }
+        afterAdd(sel, false, null);
+    }
+
+    function unwrapMapColorGroupLayout() {
+        var $wrap = jQuery('#twMapCoordMapRow');
+        if (!$wrap.length) return;
+        var $table = $wrap.children('table.map_container').first();
+        if ($table.length) $table.insertBefore($wrap);
+        $wrap.remove();
+    }
+
+    function buildColorGroupUI() {
+        jQuery('#twMapCoordColorGroupPanel').remove();
+        unwrapMapColorGroupLayout();
+        if (!jQuery('#for_groups').length && typeof ColorGroups === 'undefined') return;
+
+        var html =
+            '<div id="twMapCoordColorGroupPanel" style="' +
+            'flex:0 0 168px;width:168px;max-width:168px;box-sizing:border-box;' +
+            'padding:8px 6px;margin:0;font-size:11px;line-height:1.3;' +
+            'background:#f4e4bc;border:1px solid #8c5f0d;align-self:flex-start;' +
+            '">' +
+            '<div style="font-weight:600;margin-bottom:6px;">Seçili köyleri gruba ekle</div>' +
+            '<label style="display:block;margin-bottom:6px;">Grup<br/>' +
+            '<select id="twMapCoordGroupSelect" style="width:100%;margin-top:2px;box-sizing:border-box;"></select></label>' +
+            '<div id="twMapCoordNewGroupFields" style="display:none;margin:4px 0 6px;">' +
+            '<label style="display:block;margin-bottom:4px;">Yeni grup adı<br/>' +
+            '<input type="text" id="twMapCoordNewGroupName" placeholder="Grup adı" ' +
+            'style="width:100%;margin-top:2px;box-sizing:border-box;" /></label>' +
+            '<label style="display:inline-flex;align-items:center;gap:6px;">Renk ' +
+            '<input type="color" id="twMapCoordNewGroupColor" value="' +
+            randomBrightHex() +
+            '" /></label>' +
+            '</div>' +
+            '<a href="#" class="btn btn-confirm-yes" id="twMapCoordToColorGroup" style="display:inline-block;margin-top:2px;">Seçimi ekle</a>' +
+            '</div>';
+
+        var $mapTable = jQuery('#map').closest('table.map_container');
+        if ($mapTable.length) {
+            var $wrap = jQuery(
+                '<div id="twMapCoordMapRow" style="display:flex;align-items:flex-start;gap:8px;clear:both;"></div>'
+            );
+            $mapTable.before($wrap);
+            $wrap.append(html);
+            $wrap.append($mapTable);
+        } else if (jQuery('#map_wrap').length) {
+            jQuery('#map_wrap').before(html);
+        } else {
+            var $after = jQuery('#for_groups').nextAll('a').filter(function () {
+                return /Yeni grup/i.test(jQuery(this).text());
+            }).first();
+            if ($after.length) $after.after(html);
+            else if (jQuery('#for_groups').length) jQuery('#for_groups').after(html);
+            else return;
+        }
+
+        refreshGroupSelect();
+        jQuery('#twMapCoordGroupSelect').on('change', toggleNewGroupFields);
+        jQuery('#twMapCoordToColorGroup').on('click', function (e) {
+            e.preventDefault();
+            pushSelectionToColorGroup();
+        });
     }
 
     function findHeaderGapTd() {
@@ -352,8 +824,9 @@
             '<a href="#" class="btn" id="twMapCoordReset">Sıfırla</a>' +
             '<a href="#" class="btn" id="twMapCoordCopy">Kopyala</a>' +
             '<a href="#" class="btn btn-confirm-yes" id="twMapCoordBot">Bot\'a aktar</a>' +
+            '<a href="#" class="btn" id="twMapCoordGroupBtn">Gruba ekle</a>' +
             '</div>' +
-            '<p style="margin:8px 0 0;font-size:10px;color:#444;">Filtre açıkken haritada gezinince eşleşenler birikir. Köye tık = elle ekle/çıkar.</p>' +
+            '<p style="margin:8px 0 0;font-size:10px;color:#444;">Yalnızca ekranda görünen alan taranır; gezinince yeni eşleşmeler listeye eklenir (eski silinmez). Sıfırla ile temizle. Köye tık = elle ekle/çıkar. Gruba ekle = Harita vurguları (Yabancı köyler).</p>' +
             '</div>';
         jQuery('#contentContainer').prepend(html);
 
@@ -389,14 +862,23 @@
             e.preventDefault();
             pushToBot();
         });
+        jQuery('#twMapCoordGroupBtn').on('click', function (e) {
+            e.preventDefault();
+            showVillageColors();
+            refreshGroupSelect();
+            pushSelectionToColorGroup();
+        });
 
         try {
-            jQuery('#' + id).draggable({ cancel: 'textarea, input, .btn' });
+            jQuery('#' + id).draggable({ cancel: 'textarea, input, select, .btn' });
         } catch (e2) {}
     }
 
     function teardown() {
-        jQuery('#ra-map-coord-picker, #twMapCoordFilters, #twMapCoordResultPanel').remove();
+        jQuery(
+            '#ra-map-coord-picker, #twMapCoordFilters, #twMapCoordResultPanel, #twMapCoordColorGroupPanel'
+        ).remove();
+        unwrapMapColorGroupLayout();
         if (mapOverlay.mapHandler._twSpawnSectorOrig) {
             TWMap.mapHandler.spawnSector = mapOverlay.mapHandler._twSpawnSectorOrig;
             delete mapOverlay.mapHandler._twSpawnSectorOrig;
@@ -422,6 +904,7 @@
     TWMap.mapHandler.spawnSector = function (data, sector) {
         mapOverlay.mapHandler._twSpawnSectorOrig(data, sector);
         scanSectorVillages(data, sector);
+        scheduleViewportRescan();
         // Seçili köyleri yeniden vurgula
         var beginX = sector.x - data.x;
         var endX = beginX + mapOverlay.mapSubSectorSize;
@@ -498,6 +981,7 @@
 
     buildFilterBar();
     buildFloatingUI();
+    buildColorGroupUI();
     refreshList();
     ensureBridge(function () {});
 })();

@@ -1,5 +1,5 @@
 {
-  "version": "1.4.12",
-  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.12/TribalWarsBot-1.4.12.zip",
-  "changelog_tr": "Place onay: varış kutusu + Tabloya ekle (çoklu dalga train[2…]); sağda Evolved tarzı doldurma paneli.\nÇoklu dalga sütun kayması düzeltmesi (mancınık/misyoner).\nOnay gönderiminde yanıt doğrulama + fake limit yok sayılır.\nTemizlik köy-köy: kompakt seçim, yeşil aktif köyler, birim/aktif liste sabit görünür.\nv1.4.11 train[2…] / sekmeler dahil."
+  "version": "1.4.13",
+  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.13/TribalWarsBot-1.4.13.zip",
+  "changelog_tr": "Fake planı: rastgele kaynak–hedef eşleştirme; Varış/Gönderim zamanı modu + gönderim aralığı.\nHarita koordinat seçici: seçili köyleri yabancı renk grubuna ekle (mevcut/yeni grup); panel harita solunda.\nTelegram /bakıcı ve /gelen (v1.4.12) dahil."
 }

@@ -198,7 +198,7 @@ from license_client import (  # noqa: E402
 # ─────────────────────────────────────────────
 
 # EXE'nin guncel oldugunu dogrulamak icin her onemli degisiklikte artirin.
-APP_VERSION = "1.4.12"
+APP_VERSION = "1.4.13"
 
 # Otomatik guncelleme — kullaniciya GitHub adresi gosterilmez; yalnizca bu URL okunur.
 UPDATE_MANIFEST_URL = "https://safayolcuu.github.io/tw-bot/bot-update.json"
@@ -820,6 +820,114 @@ def tw_telegram_api_send_message(
         return (False, str(r)[:500])
     except Exception as e:
         return (False, str(e)[:500])
+
+
+def tw_telegram_api_get_updates(
+    token: str,
+    offset=None,
+    timeout: int = 25,
+    insecure_override: bool = None,
+) -> tuple:
+    """getUpdates long-poll. Dönüş: (ok: bool, updates: list, err: str)."""
+    token = (token or "").strip()
+    if not token:
+        return (False, [], "Token boş.")
+    params = {
+        "timeout": max(0, int(timeout)),
+        "allowed_updates": json.dumps(["message", "channel_post"]),
+    }
+    if offset is not None:
+        try:
+            params["offset"] = int(offset)
+        except (TypeError, ValueError):
+            pass
+    url = f"https://api.telegram.org/bot{token}/getUpdates?{urlencode(params)}"
+    req = urllib.request.Request(url, method="GET")
+    _tg = _tw_telegram_build_opener(insecure_skip_verify=insecure_override)
+    # long-poll: timeout + ağ payı
+    http_timeout = max(35, int(timeout) + 15)
+    try:
+        with _tg.open(req, timeout=http_timeout) as resp:
+            raw = resp.read(2_000_000).decode("utf-8", "replace")
+        j = json.loads(raw)
+        if not j.get("ok"):
+            desc = (j.get("description") or str(j))[:500]
+            return (False, [], f"API: {desc}")
+        result = j.get("result")
+        if not isinstance(result, list):
+            result = []
+        return (True, result, "")
+    except urllib.error.HTTPError as e:
+        try:
+            hbody = e.read().decode("utf-8", "replace")
+            hj = json.loads(hbody)
+            desc = (hj.get("description") or hbody)[:500]
+            return (False, [], f"API ({e.code}): {desc}")
+        except Exception:
+            return (False, [], f"HTTP {e.code} {e.reason or ''}")
+    except urllib.error.URLError as e:
+        r = e.reason
+        r = r if (r and str(r).strip()) else str(e)
+        return (False, [], str(r)[:500])
+    except Exception as e:
+        return (False, [], str(e)[:500])
+
+
+def _tw_fold_cmd_token(s: str) -> str:
+    """Türkçe İ/ı dahil komut adı karşılaştırma."""
+    t = str(s or "").strip()
+    t = t.replace("İ", "i").replace("I", "i").replace("ı", "i")
+    return t.casefold()
+
+
+def _tw_parse_bakici_command(text: str):
+    """
+    /bakıcı Gonderen Kabul  → (gonderen, kabul) veya None.
+    /bakici ve /bakıcı@BotName da kabul.
+    """
+    raw = str(text or "").strip()
+    if not raw.startswith("/"):
+        return None
+    parts = raw.split()
+    if len(parts) < 3:
+        return None
+    cmd = parts[0].split("@", 1)[0]
+    if _tw_fold_cmd_token(cmd) != _tw_fold_cmd_token("/bakıcı"):
+        return None
+    gonderen = parts[1].strip()
+    kabul = " ".join(parts[2:]).strip()
+    if not gonderen or not kabul:
+        return None
+    return (gonderen, kabul)
+
+
+def _tw_parse_gelen_command(text: str):
+    """
+    /gelen 500|500 Oyuncu  → (x, y, player) veya None.
+    /gelen@BotName ve 500:500 de kabul.
+    """
+    raw = str(text or "").strip()
+    if not raw.startswith("/"):
+        return None
+    parts = raw.split()
+    if len(parts) < 3:
+        return None
+    cmd = parts[0].split("@", 1)[0]
+    if _tw_fold_cmd_token(cmd) != _tw_fold_cmd_token("/gelen"):
+        return None
+    coord = parts[1].strip().replace(":", "|")
+    m = re.match(r"^(\d+)\|(\d+)$", coord)
+    if not m:
+        return None
+    player = " ".join(parts[2:]).strip()
+    if not player:
+        return None
+    try:
+        x = int(m.group(1))
+        y = int(m.group(2))
+    except (TypeError, ValueError):
+        return None
+    return (x, y, player)
 
 
 def tw_telegram_api_send_photo(
@@ -4470,18 +4578,29 @@ class ArmyAuxToolsDialog(QDialog):
         v_fake = QVBoxLayout(w_fake)
         v_fake.setContentsMargins(8, 8, 8, 8)
         self._hint_fake = QLabel(
-            "Her hedefe en fazla N fake. Önce farklı köyler (az kullanılan), aynı hedefe en uzak "
-            "yetinen; kuyruk sırası atışa en az süre kalanlara göre (Sophie). Köy başına en fazla N. "
-            "Hedef: Tarayıcı → «Koordinatlar» → «Bot'a aktar». "
-            "Bitiş saati boş = tek varış; doluysa her fake rastgele bu aralıkta (SS:DD:SS:ms)."
+            "Her hedefe en fazla N fake; köy başına en fazla N. "
+            "Kaynak–hedef eşleştirmesi rastgele (aynı planda aynı çift tekrarlanmaz). "
+            "Zaman: Varış veya Gönderim — bitiş saati boş = tek an; doluysa her fake aralıkta rastgele. "
+            "Hedef: Tarayıcı → «Koordinatlar» → «Bot'a aktar»."
         )
         self._hint_fake.setWordWrap(True)
         v_fake.addWidget(self._hint_fake)
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(6)
+        mode_row.addWidget(QLabel("Zaman modu:"))
+        self.fake_time_mode = QComboBox()
+        self.fake_time_mode.addItem("Varış zamanı", "arrive")
+        self.fake_time_mode.addItem("Gönderim zamanı", "send")
+        self.fake_time_mode.setMinimumWidth(140)
+        self.fake_time_mode.currentIndexChanged.connect(self._fake_sync_time_mode_labels)
+        mode_row.addWidget(self.fake_time_mode)
+        mode_row.addStretch()
+        v_fake.addLayout(mode_row)
         arrive_row = QHBoxLayout()
         arrive_row.setSpacing(6)
-        arrive_lbl = QLabel("Varış:")
-        arrive_lbl.setStyleSheet("font-weight: bold;")
-        arrive_row.addWidget(arrive_lbl)
+        self.fake_time_lbl = QLabel("Varış:")
+        self.fake_time_lbl.setStyleSheet("font-weight: bold;")
+        arrive_row.addWidget(self.fake_time_lbl)
         self.fake_arrive_date = QLineEdit()
         self.fake_arrive_date.setPlaceholderText("GG.AA")
         self.fake_arrive_date.setFixedWidth(56)
@@ -4500,7 +4619,7 @@ class ArmyAuxToolsDialog(QDialog):
         self.fake_arrive_clock_end.setFixedWidth(118)
         self.fake_arrive_clock_end.setAlignment(Qt.AlignCenter)
         self.fake_arrive_clock_end.setToolTip(
-            "Boş bırakırsan tek varış saati kullanılır.\n"
+            "Boş bırakırsan tek saat kullanılır.\n"
             "Doluysa her fake bu aralıkta rastgele SS:DD:SS:ms alır.\n"
             "Bitiş < başlangıç ise ertesi güne taşınır."
         )
@@ -4512,6 +4631,7 @@ class ArmyAuxToolsDialog(QDialog):
         arrive_row.addWidget(b_fake_from_main)
         arrive_row.addStretch()
         v_fake.addLayout(arrive_row)
+        self._fake_sync_time_mode_labels()
         v_fake.addWidget(QLabel("Hedef koordinatları:"))
         self.fake_targets = QTextEdit()
         self.fake_targets.setPlaceholderText("505|588  veya  satır satır")
@@ -4768,6 +4888,15 @@ class ArmyAuxToolsDialog(QDialog):
         tc_end = (s.value("fake_plan/arrive_clock_end", "") or "").strip()
         if hasattr(self, "fake_arrive_clock_end"):
             self.fake_arrive_clock_end.setText(tc_end)
+        mode = (s.value("fake_plan/time_mode", "arrive") or "arrive").strip().lower()
+        if hasattr(self, "fake_time_mode"):
+            idx = self.fake_time_mode.findData("send" if mode == "send" else "arrive")
+            if idx < 0:
+                idx = 0
+            self.fake_time_mode.blockSignals(True)
+            self.fake_time_mode.setCurrentIndex(idx)
+            self.fake_time_mode.blockSignals(False)
+            self._fake_sync_time_mode_labels()
         units_raw = (s.value("fake_plan/units", "") or "").strip()
         if units_raw:
             selected = {u.strip() for u in units_raw.split(",") if u.strip()}
@@ -4797,6 +4926,9 @@ class ArmyAuxToolsDialog(QDialog):
                 "fake_plan/arrive_clock_end",
                 self.fake_arrive_clock_end.text().strip(),
             )
+        if hasattr(self, "fake_time_mode"):
+            mode = self.fake_time_mode.currentData()
+            s.setValue("fake_plan/time_mode", "send" if mode == "send" else "arrive")
         s.setValue("fake_plan/units", ",".join(self._fake_selected_unit_keys()))
         s.setValue("fake_plan/per_village", int(self.sp_fake_per_village.value()))
         s.setValue("fake_plan/limit", self.cb_fake_limit.isChecked())
@@ -4806,6 +4938,33 @@ class ArmyAuxToolsDialog(QDialog):
                 json.dumps(self._fake_selected_source_ids(), ensure_ascii=False),
             )
         s.sync()
+
+    def _fake_selected_time_mode(self) -> str:
+        if hasattr(self, "fake_time_mode"):
+            mode = self.fake_time_mode.currentData()
+            if mode == "send":
+                return "send"
+        return "arrive"
+
+    def _fake_sync_time_mode_labels(self, *_args) -> None:
+        """Varış / gönderim etiketlerini moda göre güncelle."""
+        if not hasattr(self, "fake_time_lbl"):
+            return
+        is_send = self._fake_selected_time_mode() == "send"
+        self.fake_time_lbl.setText("Gönderim:" if is_send else "Varış:")
+        if hasattr(self, "fake_arrive_clock_end"):
+            tip = (
+                "Boş bırakırsan tek saat kullanılır.\n"
+                "Doluysa her fake bu aralıkta rastgele SS:DD:SS:ms alır.\n"
+                "Bitiş < başlangıç ise ertesi güne taşınır."
+            )
+            if is_send:
+                tip = (
+                    "Gönderim aralığı. Boş bitiş = tek gönderim anı.\n"
+                    "Doluysa her fake bu aralıkta rastgele gönderilir.\n"
+                    "Bitiş < başlangıç ise ertesi güne taşınır."
+                )
+            self.fake_arrive_clock_end.setToolTip(tip)
 
     def _fake_selected_source_ids(self) -> list:
         """İşaretli kaynak köy id'leri (str)."""
@@ -4929,6 +5088,8 @@ class ArmyAuxToolsDialog(QDialog):
         if hasattr(self, "fake_arrive_date"):
             self.fake_arrive_date.setStyleSheet(ed + inp)
             self.fake_arrive_clock.setStyleSheet(ed + inp)
+            if hasattr(self, "fake_arrive_clock_end"):
+                self.fake_arrive_clock_end.setStyleSheet(ed + inp)
         if hasattr(self, "support_target_coord"):
             self.support_target_coord.setStyleSheet(ed + inp)
         if hasattr(self, "support_arrive_date"):
@@ -5025,11 +5186,13 @@ class ArmyAuxToolsDialog(QDialog):
         tc_end = ""
         if hasattr(self, "fake_arrive_clock_end"):
             tc_end = self.fake_arrive_clock_end.text().strip()
+        time_mode = self._fake_selected_time_mode()
+        time_word = "Gönderim" if time_mode == "send" else "Varış"
         if not td or not tc:
             QMessageBox.warning(
                 self._mb_parent(),
                 "Fake planı",
-                "Varış tarihi (GG.AA) ve başlangıç saati (SS:DD:SS:ms) doldurun.\n"
+                f"{time_word} tarihi (GG.AA) ve başlangıç saati (SS:DD:SS:ms) doldurun.\n"
                 "Bitiş saati opsiyonel (boş = tek saat).",
             )
             return
@@ -5038,7 +5201,7 @@ class ArmyAuxToolsDialog(QDialog):
             QMessageBox.warning(
                 self._mb_parent(),
                 "Fake planı",
-                "Başlangıç tarih/saat formatı hatalı (GG.AA ve SS:DD:SS:ms).",
+                f"Başlangıç tarih/saat formatı hatalı (GG.AA ve SS:DD:SS:ms).",
             )
             return
         ba_end = ba
@@ -5078,6 +5241,7 @@ class ArmyAuxToolsDialog(QDialog):
             msg_parent=self.bot,
             base_arrive_end=ba_end,
             allowed_village_ids=source_ids,
+            time_mode=time_mode,
         )
         self._fake_save_settings()
         self._refresh_targets()
@@ -5712,6 +5876,8 @@ class TribalWarsBot(QMainWindow):
     # Arka plan (urllib) → ana iş parçacığı: test kutusu / log; QTimer worker’da kullanılamaz.
     _telegram_test_finished = pyqtSignal(bool, str, str)  # ok, err, chat_id_normalized
     _telegram_send_error = pyqtSignal(str)  # kısa hata metni (sendMessage arka planda)
+    _telegram_bakici_cmd = pyqtSignal(str, str)  # gonderen_hesap, kabul_edecek_hesap
+    _telegram_gelen_cmd = pyqtSignal(int, int, str)  # x, y, oyuncu
     _bright_test_finished = pyqtSignal(bool, str)  # ok, body_or_err (log’da token yok)
     _update_check_finished = pyqtSignal(object, bool)  # result dict, manual
     _update_download_finished = pyqtSignal(object)  # result dict
@@ -5834,15 +6000,23 @@ class TribalWarsBot(QMainWindow):
         # Bot koruması: adaptif DOM taraması (sunucuya istek gitmez — yalnızca runJavaScript).
         self._schedule_next_botprot_poll()
         self._schedule_next_troops_watch_poll()
-        # Otomatik bakıcılık (IGM) — ayarlardan açıksa zamanlayıcı
+        # Bakıcılık: periyodik IGM tarama yok; Telegram /bakıcı + elle «Şimdi kontrol et»
         self._sitter_auto_timer = QTimer(self)
         self._sitter_auto_timer.setSingleShot(True)
         self._sitter_auto_timer.timeout.connect(self._sitter_auto_tick)
         self._sitter_busy = False
-        QTimer.singleShot(4000, self._sitter_sync_timer_from_settings)
+        self._gelen_busy = False
+        self._tg_cmd_stop = threading.Event()
+        self._tg_cmd_thread = None
+        self._tg_cmd_offset = None
+        self._tg_cmd_flush_done = False
+        QTimer.singleShot(4000, self._sitter_sync_from_settings)
+        QTimer.singleShot(4200, self._gelen_sync_from_settings)
 
         self._telegram_test_finished.connect(self._on_telegram_test_finished)
         self._telegram_send_error.connect(self._on_telegram_send_error_slot)
+        self._telegram_bakici_cmd.connect(self._sitter_from_telegram)
+        self._telegram_gelen_cmd.connect(self._gelen_from_telegram)
         self._bright_test_finished.connect(self._on_bright_test_finished)
         self._update_check_finished.connect(self._on_update_check_finished)
         self._update_download_finished.connect(self._on_update_download_finished)
@@ -6574,6 +6748,9 @@ class TribalWarsBot(QMainWindow):
             tg_ssl = self.settings_tg_insecure_ssl_cb.isChecked()
             self._settings.setValue("notify/telegram_insecure_ssl", tg_ssl)
             _tw_save_config({"telegram_insecure_ssl": tg_ssl})
+        # Token/chat değişince bakıcı poller’ı yenile
+        if hasattr(self, "_tg_cmd_sync_poller"):
+            self._tg_cmd_sync_poller()
         if hasattr(self, "settings_sitter_enable_cb"):
             self._settings.setValue(
                 "sitter/auto_enabled", self.settings_sitter_enable_cb.isChecked()
@@ -6589,7 +6766,12 @@ class TribalWarsBot(QMainWindow):
                 self._settings.setValue(
                     "sitter/account_password", self.settings_sitter_password.text()
                 )
-            self._sitter_sync_timer_from_settings()
+            self._sitter_sync_from_settings()
+        if hasattr(self, "settings_gelen_enable_cb"):
+            self._settings.setValue(
+                "gelen/telegram_enabled", self.settings_gelen_enable_cb.isChecked()
+            )
+            self._gelen_sync_from_settings()
         if hasattr(self, "settings_bright_enable_cb"):
             self._settings.setValue(
                 "bright/enabled", self.settings_bright_enable_cb.isChecked()
@@ -6682,8 +6864,13 @@ class TribalWarsBot(QMainWindow):
             ),
             (
                 "sitter",
-                "Otomatik bakıcılık (IGM)",
+                "Bakıcılık (Telegram /bakıcı)",
                 lambda: bool(self._sitter_settings_enabled()),
+            ),
+            (
+                "gelen",
+                "Gelen paylaşımı (Telegram /gelen)",
+                lambda: bool(self._gelen_settings_enabled()),
             ),
             (
                 "main",
@@ -12212,13 +12399,16 @@ class TribalWarsBot(QMainWindow):
         msg_parent=None,
         base_arrive_end=None,
         allowed_village_ids=None,
+        time_mode="arrive",
     ):
-        """Fake kuyruğu: hedef başına farklı köy önceliği, kuyruk sırası Sophie (acil atış).
+        """Fake kuyruğu: rastgele kaynak–hedef eşleştirme.
 
-        base_arrive_end verilirse her satıra [start, end] aralığında rastgele varış atanır.
+        time_mode: 'arrive' | 'send'
+        base_arrive_end verilirse her satıra [start, end] aralığında rastgele zaman atanır.
         allowed_village_ids: sadece bu köy id'lerinden planla (None = hepsi).
         """
         parent = _tw_aux_msgbox_parent(msg_parent or self)
+        mode = "send" if str(time_mode or "").strip().lower() == "send" else "arrive"
         ba_start = base_arrive
         ba_end = base_arrive_end if base_arrive_end is not None else base_arrive
         if ba_end < ba_start:
@@ -12269,15 +12459,16 @@ class TribalWarsBot(QMainWindow):
 
         max_per_source = max(1, int(max_per_source or 1))
         now = self._server_now_dt() or datetime.datetime.now()
+        time_word = "Gönderim" if mode == "send" else "Varış"
         if ba_end <= now:
             QMessageBox.warning(
                 parent,
                 "Fake planı",
-                f"Varış aralığı sunucu saatinden önce veya aynı anda biter.\n\n"
+                f"{time_word} aralığı sunucu saatinden önce veya aynı anda biter.\n\n"
                 f"Başlangıç: {ba_start.strftime('%d.%m %H:%M:%S')}\n"
                 f"Bitiş: {ba_end.strftime('%d.%m %H:%M:%S')}\n"
                 f"Sunucu: {now.strftime('%d.%m %H:%M:%S')}\n\n"
-                "Fake planı sekmesinde varışı ileri alın (en uzak köye yetecek kadar).",
+                f"Fake planı sekmesinde {time_word.lower()}i ileri alın.",
             )
             return
 
@@ -12334,11 +12525,13 @@ class TribalWarsBot(QMainWindow):
             for p in pool
         }
         target_hits = {(tx, ty): 0 for tx, ty in targets}
+        used_pairs = set()
         added = 0
         skipped = []
         n_late = 0
         max_total = len(targets) * max_per_source
         max_rounds = max_total * max(len(pool), 1) + 16
+        earliest_send = now + datetime.timedelta(milliseconds=1)
 
         for _round in range(max_rounds):
             if added >= max_total:
@@ -12350,6 +12543,9 @@ class TribalWarsBot(QMainWindow):
                     continue
                 for p in pool:
                     vid = p["vid"]
+                    pair_key = (str(vid), int(tx), int(ty))
+                    if pair_key in used_pairs:
+                        continue
                     if usage.get(vid, 0) >= max_per_source:
                         continue
                     ref_pts = self._sa_resolve_village_points(p["v"])
@@ -12375,63 +12571,69 @@ class TribalWarsBot(QMainWindow):
                     travel_sec = self._sa_calc_travel_time(
                         dist, troop_keys, troops_map=troops_map, cmd_attack=True
                     )
-                    # Geçerli varış penceresi: [max(start, now+travel+1ms), end]
-                    earliest = now + datetime.timedelta(
-                        seconds=float(travel_sec), milliseconds=1
-                    )
-                    lo = ba_start if ba_start >= earliest else earliest
-                    hi = ba_end
-                    if lo > hi:
-                        n_late += 1
-                        continue
-                    launch_dt = lo - datetime.timedelta(seconds=travel_sec)
-                    if launch_dt <= now:
-                        n_late += 1
-                        continue
-                    time_till = (launch_dt - now).total_seconds()
-                    candidates.append(
-                        {
-                            "time_till": time_till,
-                            "usage": usage.get(vid, 0),
-                            "dist": dist,
-                            "tx": tx,
-                            "ty": ty,
-                            "coord": coord,
-                            "p": p,
-                            "vid": vid,
-                            "sx": sx,
-                            "sy": sy,
-                            "ref_pts": ref_pts,
-                            "troops_map": troops_map,
-                            "stock": stock,
-                            "arrive_lo": lo,
-                            "arrive_hi": hi,
-                        }
-                    )
+                    travel_delta = datetime.timedelta(seconds=float(travel_sec))
+
+                    if mode == "send":
+                        send_lo = ba_start if ba_start >= earliest_send else earliest_send
+                        send_hi = ba_end
+                        if send_lo > send_hi:
+                            n_late += 1
+                            continue
+                        candidates.append(
+                            {
+                                "tx": tx,
+                                "ty": ty,
+                                "coord": coord,
+                                "pair_key": pair_key,
+                                "p": p,
+                                "vid": vid,
+                                "sx": sx,
+                                "sy": sy,
+                                "ref_pts": ref_pts,
+                                "troops_map": troops_map,
+                                "stock": stock,
+                                "win_lo": send_lo,
+                                "win_hi": send_hi,
+                            }
+                        )
+                    else:
+                        earliest_arrive = now + travel_delta + datetime.timedelta(
+                            milliseconds=1
+                        )
+                        lo = ba_start if ba_start >= earliest_arrive else earliest_arrive
+                        hi = ba_end
+                        if lo > hi:
+                            n_late += 1
+                            continue
+                        launch_dt = lo - travel_delta
+                        if launch_dt <= now:
+                            n_late += 1
+                            continue
+                        candidates.append(
+                            {
+                                "tx": tx,
+                                "ty": ty,
+                                "coord": coord,
+                                "pair_key": pair_key,
+                                "p": p,
+                                "vid": vid,
+                                "sx": sx,
+                                "sy": sy,
+                                "ref_pts": ref_pts,
+                                "troops_map": troops_map,
+                                "stock": stock,
+                                "win_lo": lo,
+                                "win_hi": hi,
+                            }
+                        )
 
             if not candidates:
                 break
 
-            # Hedef başına: önce az kullanılan köy, sonra atışa az süre kalan (uzak).
-            by_target = {}
-            for c in candidates:
-                key = c["coord"]
-                prev = by_target.get(key)
-                if prev is None or (c["usage"], c["time_till"], -c["dist"]) < (
-                    prev["usage"],
-                    prev["time_till"],
-                    -prev["dist"],
-                ):
-                    by_target[key] = c
-
-            round_picks = list(by_target.values())
-            # Sophie: bu turda en acil hedef–köy çifti önce kuyruğa (timeTillFake artan).
-            round_picks.sort(
-                key=lambda c: (c["time_till"], c["usage"], -c["dist"])
-            )
+            random.shuffle(candidates)
 
             assigned_round = False
-            for pick in round_picks:
+            for pick in candidates:
                 p = pick["p"]
                 vid = pick["vid"]
                 tx, ty = pick["tx"], pick["ty"]
@@ -12440,13 +12642,13 @@ class TribalWarsBot(QMainWindow):
                 troops_map = pick["troops_map"]
                 stock = pick["stock"]
                 ref_pts = pick["ref_pts"]
-                lo = pick["arrive_lo"]
-                hi = pick["arrive_hi"]
+                lo = pick["win_lo"]
+                hi = pick["win_hi"]
                 span = (hi - lo).total_seconds()
                 if span <= 0:
-                    arrive_dt = lo
+                    input_dt = lo
                 else:
-                    arrive_dt = lo + datetime.timedelta(
+                    input_dt = lo + datetime.timedelta(
                         seconds=random.uniform(0.0, span)
                     )
 
@@ -12474,8 +12676,8 @@ class TribalWarsBot(QMainWindow):
                         ty,
                         dict(troops_map),
                         True,
-                        "arrive",
-                        arrive_dt,
+                        mode,
+                        input_dt,
                         fake_dialog=False,
                         check_fake_limit=enforce_fake_limit,
                         duplicate_dialog=False,
@@ -12489,6 +12691,7 @@ class TribalWarsBot(QMainWindow):
                     added += 1
                     usage[vid] = usage.get(vid, 0) + 1
                     target_hits[coord] = target_hits.get(coord, 0) + 1
+                    used_pairs.add(pick["pair_key"])
                     remaining[vid] = self._sa_subtract_troops_from_stock(
                         stock, troops_map
                     )
@@ -12517,15 +12720,24 @@ class TribalWarsBot(QMainWindow):
         self._sa_update_totals()
         msg = (
             f"Kuyruğa eklenen fake: {added}\n"
+            f"Zaman modu: {time_word.lower()}\n"
             f"Kaynak havuzu: {len(pool)} köy (toplam {len(villages)} köy)"
         )
         if n_late or n_no_template:
-            msg += (
-                f"\n• Varış çok yakın / geçmiş (sunucu saati): {n_late} köy–hedef denemesi"
+            late_hint = (
+                f"\n• {time_word} aralığı çok yakın / geçmiş (sunucu saati): "
+                f"{n_late} köy–hedef denemesi"
                 f"\n• Yeterli asker / şablon yok: {n_no_template} hedef"
             )
+            msg += late_hint
             if n_late:
-                msg += "\n  → Varış saatini ileri alın (en uzak köyden yetişecek kadar)."
+                if mode == "send":
+                    msg += f"\n  → {time_word} aralığını ileri alın."
+                else:
+                    msg += (
+                        f"\n  → {time_word} saatini ileri alın "
+                        "(en uzak köyden yetişecek kadar)."
+                    )
         if enforce_fake_limit and n_no_pts:
             msg += (
                 f"\n• {n_no_pts} köy puanı okunamadı → fake limiti açıkken atlanır "
@@ -24314,26 +24526,27 @@ class TribalWarsBot(QMainWindow):
         tg_group.setLayout(tg_lay)
         layout.addWidget(tg_group)
 
-        sitter_group = QGroupBox("Otomatik bakıcılık (IGM)")
+        sitter_group = QGroupBox("Bakıcılık (Telegram /bakıcı)")
         sitter_lay = QFormLayout()
         sitter_lay.setSpacing(6)
         self.settings_sitter_enable_cb = QCheckBox(
-            "Belirli mesaj konusu gelince gönderene bakıcılık isteği yolla"
+            "Telegram /bakıcı komutuyla bakıcılık isteği gönder"
         )
         self.settings_sitter_enable_cb.setChecked(
             self._settings.value("sitter/auto_enabled", False, type=bool)
         )
         self.settings_sitter_enable_cb.setToolTip(
-            "Gelen kutuda tetikleyici başlıkla yeni mesaj olursa, "
-            "gönderen oyuncuya Hesap bakıcılığı isteği gönderilir."
+            "Açıkken yapılandırılmış Telegram sohbetinden "
+            "/bakıcı GönderenHesap KabulEdecekHesap komutu dinlenir. "
+            "Periyodik mesaj kutusu taraması yapılmaz."
         )
         sitter_lay.addRow(self.settings_sitter_enable_cb)
         self.settings_sitter_subject = QLineEdit()
         self.settings_sitter_subject.setText(
             (self._settings.value("sitter/trigger_subject", "") or "").strip()
         )
-        self.settings_sitter_subject.setPlaceholderText("Örn. BAKICI veya gizli bir konu")
-        sitter_lay.addRow("Tetikleyici mesaj başlığı:", self.settings_sitter_subject)
+        self.settings_sitter_subject.setPlaceholderText("Örn. BAKICI (yalnızca elle tarama)")
+        sitter_lay.addRow("Yedek IGM başlığı (elle):", self.settings_sitter_subject)
         self.settings_sitter_password = QLineEdit()
         self.settings_sitter_password.setEchoMode(QLineEdit.Password)
         self.settings_sitter_password.setText(
@@ -24344,25 +24557,54 @@ class TribalWarsBot(QMainWindow):
         )
         sitter_lay.addRow("Oyun şifresi:", self.settings_sitter_password)
         self.settings_sitter_help = QLabel(
-            "Bot’a giriş şifresi kullanılmaz. Bu alan yalnızca oyun «Bakıcılık iste» "
-            "formundaki şifre onayı içindir; yıldızlı saklanır, tw_config.json’a yazılmaz. "
-            "Karşı taraf kabul ederse hesap kontrolü ona geçer. "
-            "Konu eşleşmesi tam eşit (büyük/küçük harf duyarsız; sondaki «(2)» sayacı yok sayılır). "
-            "Açıkken ~2–3 dk’da bir kontrol; test için «Şimdi kontrol et»."
+            "Komut: /bakıcı bakıcıisteğigönderecekhesap bakıcıyıkabuledecekhesap\n"
+            "Örnek: /bakıcı BenimHesap DigerOyuncu — gönderen oturumdaki hesapla eşleşmeli. "
+            "Üstteki Telegram token + Chat ID gerekli. "
+            "Oyun şifresi yalnızca «Bakıcılık iste» formu içindir; tw_config.json’a yazılmaz. "
+            "Periyodik gelen kutusu taraması yok (bot koruması). "
+            "İsteğe bağlı: eski IGM başlığı + «Şimdi kontrol et» tek seferlik tarama."
         )
         self.settings_sitter_help.setWordWrap(True)
         self.settings_sitter_help.setObjectName("settingsProxyHelp")
         sitter_lay.addRow(self.settings_sitter_help)
-        self.settings_sitter_now_btn = QPushButton("Şimdi kontrol et")
+        self.settings_sitter_now_btn = QPushButton("Şimdi kontrol et (IGM)")
         self.settings_sitter_now_btn.setCursor(Qt.PointingHandCursor)
         self.settings_sitter_now_btn.setToolTip(
-            "Gelen kutusunu hemen tarayıp tetikleyici başlık varsa bakıcılık isteği dener."
+            "Gelen kutusunu bir kez tarayıp tetikleyici başlık varsa bakıcılık isteği dener "
+            "(otomatik tekrar yok)."
         )
         self.settings_sitter_now_btn.clicked.connect(self._sitter_manual_check)
         sitter_lay.addRow(self.settings_sitter_now_btn)
         sitter_group.setLayout(sitter_lay)
         layout.addWidget(sitter_group)
         self.settings_sitter_enable_cb.toggled.connect(self._sitter_on_auto_toggled)
+
+        gelen_group = QGroupBox("Gelen saldırı paylaşımı (Telegram /gelen)")
+        gelen_lay = QFormLayout()
+        gelen_lay.setSpacing(6)
+        self.settings_gelen_enable_cb = QCheckBox(
+            "Telegram /gelen komutuyla hedef köye gelen saldırıları oyuncuya mesajla"
+        )
+        self.settings_gelen_enable_cb.setChecked(
+            self._settings.value("gelen/telegram_enabled", False, type=bool)
+        )
+        self.settings_gelen_enable_cb.setToolTip(
+            "Açıkken: /gelen X|Y OyuncuAdı — o koordinata gelen saldırıları seçer, "
+            "Destek iste metnini okuyup oyuncuya oyun içi mesaj gönderir."
+        )
+        gelen_lay.addRow(self.settings_gelen_enable_cb)
+        self.settings_gelen_help = QLabel(
+            "Komut: /gelen 500|500 OyuncuAdı\n"
+            "Örnek: /gelen 541|583 heinaxx — gelen saldırılar (göz ardı edilmeyenler) "
+            "tablosunda hedef eşleşen satırlar seçilir → Destek iste → metin IGM olarak "
+            "OyuncuAdı’na gider. Üstteki Telegram token + Chat ID gerekli."
+        )
+        self.settings_gelen_help.setWordWrap(True)
+        self.settings_gelen_help.setObjectName("settingsProxyHelp")
+        gelen_lay.addRow(self.settings_gelen_help)
+        gelen_group.setLayout(gelen_lay)
+        layout.addWidget(gelen_group)
+        self.settings_gelen_enable_cb.toggled.connect(self._gelen_on_auto_toggled)
 
         bright_group = QGroupBox("Bright Data — Web Unlocker (deneme)")
         bright_lay = QFormLayout()
@@ -24633,72 +24875,290 @@ class TribalWarsBot(QMainWindow):
     def _sitter_on_auto_toggled(self, checked: bool) -> None:
         if checked:
             self._automation_mark_started("sitter")
-            self._sitter_schedule_next()
-            QTimer.singleShot(2500, self._sitter_auto_tick)
         else:
             self._automation_mark_stopped("sitter")
-            t = getattr(self, "_sitter_auto_timer", None)
-            if t is not None:
-                t.stop()
+        t = getattr(self, "_sitter_auto_timer", None)
+        if t is not None:
+            t.stop()
+        self._tg_cmd_sync_poller()
 
     def _sitter_sync_timer_from_settings(self) -> None:
-        """Kaydet / açılış: checkbox durumuna göre timer."""
+        """Eski ad — uyumluluk."""
+        self._sitter_sync_from_settings()
+
+    def _sitter_sync_from_settings(self) -> None:
+        """Kaydet / açılış: periyodik timer kapalı; Telegram poller senkron."""
+        t = getattr(self, "_sitter_auto_timer", None)
+        if t is not None:
+            t.stop()
         if self._sitter_settings_enabled():
             if "sitter" not in (getattr(self, "_automation_started_at", None) or {}):
                 self._automation_mark_started("sitter")
-            self._sitter_schedule_next()
         else:
             self._automation_mark_stopped("sitter")
-            t = getattr(self, "_sitter_auto_timer", None)
-            if t is not None:
-                t.stop()
+        self._tg_cmd_sync_poller()
 
     def _sitter_schedule_next(self) -> None:
+        """Periyodik IGM taraması kaldırıldı — yalnızca varsa timer’ı durdur."""
         t = getattr(self, "_sitter_auto_timer", None)
-        if t is None:
-            return
-        if not self._sitter_settings_enabled():
+        if t is not None:
             t.stop()
+
+    def _tg_cmd_resolve_token(self) -> str:
+        if hasattr(self, "settings_tg_token"):
+            t = (self.settings_tg_token.text() or "").strip()
+            if t:
+                return t
+        cfg = _tw_load_config()
+        return (
+            cfg.get("telegram_bot_token")
+            or self._settings.value("notify/telegram_bot_token", "")
+            or ""
+        ).strip()
+
+    def _tg_cmd_resolve_chat(self) -> str:
+        if hasattr(self, "settings_tg_chat_id"):
+            c = _tw_normalize_telegram_chat_id(
+                (self.settings_tg_chat_id.text() or "").strip()
+            )
+            if c:
+                return c
+        return _tw_resolved_telegram_chat_id(_tw_load_config(), self._settings)
+
+    def _tg_cmd_poller_should_run(self) -> bool:
+        return bool(
+            (self._sitter_settings_enabled() or self._gelen_settings_enabled())
+            and self._tg_cmd_resolve_token()
+            and self._tg_cmd_resolve_chat()
+        )
+
+    def _tg_cmd_stop_poller(self) -> None:
+        ev = getattr(self, "_tg_cmd_stop", None)
+        if ev is not None:
+            ev.set()
+
+    def _tg_cmd_start_poller(self) -> None:
+        th = getattr(self, "_tg_cmd_thread", None)
+        stop_ev = getattr(self, "_tg_cmd_stop", None)
+        if th is not None and th.is_alive():
+            # Sağlıklı dinleyici zaten çalışıyor
+            if stop_ev is not None and not stop_ev.is_set():
+                return
+            # Eski thread kapanıyor — kısa sonra yeniden dene
+            QTimer.singleShot(800, self._tg_cmd_sync_poller)
             return
-        delay_ms = random.randint(120_000, 180_000)
-        t.stop()
-        t.start(delay_ms)
+        self._tg_cmd_stop = threading.Event()
+        self._tg_cmd_flush_done = False
+        self._tg_cmd_thread = threading.Thread(
+            target=self._tg_cmd_poller_loop,
+            name="tw-telegram-cmds",
+            daemon=True,
+        )
+        self._tg_cmd_thread.start()
+        self._add_log("SİSTEM", "info", "Telegram komut dinleyici başladı (/bakıcı, /gelen).")
+
+    def _tg_cmd_sync_poller(self) -> None:
+        if self._tg_cmd_poller_should_run():
+            self._tg_cmd_start_poller()
+        else:
+            was = getattr(self, "_tg_cmd_thread", None)
+            alive = was is not None and was.is_alive()
+            self._tg_cmd_stop_poller()
+            if alive:
+                self._add_log("SİSTEM", "info", "Telegram komut dinleyici durduruldu.")
+            # Thread referansını silme: kapanırken yeni poller çift başlamasın
+
+
+    def _tg_cmd_poller_loop(self) -> None:
+        stop = self._tg_cmd_stop
+        offset = getattr(self, "_tg_cmd_offset", None)
+        while stop is not None and not stop.is_set():
+            if not (
+                self._sitter_settings_enabled() or self._gelen_settings_enabled()
+            ):
+                break
+            token = self._tg_cmd_resolve_token()
+            chat = self._tg_cmd_resolve_chat()
+            if not token or not chat:
+                if stop.wait(2.0):
+                    break
+                continue
+            # İlk turda bekleyen mesajları yut (eski komut spam’i)
+            if not getattr(self, "_tg_cmd_flush_done", False):
+                ok_f, ups_f, _ = tw_telegram_api_get_updates(
+                    token, offset=offset, timeout=0
+                )
+                self._tg_cmd_flush_done = True
+                if ok_f and ups_f:
+                    try:
+                        offset = int(ups_f[-1].get("update_id", 0)) + 1
+                        self._tg_cmd_offset = offset
+                    except (TypeError, ValueError):
+                        pass
+                continue
+            ok, updates, err = tw_telegram_api_get_updates(
+                token, offset=offset, timeout=25
+            )
+            if stop.is_set():
+                break
+            if not ok:
+                if stop.wait(3.0):
+                    break
+                continue
+            want = _tw_normalize_telegram_chat_id(chat)
+            for u in updates:
+                if not isinstance(u, dict):
+                    continue
+                try:
+                    uid = int(u.get("update_id", 0))
+                    offset = uid + 1
+                    self._tg_cmd_offset = offset
+                except (TypeError, ValueError):
+                    pass
+                msg = u.get("message") or u.get("channel_post") or {}
+                if not isinstance(msg, dict):
+                    continue
+                chat_obj = msg.get("chat") or {}
+                cid = _tw_normalize_telegram_chat_id(
+                    str((chat_obj.get("id") if isinstance(chat_obj, dict) else "") or "")
+                )
+                if not cid or cid != want:
+                    continue
+                text = str(msg.get("text") or "")
+                parsed_b = _tw_parse_bakici_command(text)
+                if parsed_b:
+                    gonderen, kabul = parsed_b
+                    try:
+                        self._telegram_bakici_cmd.emit(gonderen, kabul)
+                    except Exception:
+                        pass
+                    continue
+                parsed_g = _tw_parse_gelen_command(text)
+                if parsed_g:
+                    gx, gy, gplayer = parsed_g
+                    try:
+                        self._telegram_gelen_cmd.emit(int(gx), int(gy), str(gplayer))
+                    except Exception:
+                        pass
+        # thread çıkışı
+
+    def _sitter_tg_ack(self, text: str) -> None:
+        """Komut cevabı — güvenlik uyarısı checkbox’ından bağımsız (token+chat yeterli)."""
+        body = (text or "").strip()
+        if not body:
+            return
+
+        def work():
+            try:
+                token = self._tg_cmd_resolve_token()
+                chat = self._tg_cmd_resolve_chat()
+                if not token or not chat:
+                    return
+                tw_telegram_api_send_message(token, chat, body)
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @pyqtSlot(str, str)
+    def _sitter_from_telegram(self, gonderen: str, kabul: str) -> None:
+        """Telegram /bakıcı Gönderen Kabul → vacation sitter_offer."""
+        gonderen = (gonderen or "").strip()
+        kabul = (kabul or "").strip()
+        self._add_log(
+            "BAKICI", "info",
+            f"Telegram /bakıcı: gönderen=«{gonderen}» kabul=«{kabul}»",
+        )
+        if not self._sitter_settings_enabled():
+            self._sitter_tg_ack("Bakıcılık kapalı (Ayarlar).")
+            return
+        if getattr(self, "_login_state", "") != "in_game":
+            self._sitter_tg_ack("Bot oyunda değil — önce giriş yapın.")
+            return
+        if getattr(self, "_human_verification_required", False):
+            self._sitter_tg_ack("Bot koruması / doğrulama bekleniyor — bakıcı ertelendi.")
+            return
+        if self._botprot_automation_hot_path():
+            self._sitter_tg_ack("Bot koruması sıcak yolu — bakıcı ertelendi.")
+            return
+        if getattr(self, "_sitter_busy", False):
+            self._sitter_tg_ack("Bakıcılık işlemi zaten sürüyor.")
+            return
+        password = self._sitter_account_password()
+        if not password:
+            self._sitter_tg_ack("Oyun şifresi Ayarlar’da yok.")
+            return
+        if not gonderen or not kabul:
+            self._sitter_tg_ack("Kullanım: /bakıcı GönderenHesap KabulEdecekHesap")
+            return
+        account_name = ""
+        try:
+            account_name = str(
+                ((self._game_data or {}).get("player") or {}).get("name") or ""
+            ).strip()
+        except Exception:
+            account_name = ""
+        if not account_name:
+            try:
+                account_name = self._license_account_name()
+            except Exception:
+                account_name = ""
+        if not account_name:
+            self._sitter_tg_ack("Oturum oyuncu adı okunamadı.")
+            return
+        if self._sitter_norm_subject(gonderen) != self._sitter_norm_subject(account_name):
+            self._sitter_tg_ack(
+                f"Hesap eşleşmedi: komut «{gonderen}», oturum «{account_name}»."
+            )
+            return
+        if self._sitter_is_system_sender(kabul):
+            self._sitter_tg_ack(f"Geçersiz kabul hesabı: {kabul}")
+            return
+        if not getattr(self, "browser", None):
+            self._sitter_tg_ack("Tarayıcı yok.")
+            return
+        village_id = (self._game_data.get("village") or {}).get("id", "") or ""
+        if not village_id:
+            self._sitter_tg_ack("Köy id yok.")
+            return
+
+        self._sitter_busy = True
+        self._sitter_offer_password = password
+        self._sitter_offer_queue = []
+        self._sitter_tg_ack(
+            f"Bakıcılık isteği gönderiliyor…\n"
+            f"Hesap: {account_name}\n"
+            f"Kabul edecek: {kabul}"
+        )
+        self._sitter_send_offer({"sender": kabul, "id": "telegram"})
 
     def _sitter_auto_tick(self) -> None:
         if not self._sitter_settings_enabled():
             return
         if getattr(self, "_sitter_busy", False):
-            self._sitter_schedule_next()
             return
         if getattr(self, "_human_verification_required", False):
-            self._sitter_schedule_next()
             return
         if self._botprot_automation_hot_path():
-            self._sitter_schedule_next()
             return
         if not getattr(self, "browser", None):
-            self._sitter_schedule_next()
             return
         if getattr(self, "_login_state", "") != "in_game":
-            self._sitter_schedule_next()
             return
         trigger = self._sitter_trigger_subject()
         password = self._sitter_account_password()
         if not trigger:
-            self._add_log("BAKICI", "warn", "Otomatik bakıcılık: tetikleyici başlık boş — atlandı.")
-            self._sitter_schedule_next()
+            self._add_log("BAKICI", "warn", "Elle IGM tarama: tetikleyici başlık boş — atlandı.")
             return
         if not password:
             self._add_log(
                 "BAKICI", "warn",
-                "Otomatik bakıcılık: oyun şifresi Ayarlar’da yok — atlandı.",
+                "Elle IGM tarama: oyun şifresi Ayarlar’da yok — atlandı.",
             )
-            self._sitter_schedule_next()
             return
         village_id = (self._game_data.get("village") or {}).get("id", "") or ""
         if not village_id:
-            self._add_log("BAKICI", "warn", "Köy id yok — bakıcılık kontrolü ertelendi.")
-            self._sitter_schedule_next()
+            self._add_log("BAKICI", "warn", "Köy id yok — bakıcılık kontrolü atlandı.")
             return
         self._add_log(
             "BAKICI", "info",
@@ -25166,6 +25626,8 @@ class TribalWarsBot(QMainWindow):
             self._sitter_offer_queue = []
             self._sitter_busy = False
             self._sitter_schedule_next()
+            if igm_id == "telegram":
+                self._sitter_tg_ack("Bakıcılık: bot koruması — istek gönderilemedi.")
             return
         if status == "OK":
             self._botprot_note_success()
@@ -25187,6 +25649,10 @@ class TribalWarsBot(QMainWindow):
                 )
             except Exception:
                 pass
+            if igm_id == "telegram":
+                self._sitter_tg_ack(
+                    f"Tamam: bakıcılık isteği gönderildi → {sender}"
+                )
         elif status == "OPAQUE":
             # Escalate etme; id işaretleme (yanlış pozitif tekrarını önle)
             if igm_id:
@@ -25206,6 +25672,10 @@ class TribalWarsBot(QMainWindow):
                 )
             except Exception:
                 pass
+            if igm_id == "telegram":
+                self._sitter_tg_ack(
+                    f"Yanıt belirsiz → {sender}; oyunda kontrol et."
+                )
         else:
             # Hatalı şifre / oyuncu yok — id işaretle ki döngüye girme
             if igm_id:
@@ -25214,9 +25684,501 @@ class TribalWarsBot(QMainWindow):
                 "BAKICI", "error",
                 f"Bakıcılık isteği başarısız → {sender}: {msg or '?'}",
             )
+            if igm_id == "telegram":
+                self._sitter_tg_ack(
+                    f"Başarısız → {sender}: {msg or '?'}"
+                )
 
         # Sonraki aday (kısa gecikme)
         QTimer.singleShot(1500, self._sitter_process_next_offer)
+
+    # ── TELEGRAM /gelen ─────────────────────────
+
+    def _gelen_settings_enabled(self) -> bool:
+        if hasattr(self, "settings_gelen_enable_cb"):
+            return bool(self.settings_gelen_enable_cb.isChecked())
+        return bool(self._settings.value("gelen/telegram_enabled", False, type=bool))
+
+    def _gelen_on_auto_toggled(self, checked: bool) -> None:
+        if checked:
+            self._automation_mark_started("gelen")
+        else:
+            self._automation_mark_stopped("gelen")
+        self._tg_cmd_sync_poller()
+
+    def _gelen_sync_from_settings(self) -> None:
+        if self._gelen_settings_enabled():
+            if "gelen" not in (getattr(self, "_automation_started_at", None) or {}):
+                self._automation_mark_started("gelen")
+        else:
+            self._automation_mark_stopped("gelen")
+        self._tg_cmd_sync_poller()
+
+    def _gelen_tg_ack(self, text: str) -> None:
+        self._sitter_tg_ack(text)
+
+    def _gelen_finish(self, ok: bool, message: str) -> None:
+        self._gelen_busy = False
+        level = "success" if ok else "warn"
+        self._add_log("GELEN", level, message)
+        self._gelen_tg_ack(message)
+
+    @pyqtSlot(int, int, str)
+    def _gelen_from_telegram(self, x: int, y: int, player: str) -> None:
+        """Telegram /gelen X|Y Oyuncu → seç, Destek iste, IGM."""
+        player = (player or "").strip()
+        try:
+            x = int(x)
+            y = int(y)
+        except (TypeError, ValueError):
+            self._gelen_tg_ack("Kullanım: /gelen 500|500 OyuncuAdı")
+            return
+        self._add_log(
+            "GELEN", "info",
+            f"Telegram /gelen: {x}|{y} → «{player}»",
+        )
+        if not self._gelen_settings_enabled():
+            self._gelen_tg_ack("Gelen paylaşımı kapalı (Ayarlar).")
+            return
+        if getattr(self, "_login_state", "") != "in_game":
+            self._gelen_tg_ack("Bot oyunda değil — önce giriş yapın.")
+            return
+        if getattr(self, "_human_verification_required", False):
+            self._gelen_tg_ack("Bot koruması / doğrulama bekleniyor — /gelen ertelendi.")
+            return
+        if self._botprot_automation_hot_path():
+            self._gelen_tg_ack("Bot koruması sıcak yolu — /gelen ertelendi.")
+            return
+        if getattr(self, "_gelen_busy", False):
+            self._gelen_tg_ack("/gelen işlemi zaten sürüyor.")
+            return
+        if getattr(self, "_sitter_busy", False):
+            self._gelen_tg_ack("Bakıcılık işlemi sürüyor — /gelen ertelendi.")
+            return
+        if not player:
+            self._gelen_tg_ack("Kullanım: /gelen 500|500 OyuncuAdı")
+            return
+        if not getattr(self, "browser", None):
+            self._gelen_tg_ack("Tarayıcı yok.")
+            return
+        village_id = (self._game_data.get("village") or {}).get("id", "") or ""
+        if not village_id:
+            self._gelen_tg_ack("Köy id yok.")
+            return
+
+        self._gelen_busy = True
+        self._gelen_target_x = x
+        self._gelen_target_y = y
+        self._gelen_player = player
+        self._gelen_selected_count = 0
+        self._gelen_reqdef_text = ""
+        self._gelen_tg_ack(
+            f"/gelen başlıyor…\nHedef: {x}|{y}\nAlıcı: {player}"
+        )
+        self._gelen_open_incomings()
+
+    def _gelen_open_incomings(self) -> None:
+        village_id = (self._game_data.get("village") or {}).get("id", "") or ""
+        path = (
+            f"/game.php?village={quote(str(village_id))}"
+            f"&screen=overview_villages&mode=incomings"
+            f"&type=unignored&subtype=attacks"
+        )
+        try:
+            base = self.browser.url()
+            target = QUrl(base).resolved(QUrl(path))
+        except Exception:
+            target = QUrl(path)
+        self.browser.load(target)
+        QTimer.singleShot(
+            max(500, int(getattr(self, "TW_JS_POLL_MS", 520) or 520)),
+            lambda: self._gelen_poll_select_and_submit(0),
+        )
+
+    def _gelen_poll_select_and_submit(self, attempt: int) -> None:
+        if attempt >= 50:
+            self._gelen_finish(False, "Gelen saldırılar sayfası zaman aşımı.")
+            return
+        x = int(getattr(self, "_gelen_target_x", 0) or 0)
+        y = int(getattr(self, "_gelen_target_y", 0) or 0)
+        js = f"""
+        (function() {{
+            if (document.getElementById('botprotection_quest'))
+                return JSON.stringify({{status: 'BOTPROT', message: 'bot koruması'}});
+            var href = String(location.href || '');
+            var hl = (document.documentElement ? document.documentElement.innerHTML : '').toLowerCase();
+            if (/botprotection|bot_protection|bot koruma kontrol/.test(hl))
+                return JSON.stringify({{status: 'BOTPROT', message: 'bot koruması'}});
+            var table = document.getElementById('incomings_table');
+            var form = document.getElementById('incomings_form');
+            if (!table || !form) {{
+                if (href.indexOf('mode=incomings') < 0) return 'WAITING';
+                return 'WAITING';
+            }}
+            var wantX = {x}, wantY = {y};
+            var rows = table.querySelectorAll('tr');
+            var matched = 0, checked = 0, i, tr, tds, t, m, cb, j;
+            for (i = 0; i < rows.length; i++) {{
+                tr = rows[i];
+                if (tr.querySelector('th')) continue;
+                cb = tr.querySelector('input[type="checkbox"][name^="id_"]');
+                if (!cb) continue;
+                cb.checked = false;
+                tds = tr.querySelectorAll('td');
+                if (tds.length < 2) continue;
+                t = (tds[1].textContent || '').replace(/\\s+/g, ' ').trim();
+                m = /\\((\\d+)\\|(\\d+)\\)/.exec(t);
+                if (!m) continue;
+                if (parseInt(m[1], 10) !== wantX || parseInt(m[2], 10) !== wantY) continue;
+                matched++;
+                cb.checked = true;
+                checked++;
+            }}
+            if (matched === 0) {{
+                return JSON.stringify({{
+                    status: 'EMPTY', message: 'eşleşen saldırı yok', matched: 0
+                }});
+            }}
+            var action = form.getAttribute('action') || '';
+            if (action.indexOf('screen=reqdef') < 0) {{
+                try {{
+                    var u = new URL(action, location.href);
+                    u.searchParams.set('screen', 'reqdef');
+                    u.searchParams.delete('mode');
+                    u.searchParams.delete('type');
+                    u.searchParams.delete('subtype');
+                    u.searchParams.delete('action');
+                    form.setAttribute('action', u.pathname + u.search);
+                }} catch (e1) {{
+                    form.setAttribute('action', '/game.php?village=' +
+                        encodeURIComponent((window.game_data && game_data.village && game_data.village.id) || '') +
+                        '&screen=reqdef');
+                }}
+            }}
+            try {{
+                form.submit();
+            }} catch (e2) {{
+                return JSON.stringify({{status: 'ERROR', message: String(e2 || 'submit')}});
+            }}
+            return JSON.stringify({{
+                status: 'SUBMITTED', matched: matched, checked: checked
+            }});
+        }})();
+        """
+
+        def on_result(result):
+            result_str = "WAITING" if result is None else str(result).strip()
+            if result_str in ("WAITING", "LOADING", ""):
+                QTimer.singleShot(
+                    self.TW_JS_POLL_MS,
+                    lambda: self._gelen_poll_select_and_submit(attempt + 1),
+                )
+                return
+            try:
+                data = json.loads(result_str)
+            except Exception:
+                self._gelen_finish(False, f"Gelen seçim yanıtı bozuk: {result_str[:80]}")
+                return
+            status = data.get("status")
+            if status == "BOTPROT":
+                self._botprot_note_strong_hit(
+                    "gelen", str(data.get("message") or "bot koruması")[:120], soft_reload=True
+                )
+                self._gelen_finish(False, "Bot koruması — /gelen iptal.")
+                return
+            if status == "EMPTY":
+                self._gelen_finish(
+                    False,
+                    f"Eşleşen saldırı yok ({x}|{y}).",
+                )
+                return
+            if status == "ERROR":
+                self._gelen_finish(False, f"Destek iste hata: {data.get('message') or '?'}")
+                return
+            if status == "SUBMITTED":
+                n = int(data.get("matched") or data.get("checked") or 0)
+                self._gelen_selected_count = n
+                self._botprot_note_success()
+                self._add_log(
+                    "GELEN", "info",
+                    f"{n} saldırı seçildi → Destek iste gönderildi.",
+                )
+                QTimer.singleShot(
+                    800,
+                    lambda: self._gelen_poll_reqdef_text(0),
+                )
+                return
+            QTimer.singleShot(
+                self.TW_JS_POLL_MS,
+                lambda: self._gelen_poll_select_and_submit(attempt + 1),
+            )
+
+        self.browser.page().runJavaScript(js, on_result)
+
+    def _gelen_poll_reqdef_text(self, attempt: int) -> None:
+        if attempt >= 50:
+            self._gelen_finish(False, "Destek iste sayfası (textarea) zaman aşımı.")
+            return
+        js = r"""
+        (function() {
+            if (document.getElementById('botprotection_quest'))
+                return JSON.stringify({status: 'BOTPROT', message: 'bot koruması'});
+            var href = String(location.href || '');
+            var hl = (document.documentElement ? document.documentElement.innerHTML : '').toLowerCase();
+            if (/botprotection|bot_protection|bot koruma kontrol/.test(hl))
+                return JSON.stringify({status: 'BOTPROT', message: 'bot koruması'});
+            var ta = document.querySelector('#content_value form fieldset textarea')
+                || document.querySelector('#content_value form textarea')
+                || document.querySelector('form fieldset textarea')
+                || document.querySelector('form textarea');
+            if (!ta) {
+                if (href.indexOf('reqdef') < 0 && href.indexOf('screen=reqdef') < 0)
+                    return 'WAITING';
+                return 'WAITING';
+            }
+            var text = (ta.value != null ? String(ta.value) : '');
+            if (!text.trim()) text = String(ta.textContent || '');
+            if (!text.trim())
+                return JSON.stringify({status: 'ERROR', message: 'textarea boş'});
+            return JSON.stringify({status: 'OK', text: text, length: text.length});
+        })();
+        """
+
+        def on_result(result):
+            result_str = "WAITING" if result is None else str(result).strip()
+            if result_str in ("WAITING", "LOADING", ""):
+                QTimer.singleShot(
+                    self.TW_JS_POLL_MS,
+                    lambda: self._gelen_poll_reqdef_text(attempt + 1),
+                )
+                return
+            try:
+                data = json.loads(result_str)
+            except Exception:
+                self._gelen_finish(False, f"reqdef yanıtı bozuk: {result_str[:80]}")
+                return
+            status = data.get("status")
+            if status == "BOTPROT":
+                self._botprot_note_strong_hit(
+                    "gelen", str(data.get("message") or "bot koruması")[:120], soft_reload=True
+                )
+                self._gelen_finish(False, "Bot koruması — reqdef okunamadı.")
+                return
+            if status == "ERROR":
+                self._gelen_finish(False, f"reqdef: {data.get('message') or '?'}")
+                return
+            if status == "OK":
+                text = str(data.get("text") or "")
+                self._gelen_reqdef_text = text
+                self._botprot_note_success()
+                self._add_log(
+                    "GELEN", "info",
+                    f"Destek iste metni okundu ({len(text)} karakter) → IGM.",
+                )
+                self._gelen_open_mail_new()
+                return
+            QTimer.singleShot(
+                self.TW_JS_POLL_MS,
+                lambda: self._gelen_poll_reqdef_text(attempt + 1),
+            )
+
+        self.browser.page().runJavaScript(js, on_result)
+
+    def _gelen_open_mail_new(self) -> None:
+        village_id = (self._game_data.get("village") or {}).get("id", "") or ""
+        path = (
+            f"/game.php?village={quote(str(village_id))}"
+            f"&screen=mail&mode=new"
+        )
+        try:
+            base = self.browser.url()
+            target = QUrl(base).resolved(QUrl(path))
+        except Exception:
+            target = QUrl(path)
+        self.browser.load(target)
+        QTimer.singleShot(
+            max(500, int(getattr(self, "TW_JS_POLL_MS", 520) or 520)),
+            lambda: self._gelen_poll_fill_and_send_mail(0),
+        )
+
+    def _gelen_poll_fill_and_send_mail(self, attempt: int) -> None:
+        if attempt >= 50:
+            self._gelen_finish(False, "Mesaj yaz sayfası zaman aşımı.")
+            return
+        player = json.dumps(str(getattr(self, "_gelen_player", "") or ""))
+        body = json.dumps(str(getattr(self, "_gelen_reqdef_text", "") or ""))
+        x = int(getattr(self, "_gelen_target_x", 0) or 0)
+        y = int(getattr(self, "_gelen_target_y", 0) or 0)
+        subject = json.dumps(f"Gelen saldırılar {x}|{y}")
+        js = f"""
+        (function() {{
+            if (document.getElementById('botprotection_quest'))
+                return JSON.stringify({{status: 'BOTPROT', message: 'bot koruması'}});
+            var href = String(location.href || '');
+            var hl = (document.documentElement ? document.documentElement.innerHTML : '').toLowerCase();
+            if (/botprotection|bot_protection|bot koruma kontrol/.test(hl))
+                return JSON.stringify({{status: 'BOTPROT', message: 'bot koruması'}});
+            var form = document.querySelector('#content_value form')
+                || document.querySelector('form[action*="screen=mail"]')
+                || document.querySelector('form');
+            if (!form) {{
+                if (href.indexOf('screen=mail') < 0) return 'WAITING';
+                return 'WAITING';
+            }}
+            var toIn = form.querySelector('input[name="to"]')
+                || form.querySelector('input[name="target"]')
+                || form.querySelector('input.autocomplete[data-type="player"]');
+            var subIn = form.querySelector('input[name="subject"]');
+            var ta = form.querySelector('textarea[name="text"]')
+                || form.querySelector('textarea[name="message"]')
+                || form.querySelector('textarea');
+            if (!toIn || !ta)
+                return JSON.stringify({{status: 'ERROR', message: 'mail form alanları yok'}});
+            var name = {player};
+            var subj = {subject};
+            var text = {body};
+            toIn.focus();
+            toIn.value = name;
+            try {{
+                toIn.dispatchEvent(new Event('input', {{bubbles: true}}));
+                toIn.dispatchEvent(new Event('change', {{bubbles: true}}));
+            }} catch (e0) {{}}
+            if (subIn) {{
+                subIn.focus();
+                subIn.value = subj;
+                try {{
+                    subIn.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    subIn.dispatchEvent(new Event('change', {{bubbles: true}}));
+                }} catch (e1) {{}}
+            }}
+            ta.focus();
+            ta.value = text;
+            try {{
+                ta.dispatchEvent(new Event('input', {{bubbles: true}}));
+                ta.dispatchEvent(new Event('change', {{bubbles: true}}));
+            }} catch (e2) {{}}
+            var btn = form.querySelector('input[type="submit"], button[type="submit"]');
+            if (btn) btn.click();
+            else form.submit();
+            return JSON.stringify({{status: 'SUBMITTED', to: name, length: text.length}});
+        }})();
+        """
+
+        def on_result(result):
+            result_str = "WAITING" if result is None else str(result).strip()
+            if result_str in ("WAITING", "LOADING", ""):
+                QTimer.singleShot(
+                    self.TW_JS_POLL_MS,
+                    lambda: self._gelen_poll_fill_and_send_mail(attempt + 1),
+                )
+                return
+            try:
+                data = json.loads(result_str)
+            except Exception:
+                self._gelen_finish(False, f"Mail form yanıtı bozuk: {result_str[:80]}")
+                return
+            status = data.get("status")
+            if status == "BOTPROT":
+                self._botprot_note_strong_hit(
+                    "gelen", str(data.get("message") or "bot koruması")[:120], soft_reload=True
+                )
+                self._gelen_finish(False, "Bot koruması — IGM gönderilemedi.")
+                return
+            if status == "ERROR":
+                self._gelen_finish(False, f"IGM: {data.get('message') or '?'}")
+                return
+            if status == "SUBMITTED":
+                self._botprot_note_success()
+                QTimer.singleShot(900, lambda: self._gelen_poll_mail_result(0))
+                return
+            QTimer.singleShot(
+                self.TW_JS_POLL_MS,
+                lambda: self._gelen_poll_fill_and_send_mail(attempt + 1),
+            )
+
+        self.browser.page().runJavaScript(js, on_result)
+
+    def _gelen_poll_mail_result(self, attempt: int) -> None:
+        if attempt >= 40:
+            n = int(getattr(self, "_gelen_selected_count", 0) or 0)
+            player = str(getattr(self, "_gelen_player", "") or "?")
+            self._gelen_finish(
+                True,
+                f"{n} saldırı seçildi; mesaj → {player} gönderildi (yanıt belirsiz).",
+            )
+            return
+        js = r"""
+        (function() {
+            if (document.getElementById('botprotection_quest'))
+                return JSON.stringify({status: 'BOTPROT', message: 'bot koruması'});
+            var body = (document.body && document.body.innerText) || '';
+            var href = String(location.href || '');
+            var errBox = document.querySelector('.error, .error_box, #error');
+            if (errBox) {
+                var et = (errBox.innerText || '').trim();
+                if (et) return JSON.stringify({status: 'ERROR', message: et.slice(0, 160)});
+            }
+            if (/g[oö]nderildi|mesaj.*ileti|message.*sent|ba[sş]ar[iı]/i.test(body))
+                return JSON.stringify({status: 'OK', message: 'gönderildi'});
+            if (href.indexOf('mode=new') >= 0 && document.querySelector('form textarea'))
+                return 'WAITING_RESULT';
+            if (href.indexOf('screen=mail') >= 0 && href.indexOf('mode=new') < 0)
+                return JSON.stringify({status: 'OK', message: 'mail sayfası değişti'});
+            return 'WAITING';
+        })();
+        """
+
+        def on_result(result):
+            result_str = "WAITING" if result is None else str(result).strip()
+            if result_str in ("WAITING", "WAITING_RESULT", "LOADING", ""):
+                if result_str == "WAITING_RESULT" and attempt >= 8:
+                    n = int(getattr(self, "_gelen_selected_count", 0) or 0)
+                    player = str(getattr(self, "_gelen_player", "") or "?")
+                    self._gelen_finish(
+                        True,
+                        f"{n} saldırı seçildi; mesaj → {player} gönderildi.",
+                    )
+                    return
+                QTimer.singleShot(
+                    self.TW_JS_POLL_MS,
+                    lambda: self._gelen_poll_mail_result(attempt + 1),
+                )
+                return
+            try:
+                data = json.loads(result_str)
+            except Exception:
+                n = int(getattr(self, "_gelen_selected_count", 0) or 0)
+                player = str(getattr(self, "_gelen_player", "") or "?")
+                self._gelen_finish(
+                    True,
+                    f"{n} saldırı; mesaj → {player} (yanıt belirsiz).",
+                )
+                return
+            status = data.get("status")
+            n = int(getattr(self, "_gelen_selected_count", 0) or 0)
+            player = str(getattr(self, "_gelen_player", "") or "?")
+            if status == "BOTPROT":
+                self._botprot_note_strong_hit(
+                    "gelen", str(data.get("message") or "bot koruması")[:120], soft_reload=True
+                )
+                self._gelen_finish(False, "Bot koruması — IGM sonucu belirsiz.")
+                return
+            if status == "ERROR":
+                self._gelen_finish(False, f"IGM başarısız: {data.get('message') or '?'}")
+                return
+            if status == "OK":
+                self._botprot_note_success()
+                self._gelen_finish(
+                    True,
+                    f"{n} saldırı seçildi; mesaj → {player} gönderildi.",
+                )
+                return
+            QTimer.singleShot(
+                self.TW_JS_POLL_MS,
+                lambda: self._gelen_poll_mail_result(attempt + 1),
+            )
+
+        self.browser.page().runJavaScript(js, on_result)
 
     # ── LOGLAR ─────────────────────────────────
 
