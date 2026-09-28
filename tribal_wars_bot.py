@@ -198,7 +198,7 @@ from license_client import (  # noqa: E402
 # ─────────────────────────────────────────────
 
 # EXE'nin guncel oldugunu dogrulamak icin her onemli degisiklikte artirin.
-APP_VERSION = "1.4.11"
+APP_VERSION = "1.4.12"
 
 # Otomatik guncelleme — kullaniciya GitHub adresi gosterilmez; yalnizca bu URL okunur.
 UPDATE_MANIFEST_URL = "https://safayolcuu.github.io/tw-bot/bot-update.json"
@@ -238,6 +238,104 @@ SA_QUEUE_TABLE_TROOP_KEYS = [
 
 # Mancınık hedefi — oyun place formu `building` anahtarı.
 # Seçilmezse / boşsa varsayılan: duvar (wall) — boş bırakmak bina vurmaz, sorun çıkarır.
+# Onay POST gövdesi + sonuç doğrulama (preconfirm / send JS ortak)
+_DISPATCH_CONFIRM_JS_HELPERS = r"""
+            function __twSubmitConfirmValue(cf) {
+                var sb = cf.querySelector('input[type="submit"][name="submit_confirm"], button[type="submit"][name="submit_confirm"], input[name="submit_confirm"], button[name="submit_confirm"], #troop_confirm_submit');
+                if (!sb) return 'true';
+                if (sb.value != null && String(sb.value) !== '') return String(sb.value);
+                var a = sb.getAttribute('value');
+                return (a && String(a)) || 'true';
+            }
+            function __twTrainDomSkip(inpName, extraTrainRows) {
+                extraTrainRows = extraTrainRows || [];
+                if (!extraTrainRows.length) return false;
+                var trainM = String(inpName || '').match(/^train\[(\d+)\]\[([^\]]+)\]$/);
+                if (!trainM) return false;
+                var tix = parseInt(trainM[1], 10);
+                var erowIdx = tix - 2;
+                if (erowIdx < 0 || erowIdx >= extraTrainRows.length) return false;
+                var ukey = trainM[2];
+                var erow = extraTrainRows[erowIdx];
+                return !!(erow && Object.prototype.hasOwnProperty.call(erow, ukey));
+            }
+            function __twResolveFormAction(actionUrl) {
+                if (!actionUrl) return '';
+                try { return new URL(actionUrl, window.location.href).href; }
+                catch (e) { return actionUrl; }
+            }
+            function __twParseCommandResult(html) {
+                if (!html) return 'ERROR|Bos yanit';
+                if (/hcaptcha|botprotection|bot\s*koruma|captcha/i.test(html))
+                    return 'ERROR|BOTPROT|Dogrulama sayfasi';
+                var doc = new DOMParser().parseFromString(html, 'text/html');
+                var err = doc.querySelector('.error_box, p.error, .error, #error, .content-error');
+                if (err) {
+                    var t = String(err.textContent || '').replace(/\s+/g, ' ').trim();
+                    if (t) return 'ERROR|' + t.substring(0, 140);
+                }
+                // Hâlâ onay ekranındaysa komut kabul edilmemiş demektir
+                if (doc.querySelector('#troop_confirm_submit, [name="submit_confirm"]')
+                    && doc.querySelector('[name="ch"]')) {
+                    return 'ERROR|Komut kabul edilmedi (onay sayfasinda kaldi)';
+                }
+                return 'OK';
+            }
+            function __twAppendConfirmBody(cf, html, extraTrainRows, buildingTarget, attackType) {
+                extraTrainRows = extraTrainRows || [];
+                buildingTarget = buildingTarget || '';
+                attackType = attackType || 'attack';
+                var cd = new URLSearchParams();
+                function setField(n, v) {
+                    try { cd.delete(n); } catch (e0) {}
+                    cd.append(n, v != null ? String(v) : '');
+                }
+                function appendField(el) {
+                    if (!el || !el.name) return;
+                    var n = el.name;
+                    if (n === 'submit_confirm') return;
+                    if (__twTrainDomSkip(n, extraTrainRows)) return;
+                    var typ = String(el.type || '').toLowerCase();
+                    if (typ === 'submit' || typ === 'button' || typ === 'image' || typ === 'file') return;
+                    if (typ === 'checkbox' || typ === 'radio') {
+                        if (el.checked) setField(n, el.value != null ? String(el.value) : '1');
+                        return;
+                    }
+                    // Aynı isimli alan iki kez gelirse (gizli+görünür) çift yazma → oyun toplar, «yeterli birim yok»
+                    setField(n, el.value != null ? String(el.value) : '');
+                }
+                cf.querySelectorAll('input, select, textarea').forEach(appendField);
+                if (!cd.get('ch')) {
+                    var cv = __twExtractCh(cf, html);
+                    if (cv) setField('ch', cv);
+                }
+                if (buildingTarget) setField('building', buildingTarget);
+                for (var ti = 0; ti < extraTrainRows.length; ti++) {
+                    var row = extraTrainRows[ti];
+                    if (!row || typeof row !== 'object') continue;
+                    var tidx = ti + 2;
+                    for (var uk in row) {
+                        if (!Object.prototype.hasOwnProperty.call(row, uk)) continue;
+                        if (uk === '_building' || String(uk).charAt(0) === '_') continue;
+                        var nv = parseInt(row[uk], 10);
+                        if (!isNaN(nv) && nv > 0)
+                            setField('train[' + tidx + '][' + uk + ']', String(nv));
+                        else
+                            setField('train[' + tidx + '][' + uk + ']', '');
+                    }
+                    var tb = row._building || buildingTarget || '';
+                    if (tb && parseInt(row.catapult || 0, 10) > 0) {
+                        setField('train[' + tidx + '][building]', String(tb));
+                    }
+                }
+                try { cd.delete('attack'); cd.delete('support'); } catch (eAtk) {}
+                if (attackType === 'support') cd.append('support', 'true');
+                else cd.append('attack', 'true');
+                cd.append('submit_confirm', __twSubmitConfirmValue(cf));
+                return cd.toString();
+            }
+"""
+
 SA_CATAPULT_DEFAULT_BUILDING = "wall"
 SA_CATAPULT_UI_TARGETS = (
     ("Duvar", "wall"),
@@ -1409,7 +1507,7 @@ class StealthBrowser(QWebEngineView):
 
 
 class TwPlannerBridge(QObject):
-    """Planlayıcıdaki simulator place linki → Ordu Gönder kuyruğu (QWebChannel)."""
+    """Planlayıcı / place onay → Ordu Gönder kuyruğu (QWebChannel)."""
 
     def __init__(self, bot):
         super().__init__(bot)
@@ -1419,6 +1517,11 @@ class TwPlannerBridge(QObject):
     def enqueueSimulatorCommand(self, href: str, date_time_json: str):
         if hasattr(self._bot, "_tw_planner_enqueue_from_href"):
             self._bot._tw_planner_enqueue_from_href(href, date_time_json)
+
+    @pyqtSlot(str)
+    def enqueueConfirmCommand(self, payload_json: str):
+        if hasattr(self._bot, "_tw_confirm_enqueue_from_page"):
+            self._bot._tw_confirm_enqueue_from_page(payload_json)
 
 
 class TwMapCoordBridge(QObject):
@@ -1753,25 +1856,40 @@ QListWidget {
 # MisyonerMultiWaveDialog: gömülü ana pencerenin koyu modundan bağımsız görünüm.
 _MISYONER_MULTI_DIALOG_EXTRA_LIGHT = """
 QDialog {
-    background-color: #f0f0f0;
+    background-color: #e8d9b5;
 }
 QLabel {
     color: #222222;
 }
+QGroupBox#misyonerFillBox {
+    background-color: #f4e4bc;
+    border: 1px solid #603000;
+    border-radius: 4px;
+    margin-top: 8px;
+    padding: 8px;
+    font-weight: bold;
+}
+QGroupBox#misyonerFillBox::title {
+    subcontrol-origin: margin;
+    left: 8px;
+    padding: 0 4px;
+    color: #603000;
+}
 QTableWidget {
-    background-color: #ffffff;
-    alternate-background-color: #f5f5f5;
+    background-color: #fff5da;
+    alternate-background-color: #f0e2be;
     color: #222222;
-    gridline-color: #cccccc;
+    gridline-color: #bd9c5a;
     selection-background-color: #cde8ff;
     selection-color: #000000;
-    border: 1px solid #aaaaaa;
+    border: 2px solid #bd9c5a;
 }
 QHeaderView::section {
-    background-color: #ececec;
+    background-color: #c1a264;
     color: #222222;
-    border: 1px solid #cccccc;
+    border: 1px solid #bd9c5a;
     padding: 4px;
+    font-weight: bold;
 }
 QLineEdit {
     background-color: #ffffff;
@@ -1786,6 +1904,15 @@ QSpinBox {
 QCheckBox {
     color: #222222;
 }
+QPushButton {
+    background-color: #f5e6c8;
+    border: 1px solid #b89b6a;
+    border-radius: 3px;
+    padding: 4px 8px;
+}
+QPushButton:hover {
+    background-color: #ffe7a8;
+}
 """
 
 _MISYONER_MULTI_DIALOG_EXTRA_DARK = """
@@ -1794,6 +1921,21 @@ QDialog {
 }
 QLabel {
     color: #e8e8e8;
+}
+QGroupBox#misyonerFillBox {
+    background-color: #3a3428;
+    border: 1px solid #8a7040;
+    border-radius: 4px;
+    margin-top: 8px;
+    padding: 8px;
+    font-weight: bold;
+    color: #e8e8e8;
+}
+QGroupBox#misyonerFillBox::title {
+    subcontrol-origin: margin;
+    left: 8px;
+    padding: 0 4px;
+    color: #e0c080;
 }
 QTableWidget {
     background-color: #3c3c3c;
@@ -3642,12 +3784,20 @@ class SaCommandEditDialog(QDialog):
 class MisyonerMultiWaveDialog(QDialog):
     """Çok dalgalı misyoner kuyruğu — tek gönderim zamanı; Ana «Ordu Gönder» kaynak/hedef/türünü kullanır."""
 
+    # Evolved Fake Train tarzı sabit şablonlar (tüm dalgalara yazılır)
+    _FIXED_PRESETS = (
+        {"ram": 1, "spy": 1},
+        {"catapult": 1, "spy": 1},
+        {"spy": 1, "catapult": 20},
+        {"spy": 20, "ram": 1},
+    )
+
     def __init__(self, parent, bot):
         super().__init__(parent)
         self._bot = bot
         self.setWindowTitle("Misyoner — çok dalga")
-        self.setMinimumWidth(720)
-        self.resize(900, 440)
+        self.setMinimumWidth(780)
+        self.resize(980, 520)
         self.setModal(False)
         wflags = self.windowFlags()
         wflags |= Qt.Window
@@ -3663,7 +3813,8 @@ class MisyonerMultiWaveDialog(QDialog):
             "Kaynak, hedef ve komut türü «Ordu Gönder» sekmesinden alınır. "
             "Varış veya gönderim zamanı seçin; birinci dalgaya göre sonraki her dalga yaklaşık "
             f"{getattr(bot, 'SA_DISPATCH_WAVE_GAP_MS', 100)} ms arayla eklenir (oyunla uyumlu).\n"
-            "Pencere açıkken bot ve tarayıcıda gezebilirsiniz; bitince Kapat veya İptal."
+            "Alttaki kutudan birimleri doldurun (Evolved Fake Train benzeri). "
+            "Pencere açıkken bot ve tarayıcıda gezebilirsiniz."
         )
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -3674,29 +3825,114 @@ class MisyonerMultiWaveDialog(QDialog):
         self._wave_spin.setRange(1, max_w)
         self._wave_spin.setFixedWidth(56)
         row1.addWidget(self._wave_spin)
-        self._auto_split_cb = QCheckBox("Eskort + misyoner otomatik böl")
+        self._auto_split_cb = QCheckBox("Kabulde eskort + misyoner otomatik böl (tabloyu yok say)")
         self._auto_split_cb.setToolTip(
-            "Köydeki tüm gönderilebilir birlikler (misyoner hariç) dalga sayısına eşit bölünür "
-            "(mızrak, kılıç, balta, okçu, casus, hafif, atlı okçu, ağır, koç, mancınık, şövalye …). "
-            "Her dalgada en fazla 1 misyoner."
+            "İşaretliyse Tamam’da köy stoğundan yeniden bölünür; tablo sadece önizleme olur.\n"
+            "Butonlarla doldurduysanız işareti kaldırın — tablo değerleri kullanılır."
         )
         row1.addWidget(self._auto_split_cb)
         row1.addStretch()
         root.addLayout(row1)
 
-        self._unit_defs = list(bot.SA_UNIT_DEFS)
+        # Gönderilebilir birimler (oyun place tablosu ile uyumlu; milis yok)
+        try:
+            self._unit_defs = list(bot._sa_sendable_unit_defs())
+        except Exception:
+            self._unit_defs = list(sa_sendable_unit_defs(bot.SA_UNIT_DEFS))
+
+        fill_box = QGroupBox("Birim doldurma")
+        fill_box.setObjectName("misyonerFillBox")
+        fill_l = QVBoxLayout(fill_box)
+        fill_l.setSpacing(6)
+
+        act_row = QHBoxLayout()
+        self._btn_reset = QPushButton("Sıfırla")
+        self._btn_reset.setCursor(Qt.PointingHandCursor)
+        self._btn_reset.setToolTip("Tüm dalga hücrelerini 0 yapar.")
+        self._btn_reset.clicked.connect(self._fill_reset)
+        act_row.addWidget(self._btn_reset)
+        self._btn_clone = QPushButton("İlk dalgayı kopyala")
+        self._btn_clone.setCursor(Qt.PointingHandCursor)
+        self._btn_clone.setToolTip("1. satırdaki birimleri diğer tüm dalgalara kopyalar.")
+        self._btn_clone.clicked.connect(self._fill_clone_first)
+        act_row.addWidget(self._btn_clone)
+        self._btn_auto_all = QPushButton("Eskort + misyoner otomatik böl")
+        self._btn_auto_all.setCursor(Qt.PointingHandCursor)
+        self._btn_auto_all.setToolTip(
+            "Köydeki gönderilebilir birlikleri dalga sayısına eşit böler; her dalgada en fazla 1 misyoner."
+        )
+        self._btn_auto_all.clicked.connect(self._fill_auto_noble_split)
+        act_row.addWidget(self._btn_auto_all)
+        act_row.addStretch()
+        fill_l.addLayout(act_row)
+
+        fixed_lbl = QLabel("Sabit şablonlar (tüm dalgalara):")
+        fixed_lbl.setStyleSheet("font-weight: bold;")
+        fill_l.addWidget(fixed_lbl)
+        fixed_row = QHBoxLayout()
+        fixed_row.setSpacing(4)
+        for preset in self._FIXED_PRESETS:
+            btn = QPushButton()
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setProperty("tw_mis_preset", dict(preset))
+            btn.setToolTip(
+                " + ".join(f"{v} {k}" for k, v in preset.items())
+                + " → her dalgaya yazılır (diğer birimler sıfırlanır)."
+            )
+            btn.clicked.connect(self._on_fixed_preset_clicked)
+            self._style_unit_tool_button(btn, list(preset.keys()))
+            fixed_row.addWidget(btn)
+        fixed_row.addStretch()
+        fill_l.addLayout(fixed_row)
+
+        dyn_lbl = QLabel("Dinamik birim (stoktan dalgalara eşit dağıt):")
+        dyn_lbl.setStyleSheet("font-weight: bold;")
+        fill_l.addWidget(dyn_lbl)
+        dyn_row = QHBoxLayout()
+        dyn_row.setSpacing(3)
+        self._dyn_unit_btns = []
+        for key, short in self._unit_defs:
+            if key == "knight":
+                continue
+            btn = QPushButton()
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedSize(36, 32)
+            btn.setProperty("tw_mis_dyn_unit", key)
+            btn.setToolTip(f"{short}: köy stoğundaki {short} birimini dalgalara eşit böler (diğer sütunlar aynı kalır).")
+            btn.clicked.connect(self._on_dynamic_unit_clicked)
+            ic = troop_icon_mgr.get_icon(key)
+            if ic:
+                btn.setIcon(ic)
+                btn.setIconSize(QSize(18, 18))
+            else:
+                btn.setText(short[:3])
+            dyn_row.addWidget(btn)
+            self._dyn_unit_btns.append((key, btn))
+        dyn_row.addStretch()
+        fill_l.addLayout(dyn_row)
+        fill_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        root.addWidget(fill_box)
+
         self._table = QTableWidget()
         self._table.setColumnCount(len(self._unit_defs))
-        self._table.setHorizontalHeaderLabels([s for _, s in self._unit_defs])
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self._table.verticalHeader().setVisible(True)
         self._table.setAlternatingRowColors(True)
+        self._table.verticalHeader().setVisible(True)
+        self._table.verticalHeader().setDefaultSectionSize(30)
+        self._table.horizontalHeader().setMinimumHeight(44)
+        self._table.horizontalHeader().setIconSize(QSize(20, 20))
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._table.setShowGrid(True)
+        self._table.setMinimumHeight(160)
+        self._table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._apply_unit_headers()
         root.addWidget(self._table, 1)
 
         self._wave_spin.blockSignals(True)
         self._wave_spin.setValue(1)
         self._wave_spin.blockSignals(False)
         self._wave_spin.valueChanged.connect(self._resize_wave_rows)
+        self._resize_wave_rows()
 
         _btn_style = (
             "background: qlineargradient(y1:0,y2:1,stop:0 #f5e6c8,stop:1 #d4b896);"
@@ -3759,7 +3995,6 @@ class MisyonerMultiWaveDialog(QDialog):
 
         self._auto_split_cb.stateChanged.connect(self._toggle_manual_table)
 
-        # Köydeki mevcut birlikleri çek (hücre doğrulama için)
         try:
             sx, sy = bot._sa_get_source_coords()
             v = bot._sa_find_village_at_coord(sx, sy) if sx is not None else None
@@ -3774,6 +4009,157 @@ class MisyonerMultiWaveDialog(QDialog):
         dark = bool(getattr(bot, "_dark_mode", False))
         self.setStyleSheet(_misyoner_multi_dialog_stylesheet(dark))
         self._prefill_arrive_defaults()
+        try:
+            troop_icon_mgr._signals.icon_ready.connect(self._on_troop_icon_ready)
+        except Exception:
+            pass
+
+    def _style_unit_tool_button(self, btn: QPushButton, unit_keys: list) -> None:
+        """Sabit şablon butonuna birim ikonları koy."""
+        parts = []
+        for k in unit_keys:
+            ic = troop_icon_mgr.get_icon(k)
+            if ic:
+                btn.setIcon(ic)
+                btn.setIconSize(QSize(16, 16))
+                break
+        labels = []
+        for k in unit_keys:
+            short = next((s for key, s in self._unit_defs if key == k), k)
+            labels.append(short)
+        if not btn.icon().isNull():
+            btn.setText(" / ".join(labels))
+        else:
+            btn.setText(" / ".join(labels))
+        btn.setMinimumHeight(30)
+
+    def _apply_unit_headers(self) -> None:
+        for c, (key, short) in enumerate(self._unit_defs):
+            it = QTableWidgetItem(short)
+            it.setTextAlignment(Qt.AlignCenter)
+            it.setToolTip(short)
+            ic = troop_icon_mgr.get_icon(key)
+            if ic:
+                it.setIcon(ic)
+            self._table.setHorizontalHeaderItem(c, it)
+
+    def _on_troop_icon_ready(self, unit_key: str, _raw: bytes) -> None:
+        self._apply_unit_headers()
+        for key, btn in getattr(self, "_dyn_unit_btns", []):
+            if key != unit_key:
+                continue
+            ic = troop_icon_mgr.get_icon(key)
+            if ic:
+                btn.setIcon(ic)
+                btn.setIconSize(QSize(18, 18))
+                btn.setText("")
+
+    def _use_table_values(self) -> None:
+        """Butonla doldurulunca kabulde tablo kullanılsın."""
+        if self._auto_split_cb.isChecked():
+            self._auto_split_cb.blockSignals(True)
+            self._auto_split_cb.setChecked(False)
+            self._auto_split_cb.blockSignals(False)
+        self._table.setEnabled(True)
+
+    def _write_troops_to_row(self, r: int, troops_map: dict) -> None:
+        self._table.blockSignals(True)
+        try:
+            for c, (key, _) in enumerate(self._unit_defs):
+                val = int((troops_map or {}).get(key, 0) or 0)
+                it = self._table.item(r, c)
+                if it is None:
+                    it = QTableWidgetItem("0")
+                    it.setTextAlignment(Qt.AlignCenter)
+                    self._table.setItem(r, c, it)
+                it.setText(str(max(0, val)))
+        finally:
+            self._table.blockSignals(False)
+        self._validate_cells()
+
+    def _fill_reset(self) -> None:
+        self._use_table_values()
+        n = self._table.rowCount()
+        empty = {k: 0 for k, _ in self._unit_defs}
+        for r in range(n):
+            self._write_troops_to_row(r, empty)
+
+    def _fill_clone_first(self) -> None:
+        self._use_table_values()
+        if self._table.rowCount() < 1:
+            return
+        src = self._read_troops_from_row(0)
+        for r in range(1, self._table.rowCount()):
+            self._write_troops_to_row(r, src)
+
+    def _source_troops_for_fill(self) -> dict:
+        self._refresh_troops_avail()
+        bot = self._bot
+        try:
+            sx, sy = bot._sa_get_source_coords()
+            v = bot._sa_find_village_at_coord(sx, sy) if sx is not None else None
+            if v:
+                return bot._sa_bulk_source_troops(v)
+        except Exception:
+            pass
+        return dict(getattr(self, "_troops_avail", {}) or {})
+
+    def _fill_auto_noble_split(self) -> None:
+        self._use_table_values()
+        n = max(1, self._wave_spin.value())
+        avail = self._source_troops_for_fill()
+        snob_waves = min(n, self._bot._sa_troop_count(avail, "snob"))
+        for w in range(n):
+            tm = self._bot._sa_troops_noble_split_wave(
+                avail, n, w, max_snob_waves=snob_waves
+            )
+            self._write_troops_to_row(w, tm)
+
+    def _on_fixed_preset_clicked(self) -> None:
+        btn = self.sender()
+        if not isinstance(btn, QPushButton):
+            return
+        preset = btn.property("tw_mis_preset")
+        if not isinstance(preset, dict):
+            return
+        self._use_table_values()
+        base = {k: 0 for k, _ in self._unit_defs}
+        for k, v in preset.items():
+            if k in base:
+                base[k] = int(v or 0)
+        for r in range(self._table.rowCount()):
+            self._write_troops_to_row(r, base)
+
+    def _on_dynamic_unit_clicked(self) -> None:
+        btn = self.sender()
+        if not isinstance(btn, QPushButton):
+            return
+        key = btn.property("tw_mis_dyn_unit")
+        if not key:
+            return
+        self._use_table_values()
+        n = max(1, self._table.rowCount())
+        avail = self._source_troops_for_fill()
+        total = self._bot._sa_troop_count(avail, key)
+        # Mevcut satırlardaki bu birimi düş (yeniden dağıtım)
+        base_each = total // n
+        rem = total % n
+        self._table.blockSignals(True)
+        try:
+            for r in range(n):
+                val = base_each + (1 if r < rem else 0)
+                c = next((i for i, (k, _) in enumerate(self._unit_defs) if k == key), None)
+                if c is None:
+                    continue
+                it = self._table.item(r, c)
+                if it is None:
+                    it = QTableWidgetItem("0")
+                    it.setTextAlignment(Qt.AlignCenter)
+                    self._table.setItem(r, c, it)
+                it.setText(str(max(0, val)))
+        finally:
+            self._table.blockSignals(False)
+        self._validate_cells()
 
     def _prefill_arrive_defaults(self):
         """Varsayılan: varış modu + son eklenen komutun varış zamanı."""
@@ -3790,6 +4176,7 @@ class MisyonerMultiWaveDialog(QDialog):
     def showEvent(self, event):
         super().showEvent(event)
         self._refresh_troops_avail()
+        self._apply_unit_headers()
         self._prefill_arrive_defaults()
 
     def _refresh_troops_avail(self):
@@ -3819,8 +4206,26 @@ class MisyonerMultiWaveDialog(QDialog):
                 it.setTextAlignment(Qt.AlignCenter)
                 self._table.setItem(r, c, it)
         for r in range(n):
-            self._table.setVerticalHeaderItem(r, QTableWidgetItem(str(r + 1)))
+            self._table.setVerticalHeaderItem(r, QTableWidgetItem(f"Dalga {r + 1}"))
+            self._table.setRowHeight(r, 30)
+        self._fit_dialog_to_waves(n)
         self._validate_cells()
+        if n > 0:
+            last = self._table.item(n - 1, 0)
+            if last is not None:
+                self._table.scrollToItem(last, QAbstractItemView.PositionAtBottom)
+
+    def _fit_dialog_to_waves(self, n: int) -> None:
+        """Dalga sayısı artınca tablo min yüksekliği + pencere büyüsün; satırlar görünsün."""
+        n = max(1, int(n or 1))
+        row_h = 30
+        header_h = max(44, self._table.horizontalHeader().sizeHint().height())
+        table_need = header_h + max(2, n) * row_h + 12
+        self._table.setMinimumHeight(min(max(table_need, 160), 320))
+        chrome = 380
+        target_h = min(780, chrome + self._table.minimumHeight())
+        if self.height() < target_h:
+            self.resize(max(self.width(), self.minimumWidth()), target_h)
 
     def _validate_cells(self):
         """Her sütunda birikimli toplam köydeki mevcut birliği aşarsa hücreyi kırmızı yap."""
@@ -3968,13 +4373,12 @@ class MisyonerMultiWaveDialog(QDialog):
         if self._time_mode == "arrive":
             try:
                 used_keys = set()
-                for r in range(n):
-                    for c, (key, _) in enumerate(self._unit_defs):
-                        it = self._table.item(r, c)
+                for tm in troops_list:
+                    for key, val in (tm or {}).items():
                         try:
-                            if int((it.text() if it else "0") or 0) > 0:
+                            if int(val or 0) > 0:
                                 used_keys.add(key)
-                        except ValueError:
+                        except (TypeError, ValueError):
                             pass
                 if not used_keys:
                     used_keys = {"snob"}
@@ -4004,6 +4408,7 @@ class MisyonerMultiWaveDialog(QDialog):
                 "send",
                 wave_send_dt,
                 fake_dialog=False,
+                check_fake_limit=False,
                 duplicate_dialog=False,
             )
             if ok:
@@ -8039,11 +8444,17 @@ class TribalWarsBot(QMainWindow):
         )
 
     def _tw_inject_planner_webchannel_hook(self, ok):
-        """QWebChannel istemcisi + planlayıcı «Gonder» tıklamasını Ordu Gönder kuyruğuna yönlendir."""
-        if not ok or not getattr(self, "browser", None):
+        """QWebChannel istemcisi + planlayıcı «Gonder» + place onay «Tabloya ekle»."""
+        if not ok:
+            return
+        page = self.sender()
+        if page is None or not hasattr(page, "runJavaScript"):
+            browser = getattr(self, "browser", None)
+            page = browser.page() if browser else None
+        if page is None:
             return
         try:
-            url = (self.browser.url().toString() or "").lower()
+            url = (page.url().toString() or "").lower()
         except Exception:
             url = ""
         # Giriş / portal sayfalarına WebChannel basma (beyaz ekran riski)
@@ -8053,6 +8464,11 @@ class TribalWarsBot(QMainWindow):
             return
         js = r"""
 (function(){
+  function __twPad(n, w) {
+    n = String(n == null ? '' : n);
+    while (n.length < w) n = '0' + n;
+    return n;
+  }
   function __twPlannerInsertDestekUi() {
     if (document.getElementById('__tw_planner_destek_wrap')) return true;
     var elT = document.getElementById('godzina_wejscia') || document.getElementById('data_wejscia');
@@ -8102,53 +8518,612 @@ class TribalWarsBot(QMainWindow):
     if (__twPlannerInsertDestekUi() || n > 50) return;
     setTimeout(function() { __twPlannerTryInsert(n + 1); }, 200);
   }
+
+  var __TW_CONFIRM_UNITS = ['spear','sword','axe','archer','spy','light','marcher','heavy','ram','catapult','knight','snob'];
+
+  function __twConfirmFindForm() {
+    var cf = document.getElementById('command-data-form')
+      || document.querySelector('form#command-data-form');
+    if (cf && (cf.querySelector('[name="ch"]') || document.getElementById('troop_confirm_submit')))
+      return cf;
+    var forms = document.querySelectorAll('form');
+    for (var i = 0; i < forms.length; i++) {
+      if (forms[i].querySelector('[name="ch"]') &&
+          (forms[i].querySelector('#troop_confirm_submit, [name="submit_confirm"]') ||
+           forms[i].querySelector('[name="x"]')))
+        return forms[i];
+    }
+    return null;
+  }
+  function __twIsPlaceConfirmPage() {
+    var href = String(location.href || '');
+    if (href.indexOf('screen=place') < 0) return false;
+    if (href.indexOf('try=confirm') < 0 && !document.getElementById('troop_confirm_submit'))
+      return false;
+    return !!__twConfirmFindForm();
+  }
+  function __twConfirmFindArrivalSpan(cf) {
+    if (!cf) return null;
+    var rows = cf.querySelectorAll('tr');
+    for (var ri = 0; ri < rows.length; ri++) {
+      var tds = rows[ri].querySelectorAll('td');
+      if (tds.length < 2) continue;
+      var lab = String(tds[0].textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      if (/var[ıi][sş]|arrival|ankunft/.test(lab)) {
+        var sp = tds[1].querySelector('span') || tds[1];
+        if (sp) return sp;
+      }
+    }
+    // Kullanıcının verdiği yapı: form/div/.../tr[5]/td[2]/span
+    var sp2 = cf.querySelector('div table tbody tr:nth-child(5) > td:nth-child(2) span')
+      || cf.querySelector('table tbody tr:nth-child(5) > td:nth-child(2) span');
+    if (sp2) return sp2;
+    return cf.querySelector('#date_arrival, span.timer[data-endtime], span.relative_time, span.timer');
+  }
+  function __twConfirmParseClock(text) {
+    var m = String(text || '').match(/(\d{1,2}):(\d{2}):(\d{2})(?::(\d{1,3}))?/);
+    if (!m) return '';
+    var msPart = (m[4] != null && String(m[4]).length) ? String(m[4]).slice(0, 3) : '000';
+    return __twPad(m[1], 2) + ':' + m[2] + ':' + m[3] + ':' + __twPad(msPart, 3);
+  }
+  function __twConfirmPrefillDateTime(dateEl, timeEl, cf) {
+    var day = '', month = '', hh = '', mm = '', ss = '', ms = '000';
+    var st = document.getElementById('serverTime');
+    var sd = document.getElementById('serverDate');
+    var stxt = ((sd && sd.textContent) || '') + ' ' + ((st && st.textContent) || '');
+    var dm = stxt.match(/(\d{1,2})[./\-](\d{1,2})(?:[./\-](\d{2,4}))?/);
+    var tm = stxt.match(/(\d{1,2}):(\d{2}):(\d{2})/);
+    if (dm) { day = __twPad(dm[1], 2); month = __twPad(dm[2], 2); }
+    if (tm) { hh = __twPad(tm[1], 2); mm = tm[2]; ss = tm[3]; }
+
+    // Onay formundaki «Varış» saati (canlı dönen span) → varsayılan saat kutusu
+    var arrSp = __twConfirmFindArrivalSpan(cf);
+    if (arrSp) {
+      var arrTxt = String(arrSp.textContent || arrSp.innerText || '').replace(/\s+/g, ' ').trim();
+      var clock = __twConfirmParseClock(arrTxt);
+      if (clock) {
+        var parts = clock.split(':');
+        hh = parts[0]; mm = parts[1]; ss = parts[2]; ms = parts[3] || '000';
+      }
+      var adm = arrTxt.match(/(\d{1,2})[./](\d{1,2})/);
+      if (adm) { day = __twPad(adm[1], 2); month = __twPad(adm[2], 2); }
+    }
+
+    if (!day) {
+      try {
+        if (window.Timing && typeof Timing.getCurrentServerTime === 'function') {
+          var tms = Timing.getCurrentServerTime();
+          var d = new Date(tms);
+          day = __twPad(d.getDate(), 2);
+          month = __twPad(d.getMonth() + 1, 2);
+          if (!hh) {
+            hh = __twPad(d.getHours(), 2);
+            mm = __twPad(d.getMinutes(), 2);
+            ss = __twPad(d.getSeconds(), 2);
+            ms = __twPad(d.getMilliseconds(), 3);
+          }
+        }
+      } catch (eT) {}
+    }
+    if (day && month && !dateEl.value) dateEl.value = day + '.' + month;
+    if (hh && !timeEl.value) timeEl.value = hh + ':' + mm + ':' + ss + ':' + ms;
+  }
+  function __twConfirmReadField(cf, name) {
+    var el = cf.querySelector('[name="' + name + '"]');
+    if (!el) return '';
+    if (el.tagName === 'SELECT') return el.value || '';
+    var typ = String(el.type || '').toLowerCase();
+    if (typ === 'checkbox' || typ === 'radio') return el.checked ? (el.value || '1') : '';
+    return el.value != null ? String(el.value) : '';
+  }
+  function __twConfirmReadTroops(cf) {
+    var troops = {};
+    for (var i = 0; i < __TW_CONFIRM_UNITS.length; i++) {
+      var k = __TW_CONFIRM_UNITS[i];
+      var el = cf.querySelector('input[name="' + k + '"], select[name="' + k + '"]');
+      if (!el) continue;
+      var n = parseInt(el.value, 10);
+      if (!isNaN(n) && n > 0) troops[k] = n;
+    }
+    return troops;
+  }
+  function __twConfirmReadTrainTroops(cf, tidx) {
+    var troops = {};
+    var any = false;
+    for (var i = 0; i < __TW_CONFIRM_UNITS.length; i++) {
+      var k = __TW_CONFIRM_UNITS[i];
+      var el = cf.querySelector(
+        'input[name="train[' + tidx + '][' + k + ']"], select[name="train[' + tidx + '][' + k + ']"]'
+      );
+      if (!el) continue;
+      var n = parseInt(el.value, 10);
+      if (!isNaN(n) && n > 0) { troops[k] = n; any = true; }
+    }
+    return any ? troops : null;
+  }
+  function __twConfirmReadWaves(cf) {
+    /* 1. dalga ana form; ek saldırılar train[2]..train[N] (misyoner çoklu dalga ile aynı şema) */
+    var waves = [];
+    var main = __twConfirmReadTroops(cf);
+    var mainB = __twConfirmReadField(cf, 'building') || '';
+    waves.push({ troops: main, building: mainB });
+    var maxT = 1;
+    var named = cf.querySelectorAll('input[name^="train["], select[name^="train["]');
+    for (var i = 0; i < named.length; i++) {
+      var m = String(named[i].name || '').match(/^train\[(\d+)\]/);
+      if (!m) continue;
+      var ix = parseInt(m[1], 10);
+      if (!isNaN(ix) && ix > maxT) maxT = ix;
+    }
+    for (var t = 2; t <= maxT; t++) {
+      var tr = __twConfirmReadTrainTroops(cf, t);
+      if (!tr) continue;
+      var bEl = cf.querySelector(
+        'input[name="train[' + t + '][building]"], select[name="train[' + t + '][building]"]'
+      );
+      var b = bEl && bEl.value ? String(bEl.value) : mainB;
+      waves.push({ troops: tr, building: b || '' });
+    }
+    return waves;
+  }
+  function __twConfirmVillageId(cf) {
+    var v = __twConfirmReadField(cf, 'source_village') || __twConfirmReadField(cf, 'village');
+    if (v) {
+      var n = parseInt(v, 10);
+      if (!isNaN(n) && n > 0) return n;
+    }
+    try {
+      var m = String(location.search || '').match(/[?&]village=(\d+)/);
+      if (m) return parseInt(m[1], 10);
+    } catch (e0) {}
+    try {
+      if (window.game_data && game_data.village && game_data.village.id)
+        return parseInt(game_data.village.id, 10);
+    } catch (e1) {}
+    return 0;
+  }
+  function __twConfirmIsAttack(cf) {
+    if (__twConfirmReadField(cf, 'support')) return false;
+    if (__twConfirmReadField(cf, 'attack')) return true;
+    var href = String(location.href || '');
+    if (/type=support|try=support/i.test(href)) return false;
+    return true;
+  }
+  function __twConfirmInsertQueueUi() {
+    if (document.getElementById('__tw_confirm_queue_wrap')) return true;
+    if (!__twIsPlaceConfirmPage()) return false;
+    var cf = __twConfirmFindForm();
+    if (!cf) return false;
+    var wrap = document.createElement('div');
+    wrap.id = '__tw_confirm_queue_wrap';
+    wrap.setAttribute('style',
+      'margin:10px 0;padding:8px 10px;font-size:12px;line-height:1.5;' +
+      'border:1px solid #a98;border-radius:4px;background:rgba(255,230,180,0.45);' +
+      'display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;');
+    var dateLab = document.createElement('label');
+    dateLab.textContent = 'Varış GG.AA';
+    dateLab.setAttribute('style', 'display:inline-flex;align-items:center;gap:4px;');
+    var dateEl = document.createElement('input');
+    dateEl.type = 'text';
+    dateEl.id = '__tw_confirm_arrive_date';
+    dateEl.placeholder = '28.09';
+    dateEl.setAttribute('style', 'width:64px;padding:2px 4px;');
+    dateLab.appendChild(dateEl);
+    wrap.appendChild(dateLab);
+    var timeLab = document.createElement('label');
+    timeLab.textContent = 'SS:DD:SS:ms';
+    timeLab.setAttribute('style', 'display:inline-flex;align-items:center;gap:4px;');
+    var timeEl = document.createElement('input');
+    timeEl.type = 'text';
+    timeEl.id = '__tw_confirm_arrive_time';
+    timeEl.placeholder = '03:24:00:200';
+    timeEl.setAttribute('style', 'width:110px;padding:2px 4px;');
+    timeLab.appendChild(timeEl);
+    wrap.appendChild(timeLab);
+    __twConfirmPrefillDateTime(dateEl, timeEl, cf);
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = '__tw_confirm_queue_btn';
+    btn.textContent = 'Tabloya ekle';
+    btn.setAttribute('style',
+      'padding:4px 12px;font-weight:bold;cursor:pointer;' +
+      'background:#e8d5a3;border:1px solid #a98;border-radius:3px;');
+    btn.addEventListener('click', function(ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      var form = __twConfirmFindForm();
+      if (!form) { alert('Onay formu bulunamadı'); return; }
+      if (!window.twPlannerBridge || typeof window.twPlannerBridge.enqueueConfirmCommand !== 'function') {
+        alert('TW Bot köprüsü hazır değil — sayfayı yenileyip tekrar deneyin');
+        return;
+      }
+      var waves = __twConfirmReadWaves(form);
+      var payload = {
+        village_id: __twConfirmVillageId(form),
+        x: parseInt(__twConfirmReadField(form, 'x'), 10),
+        y: parseInt(__twConfirmReadField(form, 'y'), 10),
+        attack: __twConfirmIsAttack(form),
+        waves: waves,
+        troops: (waves[0] && waves[0].troops) || {},
+        building: (waves[0] && waves[0].building) || '',
+        date: (document.getElementById('__tw_confirm_arrive_date') || {}).value || '',
+        time: (document.getElementById('__tw_confirm_arrive_time') || {}).value || ''
+      };
+      try {
+        window.twPlannerBridge.enqueueConfirmCommand(JSON.stringify(payload));
+      } catch (eSend) {
+        alert('Kuyruğa eklenemedi: ' + String(eSend));
+      }
+    });
+    wrap.appendChild(btn);
+    var hint = document.createElement('span');
+    hint.setAttribute('style', 'opacity:0.75;font-size:11px;');
+    hint.textContent = 'Varışa göre gönderim; ek saldırılar ayrı dalga olarak eklenir';
+    wrap.appendChild(hint);
+
+    var anchor = document.getElementById('troop_confirm_submit')
+      || cf.querySelector('[name="submit_confirm"]')
+      || cf;
+    var parent = anchor.parentNode || cf.parentNode;
+    if (!parent) return false;
+    if (anchor === cf) parent.insertBefore(wrap, cf);
+    else parent.insertBefore(wrap, anchor);
+    return true;
+  }
+  function __twConfirmFindAddAttackControl() {
+    var nodes = document.querySelectorAll('a, button, input[type="button"], input[type="submit"], span.btn, div.btn');
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      var t = String(el.textContent || el.value || '').replace(/\s+/g, ' ').trim();
+      var oc = String(el.getAttribute('onclick') || '');
+      if (/addAdditionalAttack|additionalAttack/i.test(oc)) return el;
+      if (/ek\s*sald[ıi]r[ıi]|additional\s*attack|weiteren?\s*angriff|ataques?\s*adicion/i.test(t))
+        return el;
+    }
+    try {
+      if (window.Place && Place.confirmScreen && typeof Place.confirmScreen.addAdditionalAttack === 'function')
+        return { __twApi: true };
+    } catch (e0) {}
+    return null;
+  }
+  function __twConfirmClickAddAttack() {
+    var ctl = __twConfirmFindAddAttackControl();
+    if (!ctl) return false;
+    if (ctl.__twApi) {
+      try { Place.confirmScreen.addAdditionalAttack(); return true; } catch (e1) { return false; }
+    }
+    try { ctl.click(); return true; } catch (e2) { return false; }
+  }
+  function __twConfirmCurrentWaveCount(cf) {
+    cf = cf || __twConfirmFindForm();
+    if (!cf) return 0;
+    var maxT = 1;
+    var named = cf.querySelectorAll('input[name^="train["], select[name^="train["]');
+    for (var i = 0; i < named.length; i++) {
+      var m = String(named[i].name || '').match(/^train\[(\d+)\]/);
+      if (!m) continue;
+      var ix = parseInt(m[1], 10);
+      if (!isNaN(ix) && ix > maxT) maxT = ix;
+    }
+    return maxT; /* train[4] → 4 dalga (1 ana + 2..4) */
+  }
+  function __twConfirmEnsureWaves(n) {
+    n = Math.max(1, Math.min(5, parseInt(n, 10) || 1));
+    var guard = 0;
+    while (__twConfirmCurrentWaveCount() < n && guard < 8) {
+      if (!__twConfirmClickAddAttack()) break;
+      guard++;
+    }
+    return __twConfirmCurrentWaveCount();
+  }
+  function __twConfirmSetNamedValue(cf, name, val) {
+    var el = cf.querySelector('[name="' + name + '"]');
+    if (!el) return false;
+    el.value = String(val);
+    try {
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch (e0) {}
+    return true;
+  }
+  function __twConfirmFillWaveTroops(cf, waveIdx, troops, clearOthers) {
+    /* waveIdx 0 = ana form; 1 → train[2], 2 → train[3], ... */
+    var prefix = '';
+    if (waveIdx > 0) prefix = 'train[' + (waveIdx + 1) + ']';
+    if (clearOthers) {
+      for (var i = 0; i < __TW_CONFIRM_UNITS.length; i++) {
+        var uk = __TW_CONFIRM_UNITS[i];
+        var nm = prefix ? (prefix + '[' + uk + ']') : uk;
+        __twConfirmSetNamedValue(cf, nm, troops[uk] ? String(troops[uk]) : (prefix ? '' : '0'));
+      }
+    } else {
+      for (var k in troops) {
+        if (!Object.prototype.hasOwnProperty.call(troops, k)) continue;
+        var nm2 = prefix ? (prefix + '[' + k + ']') : k;
+        __twConfirmSetNamedValue(cf, nm2, String(troops[k]));
+      }
+    }
+  }
+  function __twConfirmFillAllWaves(troops, clearOthers) {
+    var cf = __twConfirmFindForm();
+    if (!cf) return;
+    var n = __twConfirmCurrentWaveCount(cf);
+    for (var w = 0; w < n; w++) __twConfirmFillWaveTroops(cf, w, troops, clearOthers);
+  }
+  function __twConfirmResetAllWaves() {
+    var empty = {};
+    for (var i = 0; i < __TW_CONFIRM_UNITS.length; i++) empty[__TW_CONFIRM_UNITS[i]] = 0;
+    __twConfirmFillAllWaves(empty, true);
+  }
+  function __twConfirmCloneFirstWave() {
+    var cf = __twConfirmFindForm();
+    if (!cf) return;
+    var first = __twConfirmReadTroops(cf);
+    var n = __twConfirmCurrentWaveCount(cf);
+    for (var w = 1; w < n; w++) __twConfirmFillWaveTroops(cf, w, first, true);
+  }
+  function __twConfirmUnitIconUrl(key) {
+    try {
+      if (typeof image_base === 'string' && image_base)
+        return image_base + 'unit/unit_' + key + '.webp';
+    } catch (e0) {}
+    try {
+      if (window.game_data && game_data.link_base)
+        return '/graphic/unit/unit_' + key + '.webp';
+    } catch (e1) {}
+    return '/graphic/unit/unit_' + key + '.webp';
+  }
+  var __TW_CONFIRM_UNIT_SHORT = {
+    spear: 'Mız', sword: 'Kıl', axe: 'Bal', archer: 'Ok', spy: 'Cas',
+    light: 'HA', marcher: 'AO', heavy: 'AA', ram: 'Koç', catapult: 'Man',
+    knight: 'Şöv', snob: 'Mis'
+  };
+  var __TW_CONFIRM_FIXED_PRESETS = [
+    { ram: 1, spy: 1 },
+    { catapult: 1, spy: 1 },
+    { spy: 1, catapult: 20 },
+    { spy: 20, ram: 1 }
+  ];
+  function __twConfirmMkBtn(label, title) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = label;
+    if (title) b.title = title;
+    b.setAttribute('style',
+      'padding:3px 8px;margin:2px;cursor:pointer;font-size:11px;font-weight:bold;' +
+      'background:linear-gradient(#f5e6c8,#d4b896);border:1px solid #b89b6a;border-radius:3px;color:#5a3e1b;');
+    return b;
+  }
+  function __twConfirmInsertFillPanel() {
+    if (document.getElementById('__tw_confirm_fill_panel')) return true;
+    if (!__twIsPlaceConfirmPage()) return false;
+    var cf = __twConfirmFindForm();
+    if (!cf) return false;
+
+    var panel = document.createElement('div');
+    panel.id = '__tw_confirm_fill_panel';
+    panel.setAttribute('style',
+      'position:fixed;right:10px;top:72px;width:270px;z-index:10050;' +
+      'padding:8px 10px;font-size:12px;line-height:1.4;' +
+      'border:1px solid #a98;border-radius:5px;background:rgba(255,230,180,0.92);' +
+      'box-shadow:0 2px 10px rgba(0,0,0,0.18);max-height:calc(100vh - 90px);overflow:auto;');
+
+    var waveRow = document.createElement('div');
+    waveRow.setAttribute('style', 'display:flex;align-items:center;gap:6px;margin-bottom:6px;flex-wrap:wrap;');
+    var waveLab = document.createElement('label');
+    waveLab.textContent = 'Dalga';
+    var waveInp = document.createElement('input');
+    waveInp.type = 'number';
+    waveInp.id = '__tw_confirm_fill_waves';
+    waveInp.min = '1';
+    waveInp.max = '5';
+    waveInp.value = String(Math.max(1, __twConfirmCurrentWaveCount(cf)));
+    waveInp.setAttribute('style', 'width:48px;padding:2px 4px;');
+    var waveApply = __twConfirmMkBtn('Uygula', 'Oyunun «ek saldırı ekle» ile dalga sayısını ayarlar');
+    waveApply.addEventListener('click', function(ev) {
+      ev.preventDefault();
+      var n = parseInt(waveInp.value, 10) || 1;
+      var got = __twConfirmEnsureWaves(n);
+      waveInp.value = String(got);
+    });
+    waveRow.appendChild(waveLab);
+    waveRow.appendChild(waveInp);
+    waveRow.appendChild(waveApply);
+    panel.appendChild(waveRow);
+
+    var actRow = document.createElement('div');
+    actRow.setAttribute('style', 'display:flex;flex-wrap:wrap;gap:2px;margin-bottom:6px;');
+    var btnReset = __twConfirmMkBtn('Sıfırla', 'Tüm dalgalardaki birimleri sıfırlar');
+    btnReset.addEventListener('click', function(ev) { ev.preventDefault(); __twConfirmResetAllWaves(); });
+    var btnClone = __twConfirmMkBtn('İlk→hepsi', '1. dalgayı diğer dalgalara kopyalar');
+    btnClone.addEventListener('click', function(ev) { ev.preventDefault(); __twConfirmCloneFirstWave(); });
+    actRow.appendChild(btnReset);
+    actRow.appendChild(btnClone);
+    panel.appendChild(actRow);
+
+    var fixLbl = document.createElement('div');
+    fixLbl.setAttribute('style', 'font-weight:bold;margin:4px 0 2px;');
+    fixLbl.textContent = 'Sabit şablonlar (tüm dalgalar)';
+    panel.appendChild(fixLbl);
+    var fixRow = document.createElement('div');
+    fixRow.setAttribute('style', 'display:flex;flex-wrap:wrap;gap:2px;margin-bottom:6px;');
+    for (var pi = 0; pi < __TW_CONFIRM_FIXED_PRESETS.length; pi++) {
+      (function(preset) {
+        var keys = Object.keys(preset);
+        var b = document.createElement('button');
+        b.type = 'button';
+        b.title = keys.map(function(k) { return preset[k] + ' ' + (__TW_CONFIRM_UNIT_SHORT[k] || k); }).join(' + ');
+        b.setAttribute('style',
+          'padding:4px 6px;margin:2px;cursor:pointer;min-width:52px;' +
+          'background:linear-gradient(#f5e6c8,#d4b896);border:1px solid #b89b6a;border-radius:3px;');
+        keys.forEach(function(k) {
+          var img = document.createElement('img');
+          img.src = __twConfirmUnitIconUrl(k);
+          img.alt = k;
+          img.width = 18;
+          img.height = 18;
+          img.setAttribute('style', 'vertical-align:middle;margin:0 1px;');
+          img.onerror = function() { this.style.display = 'none'; };
+          b.appendChild(img);
+          var sm = document.createElement('span');
+          sm.textContent = String(preset[k]);
+          sm.setAttribute('style', 'font-size:10px;font-weight:bold;margin-right:3px;');
+          b.appendChild(sm);
+        });
+        b.addEventListener('click', function(ev) {
+          ev.preventDefault();
+          var nWant = parseInt((document.getElementById('__tw_confirm_fill_waves') || {}).value, 10) || 1;
+          __twConfirmEnsureWaves(nWant);
+          __twConfirmFillAllWaves(preset, true);
+        });
+        fixRow.appendChild(b);
+      })(__TW_CONFIRM_FIXED_PRESETS[pi]);
+    }
+    var btnCloneFirst = __twConfirmMkBtn('Birinciyi kopyala', 'İlk formdaki birlikleri diğer tüm dalgalara uygular');
+    btnCloneFirst.addEventListener('click', function(ev) {
+      ev.preventDefault();
+      var nWant = parseInt((document.getElementById('__tw_confirm_fill_waves') || {}).value, 10) || 1;
+      __twConfirmEnsureWaves(nWant);
+      __twConfirmCloneFirstWave();
+    });
+    fixRow.appendChild(btnCloneFirst);
+    panel.appendChild(fixRow);
+
+    var dynLbl = document.createElement('div');
+    dynLbl.setAttribute('style', 'font-weight:bold;margin:4px 0 2px;');
+    dynLbl.textContent = 'Birim × adet → tüm dalgalar';
+    panel.appendChild(dynLbl);
+    var qtyRow = document.createElement('div');
+    qtyRow.setAttribute('style', 'display:flex;align-items:center;gap:6px;margin-bottom:4px;');
+    var qtyLab = document.createElement('label');
+    qtyLab.textContent = 'Adet';
+    var qtyInp = document.createElement('input');
+    qtyInp.type = 'number';
+    qtyInp.id = '__tw_confirm_fill_qty';
+    qtyInp.min = '0';
+    qtyInp.value = '1';
+    qtyInp.setAttribute('style', 'width:56px;padding:2px 4px;');
+    qtyRow.appendChild(qtyLab);
+    qtyRow.appendChild(qtyInp);
+    panel.appendChild(qtyRow);
+    var dynRow = document.createElement('div');
+    dynRow.setAttribute('style', 'display:flex;flex-wrap:wrap;gap:2px;');
+    for (var ui = 0; ui < __TW_CONFIRM_UNITS.length; ui++) {
+      (function(ukey) {
+        if (ukey === 'knight') return;
+        var b = document.createElement('button');
+        b.type = 'button';
+        b.title = (__TW_CONFIRM_UNIT_SHORT[ukey] || ukey) + ' — adet kutusundaki sayı tüm dalgalara yazılır';
+        b.setAttribute('style',
+          'width:34px;height:30px;padding:2px;margin:1px;cursor:pointer;' +
+          'background:linear-gradient(#f5e6c8,#d4b896);border:1px solid #b89b6a;border-radius:3px;');
+        var img = document.createElement('img');
+        img.src = __twConfirmUnitIconUrl(ukey);
+        img.alt = ukey;
+        img.width = 18;
+        img.height = 18;
+        img.onerror = function() {
+          this.style.display = 'none';
+          b.textContent = (__TW_CONFIRM_UNIT_SHORT[ukey] || ukey).slice(0, 3);
+        };
+        b.appendChild(img);
+        b.addEventListener('click', function(ev) {
+          ev.preventDefault();
+          var q = parseInt((document.getElementById('__tw_confirm_fill_qty') || {}).value, 10);
+          if (isNaN(q) || q < 0) q = 0;
+          var nWant = parseInt((document.getElementById('__tw_confirm_fill_waves') || {}).value, 10) || 1;
+          __twConfirmEnsureWaves(nWant);
+          var o = {};
+          o[ukey] = q;
+          __twConfirmFillAllWaves(o, false);
+        });
+        dynRow.appendChild(b);
+      })(__TW_CONFIRM_UNITS[ui]);
+    }
+    panel.appendChild(dynRow);
+
+    var tip = document.createElement('div');
+    tip.setAttribute('style', 'margin-top:8px;opacity:0.75;font-size:10px;');
+    tip.textContent = 'Formu doldur → alttaki Tabloya ekle ile kuyruğa at';
+    panel.appendChild(tip);
+
+    document.body.appendChild(panel);
+    return true;
+  }
+  function __twConfirmTryInsert(n) {
+    n = n || 0;
+    var a = __twConfirmInsertQueueUi();
+    var b = __twConfirmInsertFillPanel();
+    if ((a && b) || n > 50) return;
+    setTimeout(function() { __twConfirmTryInsert(n + 1); }, 200);
+  }
+
+  function __twEnsurePlannerClickHook() {
+    if (window.__twPlannerClickHook) return;
+    window.__twPlannerClickHook = 1;
+    document.addEventListener('click', function(ev) {
+      if (ev.defaultPrevented || ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey) return;
+      var el = ev.target;
+      if (el.nodeType !== 1) return;
+      if (el.tagName !== 'A') el = el.closest('a');
+      if (!el || el.tagName !== 'A') return;
+      var href = el.href || '';
+      if (href.indexOf('screen=place') < 0) return;
+      if (href.indexOf('from=simulator') < 0 && href.indexOf('att_') < 0) return;
+      __twPlannerInsertDestekUi();
+      var elD = document.getElementById('data_wejscia');
+      var elT = document.getElementById('godzina_wejscia');
+      var cbEl = document.getElementById('__tw_planner_destek');
+      var payload = JSON.stringify({
+        d: elD && 'value' in elD ? elD.value : '',
+        t: elT && 'value' in elT ? elT.value : '',
+        support: !!(cbEl && cbEl.checked)
+      });
+      if (!window.twPlannerBridge) return;
+      try {
+        window.twPlannerBridge.enqueueSimulatorCommand(href, payload);
+        ev.preventDefault();
+        ev.stopPropagation();
+      } catch (e) {}
+    }, true);
+  }
+
+  function __twAfterBridgeReady() {
+    __twPlannerTryInsert(0);
+    __twConfirmTryInsert(0);
+    __twEnsurePlannerClickHook();
+  }
+
   function boot() {
-    if (window.__twPlannerBridgeReady) return;
+    if (window.__twPlannerBridgeReady && window.twPlannerBridge) {
+      __twAfterBridgeReady();
+      return;
+    }
     if (!window.qt || !window.qt.webChannelTransport) { setTimeout(boot, 30); return; }
+    if (window.__twPlannerBootStarted) return;
+    window.__twPlannerBootStarted = 1;
     var s = document.createElement('script');
     s.src = 'qrc:///qtwebchannel/qwebchannel.js';
     s.onload = function() {
-      if (window.__twPlannerBridgeReady) return;
+      if (window.__twPlannerBridgeReady && window.twPlannerBridge) {
+        __twAfterBridgeReady();
+        return;
+      }
       new QWebChannel(qt.webChannelTransport, function(ch) {
         window.twPlannerBridge = ch.objects.twPlannerBridge;
         if (ch.objects.twMapCoordBridge) window.twMapCoordBridge = ch.objects.twMapCoordBridge;
         window.__twPlannerBridgeReady = 1;
         window.__twMapCoordBridgeReady = 1;
-        __twPlannerTryInsert(0);
-        document.addEventListener('click', function(ev) {
-          if (ev.defaultPrevented || ev.button !== 0 || ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey) return;
-          var el = ev.target;
-          if (el.nodeType !== 1) return;
-          if (el.tagName !== 'A') el = el.closest('a');
-          if (!el || el.tagName !== 'A') return;
-          var href = el.href || '';
-          if (href.indexOf('screen=place') < 0) return;
-          if (href.indexOf('from=simulator') < 0 && href.indexOf('att_') < 0) return;
-          __twPlannerInsertDestekUi();
-          var elD = document.getElementById('data_wejscia');
-          var elT = document.getElementById('godzina_wejscia');
-          var cbEl = document.getElementById('__tw_planner_destek');
-          var payload = JSON.stringify({
-            d: elD && 'value' in elD ? elD.value : '',
-            t: elT && 'value' in elT ? elT.value : '',
-            support: !!(cbEl && cbEl.checked)
-          });
-          if (!window.twPlannerBridge) return;
-          try {
-            window.twPlannerBridge.enqueueSimulatorCommand(href, payload);
-            ev.preventDefault();
-            ev.stopPropagation();
-          } catch (e) {}
-        }, true);
+        __twAfterBridgeReady();
       });
     };
-    s.onerror = function() {};
+    s.onerror = function() { window.__twPlannerBootStarted = 0; };
     (document.head || document.documentElement).appendChild(s);
   }
   boot();
 })();
 """
-        self.browser.page().runJavaScript(js)
+        page.runJavaScript(js)
 
     def _tw_planner_resolve_source_display(self, village_id: int):
         """all_villages / village üzerinden Ordu Gönder tablosu ile uyumlu kaynak metni ve koordinat."""
@@ -8280,6 +9255,164 @@ class TribalWarsBot(QMainWindow):
             "PLAN",
             "success",
             f"Planlayıcıdan kuyruk ({kind}): {src_text} → {tgt_x}|{tgt_y}",
+        )
+        tab = getattr(self, "sa_tab", None)
+        if tab is not None:
+            idx = self.tabs.indexOf(tab)
+            if idx >= 0:
+                self.tabs.setCurrentIndex(idx)
+
+    def _tw_confirm_enqueue_from_page(self, payload_json: str):
+        """Place onay (try=confirm) sayfasındaki panelden Ordu Gönder satırı üret.
+
+        «Ek saldırı ekle» ile train[2..] doluysa misyoner çoklu dalga gibi
+        her dalga ayrı satır + SA_DISPATCH_WAVE_GAP_MS varış aralığı.
+        """
+        try:
+            payload = json.loads(payload_json) if payload_json else {}
+        except json.JSONDecodeError:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        d_raw = (payload.get("date") or payload.get("d") or "").strip()
+        t_raw = (payload.get("time") or payload.get("t") or "").strip()
+        d = d_raw.replace("/", ".").replace("-", ".")
+        t = t_raw
+
+        arrive_dt = self._sa_parse_time_input(d, t)
+        if arrive_dt is None:
+            QMessageBox.warning(
+                self,
+                "Place onay",
+                "Varış tarihi/saati okunamadı.\n"
+                "Tarih: GG.AA  |  Saat: SS:DD:SS:ms\n"
+                "Örnek: 28.09  ve  03:24:00:200",
+            )
+            return
+
+        try:
+            village_id = int(payload.get("village_id") or 0)
+        except (TypeError, ValueError):
+            village_id = 0
+        if village_id <= 0:
+            QMessageBox.warning(self, "Place onay", "Kaynak köy id okunamadı.")
+            return
+
+        try:
+            tgt_x = int(payload.get("x"))
+            tgt_y = int(payload.get("y"))
+        except (TypeError, ValueError):
+            QMessageBox.warning(self, "Place onay", "Hedef koordinatları okunamadı.")
+            return
+
+        unit_keys = {k for k, _ in self.SA_UNIT_DEFS}
+
+        def _parse_troops(raw):
+            out = {}
+            if not isinstance(raw, dict):
+                return out
+            for ukey, val in raw.items():
+                if ukey not in unit_keys:
+                    continue
+                try:
+                    n = int(val)
+                except (TypeError, ValueError):
+                    continue
+                if n > 0:
+                    out[str(ukey)] = n
+            return out
+
+        waves_in = payload.get("waves")
+        wave_specs = []
+        if isinstance(waves_in, list) and waves_in:
+            for wobj in waves_in:
+                if not isinstance(wobj, dict):
+                    continue
+                tm = _parse_troops(wobj.get("troops") or {})
+                if not tm:
+                    continue
+                b = str(wobj.get("building") or "").strip()
+                if int(tm.get("catapult", 0) or 0) <= 0:
+                    b = ""
+                wave_specs.append((tm, b))
+        if not wave_specs:
+            tm = _parse_troops(payload.get("troops") or {})
+            b = str(payload.get("building") or "").strip()
+            if int(tm.get("catapult", 0) or 0) <= 0:
+                b = ""
+            if tm:
+                wave_specs.append((tm, b))
+        if not wave_specs:
+            QMessageBox.warning(self, "Place onay", "Formda gönderilecek birlik bulunamadı.")
+            return
+
+        max_b = int(getattr(self, "SA_DISPATCH_MAX_BATCH", 5) or 5)
+        if len(wave_specs) > max_b:
+            wave_specs = wave_specs[:max_b]
+
+        src_text, src_x, src_y = self._tw_planner_resolve_source_display(village_id)
+        if src_text is None or src_x is None or src_y is None:
+            QMessageBox.warning(
+                self,
+                "Place onay",
+                f"Köy id={village_id} için kaynak adı/koordinat bulunamadı.\n"
+                "Köy listesinin güncel olduğundan emin olun.",
+            )
+            return
+
+        attack_val = payload.get("attack")
+        if isinstance(attack_val, bool):
+            cmd_attack = attack_val
+        else:
+            cmd_attack = str(attack_val or "1").strip().lower() not in (
+                "0", "false", "no", "support", "destek"
+            )
+
+        gap_ms = int(getattr(self, "SA_DISPATCH_WAVE_GAP_MS", 100) or 100)
+        added = 0
+        errs = []
+        for w, (troops_map, building) in enumerate(wave_specs):
+            wave_arrive = arrive_dt + datetime.timedelta(milliseconds=w * gap_ms)
+            ok, err = self._sa_append_row_from_values(
+                src_text,
+                src_x,
+                src_y,
+                tgt_x,
+                tgt_y,
+                troops_map,
+                cmd_attack,
+                "arrive",
+                wave_arrive,
+                catapult_building=building or None,
+                duplicate_dialog=(w == 0),
+                check_fake_limit=False,
+                fake_dialog=False,
+            )
+            if ok:
+                added += 1
+            else:
+                errs.append(f"Dalga {w + 1}: {err or '?'}")
+
+        if added <= 0:
+            QMessageBox.warning(
+                self,
+                "Ordu Gönder",
+                "\n".join(errs) if errs else "Komut eklenemedi",
+            )
+            return
+        if errs:
+            QMessageBox.warning(
+                self,
+                "Ordu Gönder",
+                f"{added} dalga eklendi; bazıları atlandı:\n" + "\n".join(errs),
+            )
+
+        kind = "destek" if not cmd_attack else "saldırı"
+        self._add_log(
+            "PLACE",
+            "success",
+            f"Onay sayfasından kuyruk ({kind}, {added} dalga): {src_text} → {tgt_x}|{tgt_y}",
         )
         tab = getattr(self, "sa_tab", None)
         if tab is not None:
@@ -11805,7 +12938,11 @@ class TribalWarsBot(QMainWindow):
         return (m.group(1), m.group(2)) if m else None
 
     def _dispatch_rows_batch_compatible(self, prev_item, curr_item):
-        """Aynı köy + hedef + tür; gönderim zamanı aynı veya ardışık dalga (+SA_DISPATCH_WAVE_GAP_MS ms)."""
+        """Aynı köy + hedef + tür; gönderim zamanı aynı veya ardışık dalga (+SA_DISPATCH_WAVE_GAP_MS ms).
+
+        Ek dalgalar onay POST’ta train[2]..train[N] olarak birleştirilir (oyun şeması;
+        1. dalga ana form. tr101/tr104 FoxyProxy: snob dahil train[n][snob]=1 kabul edilir).
+        """
         if not prev_item or not curr_item:
             return False
         if prev_item.text(0) != curr_item.text(0):
@@ -11886,21 +13023,28 @@ class TribalWarsBot(QMainWindow):
         )
 
     def _dispatch_build_extra_train_rows(self, batch_indices):
-        """Dalga 2..N için train[2]..train[N] gövdesi (1. dalga ana form; oyun train[1] kullanmaz)."""
+        """Dalga 2..N için train[2]..train[N] gövdesi (1. dalga ana form; oyun train[1] kullanmaz).
+
+        Tablo sütunları her zaman SA_QUEUE_TABLE_TROOP_KEYS sırasındadır; sendable listesinin
+        enumerate indeksi kullanılmamalı (okçu/mercek yoksa birimler kayar → yanlış birim).
+        """
         rows = []
+        col_of = {k: i for i, k in enumerate(SA_QUEUE_TABLE_TROOP_KEYS)}
         for idx in batch_indices[1:]:
             item = self.sa_table.topLevelItem(idx)
             if not item:
                 continue
             d = {}
-            for col_idx, (key, _) in enumerate(self._sa_sendable_unit_defs()):
+            for key, _ in self._sa_sendable_unit_defs():
+                ci = col_of.get(key)
+                if ci is None:
+                    d[key] = 0
+                    continue
                 try:
-                    val = int(item.text(col_idx + 2) or 0)
+                    val = int(item.text(ci + 2) or 0)
                 except ValueError:
                     val = 0
-                # Oyun boş birimleri de gönderir (train[2][sword]=); 0 dahil tüm anahtarlar
                 d[key] = val
-            # Mancınık hedefi: train[N][building] (boşsa duvar)
             if int(d.get("catapult", 0) or 0) > 0:
                 d["_building"] = self._sa_item_catapult_building(item) or SA_CATAPULT_DEFAULT_BUILDING
             rows.append(d)
@@ -12221,85 +13365,7 @@ class TribalWarsBot(QMainWindow):
                 return !!__twExtractCh(cf, html);
             }}
 
-            function __twSubmitConfirmValue(cf) {{
-                var sb = cf.querySelector('input[type="submit"][name="submit_confirm"], button[type="submit"][name="submit_confirm"], input[name="submit_confirm"], button[name="submit_confirm"]');
-                if (!sb) return 'true';
-                if (sb.value != null && String(sb.value) !== '') return String(sb.value);
-                var a = sb.getAttribute('value');
-                return (a && String(a)) || 'true';
-            }}
-            function __twTrainDomSkip(inpName, extraTrainRows) {{
-                extraTrainRows = extraTrainRows || [];
-                if (!extraTrainRows.length) return false;
-                var trainM = inpName.match(/^train\\[(\\d+)\\]\\[([^\\]]+)\\]$/);
-                if (!trainM) return false;
-                var tix = parseInt(trainM[1], 10);
-                /* Oyun: 1. dalga ana form; ek saldırılar train[2]..train[N+1] (train[1] yok) */
-                var erowIdx = tix - 2;
-                if (erowIdx < 0 || erowIdx >= extraTrainRows.length) return false;
-                var ukey = trainM[2];
-                var erow = extraTrainRows[erowIdx];
-                return !!(erow && Object.prototype.hasOwnProperty.call(erow, ukey));
-            }}
-            function __twAppendConfirmBody(cf, html, extraTrainRows, buildingTarget) {{
-                extraTrainRows = extraTrainRows || [];
-                buildingTarget = buildingTarget || '';
-                var cd = new URLSearchParams();
-                cf.querySelectorAll('input[type="hidden"], input[name="ch"], input[type="submit"][name="ch"], button[name="ch"]').forEach(function(h) {{
-                    if (h.name && h.name !== 'submit_confirm') cd.append(h.name, h.value || '');
-                }});
-                if (!cd.get('ch')) {{
-                    var cv = __twExtractCh(cf, html);
-                    if (cv) cd.append('ch', cv);
-                }}
-                var pu = cf.querySelector('#place_confirm_units');
-                if (pu) {{
-                    pu.querySelectorAll('input[type="number"][name], input[type="text"][name]').forEach(function(inp) {{
-                        if (!inp.name || inp.name === 'submit_confirm') return;
-                        if (__twTrainDomSkip(inp.name, extraTrainRows)) return;
-                        cd.append(inp.name, inp.value != null ? String(inp.value) : '');
-                    }});
-                    pu.querySelectorAll('select[name]').forEach(function(sel) {{
-                        if (!sel.name) return;
-                        if (__twTrainDomSkip(sel.name, extraTrainRows)) return;
-                        cd.append(sel.name, sel.value || '');
-                    }});
-                    pu.querySelectorAll('input[type="checkbox"][name]').forEach(function(cb) {{
-                        if (!cb.name) return;
-                        if (__twTrainDomSkip(cb.name, extraTrainRows)) return;
-                        if (cb.checked) cd.append(cb.name, cb.value || '1');
-                    }});
-                }}
-                /* Mancınık hedefi formun her yerinde olabilir (#place_confirm_units dışı) */
-                cf.querySelectorAll('select[name="building"], input[name="building"]').forEach(function(el) {{
-                    if (!el.name) return;
-                    cd.append(el.name, el.value || '');
-                }});
-                if (buildingTarget) {{
-                    try {{ cd.delete('building'); }} catch (eDel) {{}}
-                    cd.set('building', buildingTarget);
-                }}
-                for (var ti = 0; ti < extraTrainRows.length; ti++) {{
-                    var row = extraTrainRows[ti];
-                    if (!row || typeof row !== 'object') continue;
-                    var tidx = ti + 2;
-                    for (var uk in row) {{
-                        if (!Object.prototype.hasOwnProperty.call(row, uk)) continue;
-                        if (uk === '_building' || uk.charAt(0) === '_') continue;
-                        var nv = parseInt(row[uk], 10);
-                        if (!isNaN(nv) && nv > 0)
-                            cd.append('train[' + tidx + '][' + uk + ']', String(nv));
-                        else
-                            cd.append('train[' + tidx + '][' + uk + ']', '');
-                    }}
-                    var tb = row._building || buildingTarget || '';
-                    if (tb && parseInt(row.catapult || 0, 10) > 0) {{
-                        cd.append('train[' + tidx + '][building]', String(tb));
-                    }}
-                }}
-                cd.append('submit_confirm', __twSubmitConfirmValue(cf));
-                return cd.toString();
-            }}
+<<<DISPATCH_CONFIRM_HELPERS>>>
 
             function __twWaitCache(key, attempt, done) {{
                 var c = window.__tw_bot_cache && window.__tw_bot_cache[key];
@@ -12336,15 +13402,30 @@ class TribalWarsBot(QMainWindow):
                 }})
                 .then(function(r) {{ return r.text(); }})
                 .then(function(confirmHtml) {{
-                    if (!confirmHtml) return;
+                    if (!window.__tw_bot_results) window.__tw_bot_results = {{}};
+                    if (!window.__tw_bot_fire) window.__tw_bot_fire = {{}};
+                    if (!confirmHtml) {{
+                        window.__tw_bot_results[cmdId] = 'ERROR|Onay sayfasi bos';
+                        return;
+                    }}
+                    if (/hcaptcha|botprotection|bot\\s*koruma|captcha/i.test(confirmHtml)) {{
+                        window.__tw_bot_results[cmdId] = 'ERROR|BOTPROT|Dogrulama sayfasi';
+                        return;
+                    }}
 
                     var doc2 = new DOMParser().parseFromString(confirmHtml, 'text/html');
                     var cf = __twFindConfirmForm(doc2);
-                    if (!cf || !__twFormHasCh(cf, confirmHtml)) return;
+                    if (!cf || !__twFormHasCh(cf, confirmHtml)) {{
+                        window.__tw_bot_results[cmdId] = 'ERROR|Onay formu/ch yok (preconfirm)';
+                        return;
+                    }}
 
-                    var bodyStr = __twAppendConfirmBody(cf, confirmHtml, extraTrainRows, buildingTarget);
-                    var actionUrl = cf.getAttribute('action');
-                    if (!actionUrl) return;
+                    var bodyStr = __twAppendConfirmBody(cf, confirmHtml, extraTrainRows, buildingTarget, attackType);
+                    var actionUrl = __twResolveFormAction(cf.getAttribute('action'));
+                    if (!actionUrl) {{
+                        window.__tw_bot_results[cmdId] = 'ERROR|Form action yok';
+                        return;
+                    }}
 
                     window.__tw_bot_fire[cmdId] = function() {{
                         window.__tw_bot_results[cmdId] = 'SENDING';
@@ -12355,7 +13436,12 @@ class TribalWarsBot(QMainWindow):
                             credentials: 'same-origin'
                         }})
                         .then(function(r) {{ return r.text(); }})
-                        .then(function() {{
+                        .then(function(html) {{
+                            var chk = __twParseCommandResult(html);
+                            if (chk !== 'OK') {{
+                                window.__tw_bot_results[cmdId] = chk;
+                                return;
+                            }}
                             window.__tw_bot_results[cmdId] = 'SENT_OK';
                         }})
                         .catch(function(e) {{
@@ -12392,6 +13478,9 @@ class TribalWarsBot(QMainWindow):
         }})();
         """
 
+        preconfirm_js = preconfirm_js.replace(
+            "<<<DISPATCH_CONFIRM_HELPERS>>>", _DISPATCH_CONFIRM_JS_HELPERS
+        )
         self.browser.page().runJavaScript(preconfirm_js)
         item.setData(0, Qt.UserRole, "confirmed")
         item.setData(2, Qt.UserRole, cmd_id)
@@ -12543,84 +13632,7 @@ class TribalWarsBot(QMainWindow):
             function __twFormHasCh(cf, html) {{
                 return !!__twExtractCh(cf, html);
             }}
-            function __twSubmitConfirmValue(cf) {{
-                var sb = cf.querySelector('input[type="submit"][name="submit_confirm"], button[type="submit"][name="submit_confirm"], input[name="submit_confirm"], button[name="submit_confirm"]');
-                if (!sb) return 'true';
-                if (sb.value != null && String(sb.value) !== '') return String(sb.value);
-                var a = sb.getAttribute('value');
-                return (a && String(a)) || 'true';
-            }}
-            function __twTrainDomSkip(inpName, extraTrainRows) {{
-                extraTrainRows = extraTrainRows || [];
-                if (!extraTrainRows.length) return false;
-                var trainM = inpName.match(/^train\\[(\\d+)\\]\\[([^\\]]+)\\]$/);
-                if (!trainM) return false;
-                var tix = parseInt(trainM[1], 10);
-                var ukey = trainM[2];
-                /* Oyun: 1. dalga ana form; ek saldırılar train[2]..train[N+1] (train[1] yok) */
-                var erowIdx = tix - 2;
-                if (erowIdx < 0 || erowIdx >= extraTrainRows.length) return false;
-                var erow = extraTrainRows[erowIdx];
-                return !!(erow && Object.prototype.hasOwnProperty.call(erow, ukey));
-            }}
-            function __twAppendConfirmBody(cf, html, extraTrainRows, buildingTarget) {{
-                extraTrainRows = extraTrainRows || [];
-                buildingTarget = buildingTarget || '';
-                var cd = new URLSearchParams();
-                cf.querySelectorAll('input[type="hidden"], input[name="ch"], input[type="submit"][name="ch"], button[name="ch"]').forEach(function(h) {{
-                    if (h.name && h.name !== 'submit_confirm') cd.append(h.name, h.value || '');
-                }});
-                if (!cd.get('ch')) {{
-                    var cv = __twExtractCh(cf, html);
-                    if (cv) cd.append('ch', cv);
-                }}
-                var pu = cf.querySelector('#place_confirm_units');
-                if (pu) {{
-                    pu.querySelectorAll('input[type="number"][name], input[type="text"][name]').forEach(function(inp) {{
-                        if (!inp.name || inp.name === 'submit_confirm') return;
-                        if (__twTrainDomSkip(inp.name, extraTrainRows)) return;
-                        cd.append(inp.name, inp.value != null ? String(inp.value) : '');
-                    }});
-                    pu.querySelectorAll('select[name]').forEach(function(sel) {{
-                        if (!sel.name) return;
-                        if (__twTrainDomSkip(sel.name, extraTrainRows)) return;
-                        cd.append(sel.name, sel.value || '');
-                    }});
-                    pu.querySelectorAll('input[type="checkbox"][name]').forEach(function(cb) {{
-                        if (!cb.name) return;
-                        if (__twTrainDomSkip(cb.name, extraTrainRows)) return;
-                        if (cb.checked) cd.append(cb.name, cb.value || '1');
-                    }});
-                }}
-                cf.querySelectorAll('select[name="building"], input[name="building"]').forEach(function(el) {{
-                    if (!el.name) return;
-                    cd.append(el.name, el.value || '');
-                }});
-                if (buildingTarget) {{
-                    try {{ cd.delete('building'); }} catch (eDel) {{}}
-                    cd.set('building', buildingTarget);
-                }}
-                for (var ti = 0; ti < extraTrainRows.length; ti++) {{
-                    var row = extraTrainRows[ti];
-                    if (!row || typeof row !== 'object') continue;
-                    var tidx = ti + 2;
-                    for (var uk in row) {{
-                        if (!Object.prototype.hasOwnProperty.call(row, uk)) continue;
-                        if (uk === '_building' || uk.charAt(0) === '_') continue;
-                        var nv = parseInt(row[uk], 10);
-                        if (!isNaN(nv) && nv > 0)
-                            cd.append('train[' + tidx + '][' + uk + ']', String(nv));
-                        else
-                            cd.append('train[' + tidx + '][' + uk + ']', '');
-                    }}
-                    var tb = row._building || buildingTarget || '';
-                    if (tb && parseInt(row.catapult || 0, 10) > 0) {{
-                        cd.append('train[' + tidx + '][building]', String(tb));
-                    }}
-                }}
-                cd.append('submit_confirm', __twSubmitConfirmValue(cf));
-                return cd.toString();
-            }}
+<<<DISPATCH_CONFIRM_HELPERS>>>
 
             if (!window.__tw_bot_results) window.__tw_bot_results = {{}};
 
@@ -12713,8 +13725,8 @@ class TribalWarsBot(QMainWindow):
                     window.__tw_bot_results[cmdId] = 'ERROR|ch token bulunamadi';
                     return;
                 }}
-                var bodyStr = __twAppendConfirmBody(cf, confirmHtml, extraTrainRows, buildingTarget);
-                var actionUrl = cf.getAttribute('action');
+                var bodyStr = __twAppendConfirmBody(cf, confirmHtml, extraTrainRows, buildingTarget, attackType);
+                var actionUrl = __twResolveFormAction(cf.getAttribute('action'));
                 if (!actionUrl) {{
                     window.__tw_bot_results[cmdId] = 'ERROR|Form action yok';
                     return;
@@ -12728,8 +13740,13 @@ class TribalWarsBot(QMainWindow):
                 }});
             }})
             .then(function(r) {{ if (r) return r.text(); }})
-            .then(function() {{
+            .then(function(html) {{
                 if (window.__tw_bot_results[cmdId] && window.__tw_bot_results[cmdId].startsWith('ERROR')) return;
+                var chk = __twParseCommandResult(html);
+                if (chk !== 'OK') {{
+                    window.__tw_bot_results[cmdId] = chk;
+                    return;
+                }}
                 window.__tw_bot_results[cmdId] = 'SENT_OK';
             }})
             .catch(function(err) {{
@@ -12739,6 +13756,9 @@ class TribalWarsBot(QMainWindow):
         }})();
         """
 
+        send_js = send_js.replace(
+            "<<<DISPATCH_CONFIRM_HELPERS>>>", _DISPATCH_CONFIRM_JS_HELPERS
+        )
         wave_tag = f" [{len(batch_items)} dalga]" if len(batch_items) > 1 else ""
         cat_b = self._sa_item_catapult_building(item)
         self._add_log("GÖNDERİM", "info",
@@ -17935,18 +18955,148 @@ class TribalWarsBot(QMainWindow):
         pv_lay.setContentsMargins(0, 0, 0, 0)
         pv_lay.setSpacing(4)
 
+        # Üst: sol = köy seçimi + birimler | sağ = evde tut / seviye / off-def / dağıtım
+        pv_top = QHBoxLayout()
+        pv_top.setSpacing(8)
+
+        pv_left = QWidget()
+        pv_left_lay = QVBoxLayout(pv_left)
+        pv_left_lay.setContentsMargins(0, 0, 0, 0)
+        pv_left_lay.setSpacing(4)
+
         pv_vsel = QGroupBox("1. Köyleri seçin")
         pv_vsel_lay = QVBoxLayout(pv_vsel)
         pv_vsel_lay.setContentsMargins(4, 4, 4, 4)
         self.scav_vsel_table = QTreeWidget()
         self.scav_vsel_table.setRootIsDecorated(False)
         self.scav_vsel_table.setAlternatingRowColors(True)
-        self.scav_vsel_table.setHeaderLabels(["Köy", "Koordinat"])
+        self.scav_vsel_table.setUniformRowHeights(True)
+        self.scav_vsel_table.setHeaderLabels(["Köy (koordinat)"])
         self.scav_vsel_table.header().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.scav_vsel_table.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.scav_vsel_table.setMaximumHeight(140)
+        self.scav_vsel_table.setMinimumWidth(220)
+        self.scav_vsel_table.setMaximumHeight(160)
         pv_vsel_lay.addWidget(self.scav_vsel_table)
-        pv_lay.addWidget(pv_vsel)
+        pv_left_lay.addWidget(pv_vsel)
+        pv_top.addWidget(pv_left, 3)
+
+        # Ortak ayarlar (köy köyde sağda; toplu modda tam genişlik — reparent)
+        self.scav_shared_opts = QGroupBox("Evde tut / seviye / dağıtım")
+        shared_lay = QVBoxLayout(self.scav_shared_opts)
+        shared_lay.setContentsMargins(6, 6, 6, 6)
+        shared_lay.setSpacing(6)
+
+        kh_grid = QGridLayout()
+        kh_grid.setHorizontalSpacing(4)
+        kh_grid.setVerticalSpacing(2)
+        kh_title = QLabel("Evde tut:")
+        kh_title.setStyleSheet("font-weight: bold;")
+        shared_lay.addWidget(kh_title)
+        self.scav_keep_home = {}
+        for i, (key, name) in enumerate(self.SCAV_UNITS):
+            r, c = divmod(i, 2)
+            cell = QHBoxLayout()
+            cell.setSpacing(2)
+            lab = QLabel(name)
+            lab.setStyleSheet("font-size: 10px;")
+            lab.setMinimumWidth(52)
+            cell.addWidget(lab)
+            kh = QSpinBox()
+            kh.setRange(0, 999999)
+            kh.setFixedWidth(58)
+            kh.setToolTip(f"{name} — köyde bırakılacak minimum")
+            self.scav_keep_home[key] = kh
+            cell.addWidget(kh)
+            cell.addStretch()
+            kh_grid.addLayout(cell, r, c)
+        shared_lay.addLayout(kh_grid)
+
+        cat_row = QHBoxLayout()
+        cat_row.addWidget(QLabel("Seviyeler:"))
+        self.scav_cat_cbs = {}
+        for oid, lbl in [
+            (1, "Sv1 %10"), (2, "Sv2 %25"), (3, "Sv3 %50"), (4, "Sv4 %75"),
+        ]:
+            cb = QCheckBox(lbl)
+            cb.setChecked(True)
+            cb.setStyleSheet("font-size: 10px;")
+            self.scav_cat_cbs[oid] = cb
+            cat_row.addWidget(cb)
+        cat_row.addStretch()
+        shared_lay.addLayout(cat_row)
+
+        rt_hint = QLabel(
+            "Köy tipi: off toplamı > def → Off satırı; aksi halde Def."
+        )
+        rt_hint.setWordWrap(True)
+        rt_hint.setStyleSheet("font-size: 9px; color: #666;")
+        shared_lay.addWidget(rt_hint)
+        rt_sub = QHBoxLayout()
+        rt_sub.setSpacing(6)
+        rt_sub.addWidget(QLabel("Off:"))
+        self.scav_rt_off = QDoubleSpinBox()
+        self.scav_rt_off.setRange(0.1, 24.0)
+        self.scav_rt_off.setSingleStep(0.5)
+        self.scav_rt_off.setDecimals(2)
+        self.scav_rt_off.setValue(4.0)
+        self.scav_rt_off.setMinimumWidth(72)
+        self.scav_rt_off.setToolTip(
+            "Köyde (köy ekranındaki) off birim toplamı def’ten fazlaysa kullanılan hedef dönüş süresi saat."
+        )
+        rt_sub.addWidget(self.scav_rt_off)
+        rt_sub.addWidget(QLabel("saat"))
+        rt_sub.addSpacing(8)
+        rt_sub.addWidget(QLabel("Def:"))
+        self.scav_rt_def = QDoubleSpinBox()
+        self.scav_rt_def.setRange(0.1, 24.0)
+        self.scav_rt_def.setSingleStep(0.5)
+        self.scav_rt_def.setDecimals(2)
+        self.scav_rt_def.setValue(3.0)
+        self.scav_rt_def.setMinimumWidth(72)
+        self.scav_rt_def.setToolTip(
+            "Köyde def birim toplamı off’a eşit veya fazlaysa kullanılan hedef dönüş süresi saat."
+        )
+        rt_sub.addWidget(self.scav_rt_def)
+        rt_sub.addWidget(QLabel("saat"))
+        rt_sub.addStretch()
+        shared_lay.addLayout(rt_sub)
+
+        prio_col = QVBoxLayout()
+        prio_col.setSpacing(2)
+        prio_col.addWidget(QLabel("Dağıtım:"))
+        self.scav_prio_group = QButtonGroup(self)
+        self.scav_prio_balanced = QRadioButton("Dengeli (çok asker + tüm kategoriler)")
+        self.scav_prio_highfirst = QRadioButton("Önce yüksek kategori (Sophie)")
+        self.scav_prio_balanced.setChecked(True)
+        self.scav_prio_balanced.setStyleSheet("font-size: 10px;")
+        self.scav_prio_highfirst.setStyleSheet("font-size: 10px;")
+        self.scav_prio_group.addButton(self.scav_prio_balanced, 0)
+        self.scav_prio_group.addButton(self.scav_prio_highfirst, 1)
+        prio_col.addWidget(self.scav_prio_balanced)
+        prio_col.addWidget(self.scav_prio_highfirst)
+        shared_lay.addLayout(prio_col)
+        shared_lay.addStretch(1)
+
+        self.scav_shared_opts.setMinimumWidth(280)
+        self.scav_shared_opts.setMaximumWidth(360)
+        pv_top.addWidget(self.scav_shared_opts, 2)
+        pv_lay.addLayout(pv_top)
+        self.scav_pv_panel.setVisible(False)
+        opt_layout.addWidget(self.scav_pv_panel)
+        # Toplu modda shared opts paneli köy panelinin dışında (tam genişlik)
+        self._scav_shared_opts_mass_host = QWidget()
+        mass_host_lay = QVBoxLayout(self._scav_shared_opts_mass_host)
+        mass_host_lay.setContentsMargins(0, 0, 0, 0)
+        mass_host_lay.setSpacing(0)
+        opt_layout.addWidget(self._scav_shared_opts_mass_host)
+
+        opt_scroll.setWidget(opt_inner)
+        scav_split.addWidget(opt_scroll)
+
+        # Birim seç + aktif liste: scroll dışında her zaman görünür
+        self.scav_pv_mid_box = QWidget()
+        mid_lay = QVBoxLayout(self.scav_pv_mid_box)
+        mid_lay.setContentsMargins(0, 0, 0, 0)
+        mid_lay.setSpacing(4)
 
         pv_urow = QHBoxLayout()
         pv_usel = QGroupBox("2. Birimleri seçip Ekle")
@@ -17968,13 +19118,13 @@ class TribalWarsBot(QMainWindow):
         self.scav_pv_add_btn.setObjectName("startBtn")
         self.scav_pv_add_btn.setCursor(Qt.PointingHandCursor)
         self.scav_pv_add_btn.setMinimumWidth(80)
-        self.scav_pv_add_btn.setMinimumHeight(40)
+        self.scav_pv_add_btn.setMinimumHeight(36)
         self.scav_pv_add_btn.clicked.connect(self._scav_pv_add_villages)
         pv_urow.addWidget(self.scav_pv_add_btn)
-        pv_lay.addLayout(pv_urow)
+        mid_lay.addLayout(pv_urow)
 
-        pv_active = QGroupBox("Aktif temizlik köyleri")
-        pv_active_lay = QVBoxLayout(pv_active)
+        self.scav_pv_active_box = QGroupBox("Aktif temizlik köyleri")
+        pv_active_lay = QVBoxLayout(self.scav_pv_active_box)
         pv_active_lay.setContentsMargins(4, 4, 4, 4)
         self.scav_pv_table = QTreeWidget()
         self.scav_pv_table.setRootIsDecorated(False)
@@ -17984,7 +19134,8 @@ class TribalWarsBot(QMainWindow):
         self.scav_pv_table.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self.scav_pv_table.header().setSectionResizeMode(1, QHeaderView.Stretch)
         self.scav_pv_table.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.scav_pv_table.setMaximumHeight(160)
+        self.scav_pv_table.setMinimumHeight(80)
+        self.scav_pv_table.setMaximumHeight(150)
         pv_active_lay.addWidget(self.scav_pv_table)
         pv_btn_row = QHBoxLayout()
         self.scav_pv_remove_btn = QPushButton("Seçileni kaldır")
@@ -17995,98 +19146,11 @@ class TribalWarsBot(QMainWindow):
         pv_btn_row.addWidget(self.scav_pv_clear_btn)
         pv_btn_row.addStretch()
         pv_active_lay.addLayout(pv_btn_row)
-        pv_lay.addWidget(pv_active)
-        self.scav_pv_panel.setVisible(False)
-        opt_layout.addWidget(self.scav_pv_panel)
+        mid_lay.addWidget(self.scav_pv_active_box)
+        self.scav_pv_mid_box.setVisible(False)
+        scav_split.addWidget(self.scav_pv_mid_box)
 
-        # Evde tut (Sophie keepHome)
-        kh_row = QHBoxLayout()
-        kh_row.addWidget(QLabel("Evde tut:"))
-        self.scav_keep_home = {}
-        for key, name in self.SCAV_UNITS:
-            kh_row.addWidget(QLabel(name))
-            kh = QSpinBox()
-            kh.setRange(0, 999999)
-            kh.setFixedWidth(64)
-            kh.setToolTip(f"{name} — köyde bırakılacak minimum")
-            self.scav_keep_home[key] = kh
-            kh_row.addWidget(kh)
-        kh_row.addStretch()
-        opt_layout.addLayout(kh_row)
-
-        # Kullanılacak temizlik seviyeleri (Sv1–Sv4)
-        cat_row = QHBoxLayout()
-        cat_row.addWidget(QLabel("Seviyeler:"))
-        self.scav_cat_cbs = {}
-        for oid, lbl in [
-            (1, "Sv1 %10"), (2, "Sv2 %25"), (3, "Sv3 %50"), (4, "Sv4 %75"),
-        ]:
-            cb = QCheckBox(lbl)
-            cb.setChecked(True)
-            cb.setStyleSheet("font-size: 10px;")
-            self.scav_cat_cbs[oid] = cb
-            cat_row.addWidget(cb)
-        cat_row.addStretch()
-        opt_layout.addLayout(cat_row)
-
-        # Hedef dönüş süresi (saat) — off/def köy (Sophie runTimes); iki satırda taşma olmasın
-        rt_block = QVBoxLayout()
-        rt_block.setSpacing(4)
-        rt_hint = QLabel(
-            "Köy tipi, köydeki tüm birim sayılarına göre belirlenir (off toplamı > def toplamı → üst satır)."
-        )
-        rt_hint.setWordWrap(True)
-        rt_hint.setStyleSheet("font-size: 9px; color: #666;")
-        rt_block.addWidget(rt_hint)
-        rt_sub = QHBoxLayout()
-        rt_sub.setSpacing(8)
-        rt_sub.addWidget(QLabel("Off köyleri:"))
-        self.scav_rt_off = QDoubleSpinBox()
-        self.scav_rt_off.setRange(0.1, 24.0)
-        self.scav_rt_off.setSingleStep(0.5)
-        self.scav_rt_off.setDecimals(2)
-        self.scav_rt_off.setValue(4.0)
-        self.scav_rt_off.setMinimumWidth(88)
-        self.scav_rt_off.setToolTip(
-            "Köyde (köy ekranındaki) off birim toplamı def’ten fazlaysa kullanılan hedef dönüş süresi saat."
-        )
-        rt_sub.addWidget(self.scav_rt_off)
-        rt_sub.addWidget(QLabel("saat"))
-        rt_sub.addSpacing(20)
-        rt_sub.addWidget(QLabel("Def köyleri:"))
-        self.scav_rt_def = QDoubleSpinBox()
-        self.scav_rt_def.setRange(0.1, 24.0)
-        self.scav_rt_def.setSingleStep(0.5)
-        self.scav_rt_def.setDecimals(2)
-        self.scav_rt_def.setValue(3.0)
-        self.scav_rt_def.setMinimumWidth(88)
-        self.scav_rt_def.setToolTip(
-            "Köyde def birim toplamı off’a eşit veya fazlaysa kullanılan hedef dönüş süresi saat."
-        )
-        rt_sub.addWidget(self.scav_rt_def)
-        rt_sub.addWidget(QLabel("saat"))
-        rt_sub.addStretch()
-        rt_block.addLayout(rt_sub)
-        opt_layout.addLayout(rt_block)
-
-        # Dağıtım modu (Sophie prioritiseHighCat / balanced)
-        prio_row = QHBoxLayout()
-        prio_row.addWidget(QLabel("Dağıtım:"))
-        self.scav_prio_group = QButtonGroup(self)
-        self.scav_prio_balanced = QRadioButton("Dengeli (çok asker + tüm kategoriler)")
-        self.scav_prio_highfirst = QRadioButton("Önce yüksek kategori doldur (Sophie öncelik)")
-        self.scav_prio_balanced.setChecked(True)
-        self.scav_prio_group.addButton(self.scav_prio_balanced, 0)
-        self.scav_prio_group.addButton(self.scav_prio_highfirst, 1)
-        prio_row.addWidget(self.scav_prio_balanced)
-        prio_row.addWidget(self.scav_prio_highfirst)
-        prio_row.addStretch()
-        opt_layout.addLayout(prio_row)
-
-        opt_scroll.setWidget(opt_inner)
-        scav_split.addWidget(opt_scroll)
-
-        # Köy tablosu
+        # Köy durum tablosu
         self.scav_table = QTreeWidget()
         self.scav_table.setAlternatingRowColors(True)
         self.scav_table.setRootIsDecorated(False)
@@ -18104,8 +19168,10 @@ class TribalWarsBot(QMainWindow):
                 self.scav_table.setColumnWidth(i, 76 if i <= 4 else 88)
         scav_split.addWidget(self.scav_table)
         scav_split.setStretchFactor(0, 0)
-        scav_split.setStretchFactor(1, 1)
-        scav_split.setSizes([320, 480])
+        scav_split.setStretchFactor(1, 0)
+        scav_split.setStretchFactor(2, 1)
+        scav_split.setSizes([220, 200, 400])
+        self.scav_split = scav_split
         layout.addWidget(scav_split, 1)
         self.scav_tab = tab
         self.tabs.addTab(tab, "🧹 Temizlik")
@@ -18133,6 +19199,51 @@ class TribalWarsBot(QMainWindow):
             return "village"
         return "mass"
 
+    def _scav_place_shared_opts(self, village_mode: bool) -> None:
+        """Köy köy: ayarlar seçim tablosunun sağında; toplu: panel dışı tam genişlik."""
+        opts = getattr(self, "scav_shared_opts", None)
+        if opts is None:
+            return
+        mass_host = getattr(self, "_scav_shared_opts_mass_host", None)
+        pv_panel = getattr(self, "scav_pv_panel", None)
+        if mass_host is None or pv_panel is None:
+            return
+
+        pv_top = None
+        pl = pv_panel.layout()
+        if pl is not None and pl.count() > 0:
+            it0 = pl.itemAt(0)
+            if it0 is not None:
+                pv_top = it0.layout()
+
+        def _in_layout(lay, widget):
+            if lay is None:
+                return False
+            for i in range(lay.count()):
+                w = lay.itemAt(i).widget()
+                if w is widget:
+                    return True
+            return False
+
+        if village_mode:
+            if mass_host.layout() is not None and _in_layout(mass_host.layout(), opts):
+                mass_host.layout().removeWidget(opts)
+            opts.setMaximumWidth(360)
+            opts.setMinimumWidth(280)
+            if pv_top is not None and not _in_layout(pv_top, opts):
+                opts.setParent(None)
+                pv_top.addWidget(opts, 2)
+            opts.show()
+        else:
+            if pv_top is not None and _in_layout(pv_top, opts):
+                pv_top.removeWidget(opts)
+            opts.setMaximumWidth(16777215)
+            opts.setMinimumWidth(0)
+            if mass_host.layout() is not None and not _in_layout(mass_host.layout(), opts):
+                opts.setParent(None)
+                mass_host.layout().addWidget(opts)
+            opts.show()
+
     def _scav_on_mode_changed(self, *_args):
         village = self._scav_get_mode() == "village"
         if hasattr(self, "scav_mass_units_wrap"):
@@ -18141,6 +19252,20 @@ class TribalWarsBot(QMainWindow):
             self.scav_group_row_wrap.setVisible(not village)
         if hasattr(self, "scav_pv_panel"):
             self.scav_pv_panel.setVisible(village)
+        if hasattr(self, "scav_pv_mid_box"):
+            self.scav_pv_mid_box.setVisible(village)
+        elif hasattr(self, "scav_pv_active_box"):
+            self.scav_pv_active_box.setVisible(village)
+        if hasattr(self, "_scav_shared_opts_mass_host"):
+            self._scav_shared_opts_mass_host.setVisible(not village)
+        self._scav_place_shared_opts(village)
+        # Köy köyde birim+aktif liste görünsün; durum tablosu alta kalsın
+        split = getattr(self, "scav_split", None)
+        if split is not None and village:
+            try:
+                split.setSizes([220, 200, 400])
+            except Exception:
+                pass
         try:
             self._settings.setValue("scav/mode", "village" if village else "mass")
         except Exception:
@@ -18168,10 +19293,14 @@ class TribalWarsBot(QMainWindow):
                 continue
             coord = f"({v.get('x', '?')}|{v.get('y', '?')})"
             name = v.get("name", "?")
-            row = QTreeWidgetItem([name, coord])
+            # Tek sütun: isim + koordinat yan yana (isim sıkışmasın)
+            row = QTreeWidgetItem([f"{name}  {coord}"])
             row.setCheckState(0, Qt.Unchecked)
             row.setFlags(row.flags() | Qt.ItemIsUserCheckable)
             row.setData(0, Qt.UserRole, vid)
+            row.setData(0, Qt.UserRole + 1, name)
+            row.setData(0, Qt.UserRole + 2, coord)
+            row.setToolTip(0, f"{name}\n{coord}")
             self.scav_vsel_table.addTopLevelItem(row)
         profiles = getattr(self, "_scav_village_profiles", {}) or {}
         for v in all_v:
@@ -18181,17 +19310,45 @@ class TribalWarsBot(QMainWindow):
                 continue
             coord = f"({v.get('x', '?')}|{v.get('y', '?')})"
             st["row"].setText(0, f"{v.get('name', '?')} {coord}")
+        self._scav_vsel_sync_active_highlight()
+
+    def _scav_vsel_sync_active_highlight(self) -> None:
+        """Aktif temizlik listesindeki köyleri seçim tablosunda yeşil göster."""
+        if not hasattr(self, "scav_vsel_table"):
+            return
+        active = set((getattr(self, "_scav_village_profiles", None) or {}).keys())
+        green = QColor("#c8e6c9")
+        green_fg = QColor("#1b5e20")
+        for i in range(self.scav_vsel_table.topLevelItemCount()):
+            it = self.scav_vsel_table.topLevelItem(i)
+            if not it:
+                continue
+            vid = str(it.data(0, Qt.UserRole) or "")
+            if vid and vid in active:
+                it.setBackground(0, green)
+                it.setForeground(0, green_fg)
+            else:
+                it.setBackground(0, QBrush())
+                it.setForeground(0, QBrush())
 
     def _scav_pv_add_villages(self):
         if not hasattr(self, "scav_vsel_table"):
             return
         checked = []
+        checked_items = []
         for i in range(self.scav_vsel_table.topLevelItemCount()):
             it = self.scav_vsel_table.topLevelItem(i)
             if it and it.checkState(0) == Qt.Checked:
                 vid = it.data(0, Qt.UserRole)
                 if vid:
-                    checked.append((str(vid), it.text(0), it.text(1)))
+                    name = it.data(0, Qt.UserRole + 1) or (it.text(0) or "").split("  (")[0]
+                    coord = it.data(0, Qt.UserRole + 2) or ""
+                    if not coord:
+                        m = re.search(r"\((\d+)\|(\d+)\)", it.text(0) or "")
+                        if m:
+                            coord = f"({m.group(1)}|{m.group(2)})"
+                    checked.append((str(vid), name, coord))
+                    checked_items.append(it)
         if not checked:
             QMessageBox.warning(self, "Uyarı", "Üst listeden en az bir köy seçin.")
             return
@@ -18220,6 +19377,9 @@ class TribalWarsBot(QMainWindow):
                 self.scav_pv_table.addTopLevelItem(row)
                 self._scav_village_profiles[vid] = {"units": set(selected_units), "row": row}
                 added += 1
+        for it in checked_items:
+            it.setCheckState(0, Qt.Unchecked)
+        self._scav_vsel_sync_active_highlight()
         self._scav_save_profiles()
         parts = []
         if added:
@@ -18243,12 +19403,14 @@ class TribalWarsBot(QMainWindow):
                     self.scav_pv_table.takeTopLevelItem(idx)
                 del self._scav_village_profiles[vid]
         self._scav_save_profiles()
+        self._scav_vsel_sync_active_highlight()
 
     def _scav_pv_clear(self):
         if hasattr(self, "scav_pv_table"):
             self.scav_pv_table.clear()
         self._scav_village_profiles = {}
         self._scav_save_profiles()
+        self._scav_vsel_sync_active_highlight()
         self._add_log("TEMİZLİK", "info", "Köy köy liste temizlendi")
 
     def _scav_save_profiles(self):

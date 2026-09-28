@@ -1,5 +1,5 @@
 {
-  "version": "1.4.11",
-  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.11/TribalWarsBot-1.4.11.zip",
-  "changelog_tr": "Misyoner/çoklu dalga: onay POST’ta train[2]… train[N] (oyunla aynı; train[1] yok) — 4’lü tren düzeltmesi.\nÇoklu tarayıcı sekmesi (ortak oturum, en fazla 6) ve F5 ile yenileme.\nHarita koordinat seçici filtreleri.\nv1.4.10 güncelleme SSL / botprot dahil."
+  "version": "1.4.12",
+  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.12/TribalWarsBot-1.4.12.zip",
+  "changelog_tr": "Place onay: varış kutusu + Tabloya ekle (çoklu dalga train[2…]); sağda Evolved tarzı doldurma paneli.\nÇoklu dalga sütun kayması düzeltmesi (mancınık/misyoner).\nOnay gönderiminde yanıt doğrulama + fake limit yok sayılır.\nTemizlik köy-köy: kompakt seçim, yeşil aktif köyler, birim/aktif liste sabit görünür.\nv1.4.11 train[2…] / sekmeler dahil."
 }
