@@ -1,5 +1,5 @@
 {
-  "version": "1.4.14",
-  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.14/TribalWarsBot-1.4.14.zip",
-  "changelog_tr": "Fake planı: köy grubu filtresi, 4'lü tren, komutlar arası 15–20 sn boşluk.\nOrdu Gönder: elle Birlikleri oku + seçim koruma (köy değişince otomatik scrape yok).\nTemizlik: aktif liste ortada, tümünü seç; depo denge Enter basılı tutarak sırayla gönder.\nKurulum: README / baslat / gerekler-kontrol güncellendi."
+  "version": "1.4.15",
+  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.15/TribalWarsBot-1.4.15.zip",
+  "changelog_tr": "Açılış crash düzeltmesi: _sa_refresh_time_mode_button_styles metod tanımı geri yüklendi.\nv1.4.14 fake/ordu/temizlik/depo değişiklikleri dahil."
 }

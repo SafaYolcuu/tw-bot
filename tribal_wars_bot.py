@@ -198,7 +198,7 @@ from license_client import (  # noqa: E402
 # ─────────────────────────────────────────────
 
 # EXE'nin guncel oldugunu dogrulamak icin her onemli degisiklikte artirin.
-APP_VERSION = "1.4.14"
+APP_VERSION = "1.4.15"
 
 # Otomatik guncelleme — kullaniciya GitHub adresi gosterilmez; yalnizca bu URL okunur.
 UPDATE_MANIFEST_URL = "https://safayolcuu.github.io/tw-bot/bot-update.json"
@@ -7456,6 +7456,8 @@ class TribalWarsBot(QMainWindow):
             self._sa_on_source_changed(self.sa_source_combo.currentIndex())
         if hasattr(self, "sa_troops_age_label"):
             self._sa_update_troops_age_label()
+
+    def _sa_refresh_time_mode_button_styles(self):
         """Varış / gönderim zamanı düğmeleri — koyu tema ile uyumlu stiller."""
         active_dark = (
             "background: qlineargradient(y1:0,y2:1,stop:0 #6b5a3d,stop:1 #4a3d28);"
