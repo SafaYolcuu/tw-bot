@@ -20,6 +20,10 @@ if _os.path.isfile(_lic):
 _gunc = _os.path.join(SPECPATH, 'guncelle.bat')
 if _os.path.isfile(_gunc):
     datas += [(_gunc, '.')]
+for _extra_name in ('baslat.bat', 'gerekler-kontrol.bat', 'README_KURULUM.txt'):
+    _extra = _os.path.join(SPECPATH, _extra_name)
+    if _os.path.isfile(_extra):
+        datas += [(_extra, '.')]
 
 # PyQt5 alt modullerini topla
 hiddenimports = collect_submodules('PyQt5')

@@ -1,42 +1,66 @@
-================================================
-  TRIBAL WARS BOT - KURULUM KILAVUZU
-================================================
+================================================================================
+  Tribal Wars Bot — Kurulum ve Sistem Gereksinimleri
+================================================================================
 
-KURULUM:
-  1. TribalWarsBot.zip dosyasini INDIRIN
-  2. ZIP'in TAMAMINI bir klasore cikartin (ornek: C:\TWBot\)
-  3. baslat.bat ile acin (onerilir)
+SISTEM GEREKSINIMLERI
+---------------------
+  • Windows 10 veya 11, 64-bit (x64). 32-bit desteklenmez.
+  • Visual C++ Redistributable 2015–2022 x64 (ZORUNLU):
+      https://aka.ms/vs/17/release/vc_redist.x64.exe
+  • Disk: en az ~400 MB bos alan (ZIP + _internal)
+  • RAM: en az 4 GB (onerilen 8 GB) — gomulu Chromium tarayici
+  • Internet: oyun sunucusu + lisans / guncelleme erisimi
 
-  ONEMLI: Sadece TribalWarsBot.exe YETMEZ!
-  Yaninda _internal ve license_config.json olmali.
+KURULUM (ADIM ADIM)
+-------------------
+  1) ZIP dosyasini bir klasore TAM cikartin
+     (Ornek: C:\Games\TWBot  veya  D:\TribalWarsBot)
+  2) Klasorde sunlar yan yana olmali:
+       TribalWarsBot.exe
+       _internal\          ← bu klasor eksikse bot ACILMAZ
+       baslat.bat
+       gerekler-kontrol.bat
+       README_KURULUM.txt
+  3) VC++ x64 paketini kurun (yukaridaki link).
+  4) Once gerekler-kontrol.bat calistirin; OK ise baslat.bat ile acin.
+  5) Ilk acilista lisans / giris adimlarini tamamlayin.
 
-  Dogru yapi:
-    C:\TWBot\
-      TribalWarsBot.exe
-      _internal\
-      license_config.json
-      baslat.bat
-      README_KURULUM.txt
+YAPMAYIN
+--------
+  • ZIP icinden dogrudan calistirmayin
+  • Temp / Downloads icinden calistirmayin
+  • OneDrive / Google Drive senkron klasorunde tutmayin (DLL kilitlenebilir)
+  • Program Files altina koymaya zorlamayin (yazma izni sorunlari)
 
-YASAK / SIK HATA:
-  - ZIP icinden exe acmak (Temp)
-  - OneDrive / Masaustu (tercihen C:\TWBot\)
-  - Antivirus'un _internal silmesi
+SIK HATALAR
+-----------
+  Hic acilmiyor / aninda kapaniyor
+    → VC++ x64 kurun; ZIP’i yeniden cikarin; antivirus karantinasini kontrol edin
+    → boot.log ve crash.log dosyalarini (exe yaninda) destek ekibine gonderin
 
-Baslat deyince donup kapaniyorsa:
-  1. baslat.bat kullanin
-  2. %LOCALAPPDATA%\TribalWarsBot\webengine_data klasorunu silin
-  3. VC++ x64 kurun: https://aka.ms/vs/17/release/vc_redist.x64.exe
-  4. boot.log / crash.log gonderin
+  "Qt / DLL yuklenemedi"
+    → _internal klasoru eksik veya bozulmus; ZIP’i tekrar cikarin
+    → OneDrive yerine yerel disk yolu kullanin
 
-EK GEREKSINIM:
-  Visual C++ Redistributable x64
-  https://aka.ms/vs/17/release/vc_redist.x64.exe
+  Aciliyor ama tarayici beyaz / cokuyor
+    → baslat.bat ile acin
+    → GPU surucusunu guncelleyin; Windows Defender istisnasi ekleyin
 
-KULLANIM:
-  1. Lisans menusunden TWB- anahtari
-  2. Kullanici / sifre
-  3. Sunucu sec
-  4. Baslat
+  Lisans / guncelleme SSL hatasi
+    → Antivirus HTTPS taramasini gecici kapatin veya istisna ekleyin
 
-================================================
+  Windows 7 / 8
+    → Desteklenmez; Windows 10 veya 11 64-bit gerekir
+
+DESTEK ICIN GONDERIN
+--------------------
+  1) Windows surumu (Ayarlar → Sistem → Hakkinda): 10/11 ve 64-bit mi?
+  2) ZIP tam cikarildi mi? exe yaninda _internal var mi?
+  3) VC++ x64 kuruldu mu?
+  4) Bot klasor yolu (OneDrive mi?)
+  5) Antivirus / Defender engeli var mi?
+  6) boot.log ve crash.log (varsa)
+  7) Hata: hic acilmiyor mu, tarayici mi bos?
+
+Guncelleme: Yardim → Guncellemeleri kontrol et  veya  guncelle.bat
+================================================================================

@@ -1,5 +1,5 @@
 {
-  "version": "1.4.13",
-  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.13/TribalWarsBot-1.4.13.zip",
-  "changelog_tr": "Fake planı: rastgele kaynak–hedef eşleştirme; Varış/Gönderim zamanı modu + gönderim aralığı.\nHarita koordinat seçici: seçili köyleri yabancı renk grubuna ekle (mevcut/yeni grup); panel harita solunda.\nTelegram /bakıcı ve /gelen (v1.4.12) dahil."
+  "version": "1.4.14",
+  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.14/TribalWarsBot-1.4.14.zip",
+  "changelog_tr": "Fake planı: köy grubu filtresi, 4'lü tren, komutlar arası 15–20 sn boşluk.\nOrdu Gönder: elle Birlikleri oku + seçim koruma (köy değişince otomatik scrape yok).\nTemizlik: aktif liste ortada, tümünü seç; depo denge Enter basılı tutarak sırayla gönder.\nKurulum: README / baslat / gerekler-kontrol güncellendi."
 }

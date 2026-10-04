@@ -140,7 +140,7 @@ try:
 
     from PyQt5.QtCore import (
         Qt, QUrl, QTimer, QTime, QDate, QSize, pyqtSignal, QObject, QSettings, pyqtSlot,
-        QByteArray, QBuffer, QIODevice,
+        QByteArray, QBuffer, QIODevice, QEvent,
     )
     from PyQt5.QtGui import (
         QFont, QColor, QBrush, QPainter, QPen, QPixmap, QIcon, QPalette, QKeySequence,
@@ -154,7 +154,7 @@ try:
         QSizePolicy, QFormLayout, QMessageBox, QTableWidget, QTableWidgetItem,
         QTimeEdit, QDateEdit, QAbstractItemView, QDoubleSpinBox, QSlider,
         QDialog, QDialogButtonBox, QRadioButton, QButtonGroup, QInputDialog,
-        QMenuBar, QAction, QProgressDialog, QShortcut,
+        QMenuBar, QAction, QProgressDialog, QProgressBar, QShortcut,
     )
     from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage, QWebEngineProfile, QWebEngineSettings
     from PyQt5.QtWebChannel import QWebChannel
@@ -198,7 +198,7 @@ from license_client import (  # noqa: E402
 # ─────────────────────────────────────────────
 
 # EXE'nin guncel oldugunu dogrulamak icin her onemli degisiklikte artirin.
-APP_VERSION = "1.4.13"
+APP_VERSION = "1.4.14"
 
 # Otomatik guncelleme — kullaniciya GitHub adresi gosterilmez; yalnizca bu URL okunur.
 UPDATE_MANIFEST_URL = "https://safayolcuu.github.io/tw-bot/bot-update.json"
@@ -4577,14 +4577,6 @@ class ArmyAuxToolsDialog(QDialog):
         w_fake = QWidget()
         v_fake = QVBoxLayout(w_fake)
         v_fake.setContentsMargins(8, 8, 8, 8)
-        self._hint_fake = QLabel(
-            "Her hedefe en fazla N fake; köy başına en fazla N. "
-            "Kaynak–hedef eşleştirmesi rastgele (aynı planda aynı çift tekrarlanmaz). "
-            "Zaman: Varış veya Gönderim — bitiş saati boş = tek an; doluysa her fake aralıkta rastgele. "
-            "Hedef: Tarayıcı → «Koordinatlar» → «Bot'a aktar»."
-        )
-        self._hint_fake.setWordWrap(True)
-        v_fake.addWidget(self._hint_fake)
         mode_row = QHBoxLayout()
         mode_row.setSpacing(6)
         mode_row.addWidget(QLabel("Zaman modu:"))
@@ -4663,6 +4655,15 @@ class ArmyAuxToolsDialog(QDialog):
         self.cb_fake_limit = QCheckBox(bot._fake_limit_checkbox_text())
         self.cb_fake_limit.setChecked(True)
         fake_form.addWidget(self.cb_fake_limit, 0, 2, 1, 2)
+        self.cb_fake_train = QCheckBox(
+            "4'lü tren (misyoner mantığı — her komutta 1 birim)"
+        )
+        self.cb_fake_train.setToolTip(
+            "İşaretliyse her kaynak→hedef ataması 4 satır ekler; "
+            "seçili birimlerden stokta yeterli olandan her dalgada 1 asker "
+            f"(~{getattr(bot, 'SA_DISPATCH_WAVE_GAP_MS', 100)} ms arayla, oyun treni gibi)."
+        )
+        fake_form.addWidget(self.cb_fake_train, 1, 0, 1, 4)
         fake_form.setColumnStretch(4, 1)
         v_fake.addLayout(fake_form)
         v_fake.addWidget(QLabel(
@@ -4684,6 +4685,18 @@ class ArmyAuxToolsDialog(QDialog):
             unit_grid.addWidget(cb, i // 6, i % 6)
         v_fake.addWidget(unit_wrap)
         v_fake.addWidget(QLabel("Kaynak köyler (işaretli köylerden fake planlanır):"))
+        fake_group_row = QHBoxLayout()
+        fake_group_row.setSpacing(6)
+        fake_group_row.addWidget(QLabel("Köy grubu:"))
+        self.cb_fake_group = QComboBox()
+        self.cb_fake_group.setMinimumWidth(160)
+        self.cb_fake_group.setToolTip(
+            "Şablonlu destek ile aynı grup listesi. «Tüm köyler» = filtre yok."
+        )
+        self.cb_fake_group.currentIndexChanged.connect(self._on_fake_group_changed)
+        fake_group_row.addWidget(self.cb_fake_group)
+        fake_group_row.addStretch()
+        v_fake.addLayout(fake_group_row)
         fake_src_btns = QHBoxLayout()
         b_fake_src_all = QPushButton("Tümünü seç")
         b_fake_src_all.setCursor(Qt.PointingHandCursor)
@@ -4869,9 +4882,10 @@ class ArmyAuxToolsDialog(QDialog):
 
         self._tw.setCurrentIndex(max(0, min(int(initial_page), 3)))
 
+        self.bot._refresh_fake_plan_groups()
+        self.bot._refresh_support_plan_groups()
         self._fake_load_settings()
         self._support_load_settings()
-        self.bot._refresh_support_plan_groups()
         self._apply_aux_theme()
 
     def _fake_load_settings(self) -> None:
@@ -4911,7 +4925,28 @@ class ArmyAuxToolsDialog(QDialog):
         fl = s.value("fake_plan/limit")
         if fl is not None:
             self.cb_fake_limit.setChecked(bool(fl) if not isinstance(fl, str) else fl.lower() in ("1", "true", "yes"))
-        # Kaynak köy listesi (seçimler QSettings'ten)
+        tr = s.value("fake_plan/train_mode")
+        if tr is not None and hasattr(self, "cb_fake_train"):
+            self.cb_fake_train.setChecked(
+                bool(tr) if not isinstance(tr, str) else tr.lower() in ("1", "true", "yes")
+            )
+        gid = (s.value("fake_plan/selected_group_id", "") or "").strip()
+        if hasattr(self, "cb_fake_group"):
+            self.cb_fake_group.blockSignals(True)
+            if gid:
+                found = False
+                for i in range(self.cb_fake_group.count()):
+                    g = self.cb_fake_group.itemData(i)
+                    if g and str(g.get("id", "")) == gid:
+                        self.cb_fake_group.setCurrentIndex(i)
+                        found = True
+                        break
+                if not found:
+                    self.cb_fake_group.setCurrentIndex(0)
+            else:
+                self.cb_fake_group.setCurrentIndex(0)
+            self.cb_fake_group.blockSignals(False)
+        # Kaynak köy listesi (seçimler QSettings'ten; grup filtresi uygulanır)
         self._fake_refresh_source_villages()
 
     def _fake_save_settings(self) -> None:
@@ -4932,6 +4967,14 @@ class ArmyAuxToolsDialog(QDialog):
         s.setValue("fake_plan/units", ",".join(self._fake_selected_unit_keys()))
         s.setValue("fake_plan/per_village", int(self.sp_fake_per_village.value()))
         s.setValue("fake_plan/limit", self.cb_fake_limit.isChecked())
+        if hasattr(self, "cb_fake_train"):
+            s.setValue("fake_plan/train_mode", self.cb_fake_train.isChecked())
+        if hasattr(self, "cb_fake_group"):
+            g = self.cb_fake_group.currentData()
+            s.setValue(
+                "fake_plan/selected_group_id",
+                str(g.get("id", "")) if isinstance(g, dict) else "",
+            )
         if hasattr(self, "fake_source_list"):
             s.setValue(
                 "fake_plan/source_village_ids",
@@ -4994,28 +5037,50 @@ class ArmyAuxToolsDialog(QDialog):
             if item is not None:
                 item.setCheckState(state)
 
+    def _on_fake_group_changed(self, *_args) -> None:
+        """Grup değişince listeyi filtrele ve gruptakileri seç."""
+        self._fake_group_just_changed = True
+        try:
+            self._fake_refresh_source_villages()
+        finally:
+            self._fake_group_just_changed = False
+        self._fake_save_settings()
+
+    def _fake_selected_group(self):
+        """Seçili köy grubu dict veya None (Tüm köyler)."""
+        if not hasattr(self, "cb_fake_group"):
+            return None
+        g = self.cb_fake_group.currentData()
+        return g if isinstance(g, dict) else None
+
     def _fake_refresh_source_villages(self) -> None:
-        """Oyundaki köyleri listele; önceki seçimleri koru (ilk açılışta hepsi seçili)."""
+        """Oyundaki köyleri listele; grup filtresi + önceki seçimler."""
         lst = getattr(self, "fake_source_list", None)
         if lst is None:
             return
+        group_changed = bool(getattr(self, "_fake_group_just_changed", False))
+        group = self._fake_selected_group()
         prev_checked = set(self._fake_selected_source_ids())
         s = QSettings(QSETTINGS_ORG, QSETTINGS_APP)
         saved_raw = s.value("fake_plan/source_village_ids", None)
         first_populate = lst.count() == 0
-        if first_populate and saved_raw is not None:
+        if first_populate and saved_raw is not None and not group_changed:
             try:
                 data = json.loads(str(saved_raw) or "[]")
                 if isinstance(data, list):
                     prev_checked = {str(x) for x in data if str(x).strip()}
             except (json.JSONDecodeError, TypeError):
                 prev_checked = set()
-            # Kayıt yokmuş gibi boş liste + hiç köy seçili değil: yine hepsini seç
             select_all_default = False
-        elif first_populate:
+        elif first_populate and not group:
             select_all_default = True
         else:
             select_all_default = False
+
+        # Grup değiştiyse listedekilerin hepsini seç
+        if group_changed:
+            select_all_default = True
+            prev_checked = set()
 
         villages = []
         try:
@@ -5027,6 +5092,16 @@ class ArmyAuxToolsDialog(QDialog):
             villages = _tw_sorted_player_villages(villages)
         except Exception:
             villages = list(self.bot._game_data.get("all_villages") or [])
+
+        if group:
+            gid = str(group.get("id", "") or "")
+            gname = (group.get("name") or "").strip()
+            gtype = (group.get("type") or "static").strip()
+            villages = [
+                v
+                for v in villages
+                if self.bot._sa_village_in_group(v, gid, gname, gtype)
+            ]
 
         lst.clear()
         for v in villages:
@@ -5066,8 +5141,6 @@ class ArmyAuxToolsDialog(QDialog):
         self.setStyleSheet(_army_aux_dialog_stylesheet(dark))
         hint_c = "#a8a8a8" if dark else "#555555"
         self._hint_bulk.setStyleSheet(f"color: {hint_c};")
-        if hasattr(self, "_hint_fake"):
-            self._hint_fake.setStyleSheet(f"color: {hint_c};")
         if hasattr(self, "_hint_support"):
             self._hint_support.setStyleSheet(f"color: {hint_c};")
         mono = "font-family: Consolas, monospace; font-size: 11px;"
@@ -5101,6 +5174,7 @@ class ArmyAuxToolsDialog(QDialog):
             if hasattr(self, "cb_fake_limit"):
                 self.cb_fake_limit.setText(self.bot._fake_limit_checkbox_text())
             self._fake_prefill_arrival_time_if_empty()
+            self.bot._refresh_fake_plan_groups()
             self._fake_refresh_source_villages()
         if idx == 2:
             self._support_prefill_arrival_time_if_empty()
@@ -5242,6 +5316,10 @@ class ArmyAuxToolsDialog(QDialog):
             base_arrive_end=ba_end,
             allowed_village_ids=source_ids,
             time_mode=time_mode,
+            train_mode=bool(
+                getattr(self, "cb_fake_train", None)
+                and self.cb_fake_train.isChecked()
+            ),
         )
         self._fake_save_settings()
         self._refresh_targets()
@@ -5674,6 +5752,7 @@ class DepoDengeDialog(QDialog):
         self.setModal(False)
         self.setWindowModality(Qt.NonModal)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self._enter_held = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -5740,7 +5819,7 @@ class DepoDengeDialog(QDialog):
         self.btn_clear.clicked.connect(self._on_clear)
         btns.addWidget(self.btn_clear)
 
-        self.status = QLabel("Durum: Bekliyor")
+        self.status = QLabel("Durum: Bekliyor — Enter basılı tutarak sırayla gönder")
         self.status.setStyleSheet("font-size: 10px; color: #888;")
         btns.addWidget(self.status, 1)
         root.addLayout(btns)
@@ -5751,6 +5830,8 @@ class DepoDengeDialog(QDialog):
         )
         self.tree.setRootIsDecorated(False)
         self.tree.setAlternatingRowColors(True)
+        self.tree.setFocusPolicy(Qt.StrongFocus)
+        self.tree.installEventFilter(self)
         hdr = self.tree.header()
         hdr.setSectionResizeMode(0, QHeaderView.Stretch)
         hdr.setSectionResizeMode(1, QHeaderView.Stretch)
@@ -5761,6 +5842,55 @@ class DepoDengeDialog(QDialog):
         root.addWidget(self.tree, 1)
 
         self._links = []
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def eventFilter(self, obj, event):
+        if obj is self.tree and event.type() == QEvent.KeyPress:
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                self.keyPressEvent(event)
+                return True
+        if obj is self.tree and event.type() == QEvent.KeyRelease:
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                self.keyReleaseEvent(event)
+                return True
+        return super().eventFilter(obj, event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if not event.isAutoRepeat():
+                self._enter_held = True
+            self._try_enter_send()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self._enter_held = False
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
+
+    def _try_enter_send(self) -> None:
+        """Enter basılıyken sıradaki (ilk) satırı gönder."""
+        if not getattr(self, "_enter_held", False):
+            return
+        if not getattr(self, "_links", None):
+            return
+        if getattr(self.bot, "_wb_sending", False):
+            return
+        if getattr(self.bot, "_human_verification_required", False):
+            return
+        self.bot._wb_send_row(self, 0)
+
+    def _continue_enter_send_chain(self) -> None:
+        """Bir gönderim bitince Enter hâlâ basılıysa sonraki satıra geç."""
+        if not getattr(self, "_enter_held", False):
+            return
+        if not getattr(self, "_links", None):
+            self.status.setText("Durum: Tüm gönderimler tamam")
+            return
+        QTimer.singleShot(80, self._try_enter_send)
 
     def settings_dict(self) -> dict:
         return {
@@ -5839,8 +5969,10 @@ class DepoDengeDialog(QDialog):
         self.status.setText(
             f"Durum: {len(self._links)} gönderim planı"
             + (f" — {meta}" if meta else "")
+            + " — Enter basılı tutarak sırayla gönder"
         )
         self.btn_plan.setEnabled(True)
+        self.tree.setFocus(Qt.OtherFocusReason)
 
     def remove_row_by_link_index(self, link_index: int):
         """Gönderilen satırı listeden çıkar ve tabloyu yeniden kur (buton ghost kalmasın)."""
@@ -5990,6 +6122,8 @@ class TribalWarsBot(QMainWindow):
         self._troops_loading_until = 0.0
         self._last_troops_scrape_at = 0.0
         self._troops_scrape_debounce_sec = 3.0
+        self._data_loading_depth = 0
+        self._deferred_troops_bulk_timer = None
 
         self._license = LicenseState()
         self._license.load_from_settings(self._settings)
@@ -6663,6 +6797,17 @@ class TribalWarsBot(QMainWindow):
         self._build_logs_tab()
 
         self.statusBar().showMessage("Durum: Bekliyor | Seçili: 0")
+        self._data_loading_label = QLabel("")
+        self._data_loading_label.setVisible(False)
+        self._data_loading_bar = QProgressBar()
+        self._data_loading_bar.setRange(0, 0)
+        self._data_loading_bar.setFixedWidth(120)
+        self._data_loading_bar.setFixedHeight(14)
+        self._data_loading_bar.setTextVisible(False)
+        self._data_loading_bar.setVisible(False)
+        self._apply_data_loading_style()
+        self.statusBar().addPermanentWidget(self._data_loading_label)
+        self.statusBar().addPermanentWidget(self._data_loading_bar)
         self._status_license_label = QLabel(f"Lisans: {self._license.status_summary()}")
         self.statusBar().addPermanentWidget(self._status_license_label)
         self._status_perm_label = QLabel(f"v{APP_VERSION}")
@@ -7031,6 +7176,8 @@ class TribalWarsBot(QMainWindow):
 
     def _refresh_theme_dependent_widgets(self):
         """Satır içi setStyleSheet kullanan üst/kritik bileşenleri temaya göre güncelle."""
+        if hasattr(self, "_data_loading_bar"):
+            self._apply_data_loading_style()
         if self._dark_mode:
             sync_idle = "color: #b0b0b0; font-size: 10px;"
             tb = "background: #3a3a3a; border: 1px solid #555555; border-radius: 2px;"
@@ -7307,8 +7454,8 @@ class TribalWarsBot(QMainWindow):
 
         if hasattr(self, "sa_source_combo") and self.sa_source_combo.currentIndex() >= 0:
             self._sa_on_source_changed(self.sa_source_combo.currentIndex())
-
-    def _sa_refresh_time_mode_button_styles(self):
+        if hasattr(self, "sa_troops_age_label"):
+            self._sa_update_troops_age_label()
         """Varış / gönderim zamanı düğmeleri — koyu tema ile uyumlu stiller."""
         active_dark = (
             "background: qlineargradient(y1:0,y2:1,stop:0 #6b5a3d,stop:1 #4a3d28);"
@@ -8590,6 +8737,11 @@ class TribalWarsBot(QMainWindow):
                     dlg.remove_row_by_link_index(row_index)
                 except RuntimeError:
                     pass
+                try:
+                    if hasattr(dlg, "_continue_enter_send_chain"):
+                        dlg._continue_enter_send_chain()
+                except RuntimeError:
+                    pass
             else:
                 err = res.split("|", 1)[-1] if "|" in res else res
                 self._add_log("DEPO", "warn", f"Gönderim hata: {err}")
@@ -9759,6 +9911,21 @@ class TribalWarsBot(QMainWindow):
         self.sa_quick_target.returnPressed.connect(self._sa_parse_target)
         self.sa_quick_target.editingFinished.connect(self._sa_sync_quick_target_to_spinboxes)
         coord_row.addWidget(self.sa_quick_target)
+
+        coord_row.addSpacing(16)
+        self.sa_troops_age_label = QLabel("Birlikler: henüz okunmadı")
+        self.sa_troops_age_label.setToolTip(
+            "Son toplu birlik okuma zamanı. Bayatsa «Birlikleri oku» ile güncelleyin."
+        )
+        coord_row.addWidget(self.sa_troops_age_label)
+        self.sa_troops_refresh_btn = QPushButton("Birlikleri oku")
+        self.sa_troops_refresh_btn.setCursor(Qt.PointingHandCursor)
+        self.sa_troops_refresh_btn.setToolTip(
+            "Tüm köy birliklerini oyundan okur (gönderime ~9 sn kala otomatik ertelenir)."
+        )
+        self.sa_troops_refresh_btn.clicked.connect(self._request_troops_bulk_safe)
+        coord_row.addWidget(self.sa_troops_refresh_btn)
+        self._sa_update_troops_age_label()
 
         coord_row.addStretch()
         form_layout.addLayout(coord_row)
@@ -11946,6 +12113,56 @@ class TribalWarsBot(QMainWindow):
         self._sa_sync_last_arrive_from_queue()
         self._sa_update_totals()
 
+    def _sa_update_troops_age_label(self) -> None:
+        """Ordu satırındaki son birlik okuma zamanı etiketini güncelle."""
+        lbl = getattr(self, "sa_troops_age_label", None)
+        if lbl is None:
+            return
+        last = float(getattr(self, "_last_troops_scrape_at", 0) or 0)
+        dark = bool(getattr(self, "_dark_mode", False))
+        if last <= 0:
+            text = "Birlikler: henüz okunmadı"
+            color = "#c0392b" if not dark else "#e74c3c"
+            bg = "#fdebd0" if not dark else "#4a3020"
+        else:
+            age = max(0.0, time.time() - last)
+            clock = datetime.datetime.fromtimestamp(last).strftime("%H:%M:%S")
+            if age < 60:
+                ago = f"{int(age)} sn önce"
+            elif age < 3600:
+                ago = f"{int(age // 60)} dk önce"
+            else:
+                ago = f"{age / 3600:.1f} sa önce"
+            text = f"Birlikler: {clock} ({ago})"
+            stale = age >= 600.0
+            if stale:
+                color = "#c0392b" if not dark else "#e74c3c"
+                bg = "#fdebd0" if not dark else "#4a3020"
+            else:
+                color = "#1a7a3a" if not dark else "#6bdc6b"
+                bg = "#e8f8ef" if not dark else "#1e3a28"
+        lbl.setText(text)
+        lbl.setStyleSheet(
+            f"font-size: 11px; font-weight: bold; color: {color}; "
+            f"background: {bg}; border-radius: 3px; padding: 3px 8px;"
+        )
+        btn = getattr(self, "sa_troops_refresh_btn", None)
+        if btn is not None:
+            if dark:
+                btn.setStyleSheet(
+                    "QPushButton { font-weight: bold; font-size: 11px; color: #f5f5f5; "
+                    "background: #1e8449; border: 1px solid #27ae60; border-radius: 3px; "
+                    "padding: 4px 10px; }"
+                    "QPushButton:hover { background: #27ae60; }"
+                )
+            else:
+                btn.setStyleSheet(
+                    "QPushButton { font-weight: bold; font-size: 11px; color: #ffffff; "
+                    "background: #1e8449; border: 1px solid #196f3d; border-radius: 3px; "
+                    "padding: 4px 10px; }"
+                    "QPushButton:hover { background: #27ae60; }"
+                )
+
     def _sa_update_totals(self):
         count = self.sa_table.topLevelItemCount()
         nh = (
@@ -12185,6 +12402,53 @@ class TribalWarsBot(QMainWindow):
             return f"{name} ({sx}|{sy})"
         return str(name)
 
+    def _refresh_fake_plan_groups(self) -> None:
+        """Fake planı sekmesindeki grup combobox'ını village_groups ile güncelle."""
+        dlg = getattr(self, "_army_aux_dialog", None)
+        if dlg is None or not hasattr(dlg, "cb_fake_group"):
+            return
+        groups = self._game_data.get("village_groups") or []
+        cur_gid = None
+        if dlg.cb_fake_group.count() > 0:
+            cur = dlg.cb_fake_group.currentData()
+            if isinstance(cur, dict):
+                cur_gid = str(cur.get("id", "") or "")
+            elif cur is None and dlg.cb_fake_group.currentIndex() == 0:
+                cur_gid = ""
+        dlg.cb_fake_group.blockSignals(True)
+        dlg.cb_fake_group.clear()
+        dlg.cb_fake_group.addItem("Tüm köyler", None)
+        for g in groups:
+            gid = str(g.get("id", "") or "")
+            name = (g.get("name") or "").strip() or gid
+            gtype = (g.get("type") or "static").strip()
+            label = f"{name} ({gtype})"
+            dlg.cb_fake_group.addItem(label, g)
+        restored = False
+        if cur_gid is not None and cur_gid != "":
+            for i in range(dlg.cb_fake_group.count()):
+                g = dlg.cb_fake_group.itemData(i)
+                if g and str(g.get("id", "")) == cur_gid:
+                    dlg.cb_fake_group.setCurrentIndex(i)
+                    restored = True
+                    break
+        elif cur_gid == "":
+            dlg.cb_fake_group.setCurrentIndex(0)
+            restored = True
+        if not restored:
+            s = QSettings(QSETTINGS_ORG, QSETTINGS_APP)
+            gid_saved = (s.value("fake_plan/selected_group_id", "") or "").strip()
+            if gid_saved:
+                for i in range(dlg.cb_fake_group.count()):
+                    g = dlg.cb_fake_group.itemData(i)
+                    if g and str(g.get("id", "")) == gid_saved:
+                        dlg.cb_fake_group.setCurrentIndex(i)
+                        restored = True
+                        break
+            if not restored:
+                dlg.cb_fake_group.setCurrentIndex(0)
+        dlg.cb_fake_group.blockSignals(False)
+
     def _refresh_support_plan_groups(self) -> None:
         """Şablonlu destek sekmesindeki grup combobox'ını village_groups ile güncelle."""
         dlg = getattr(self, "_army_aux_dialog", None)
@@ -12246,6 +12510,30 @@ class TribalWarsBot(QMainWindow):
                 total += send_n
         if total <= 0:
             return None
+        return troops
+
+    def _sa_pick_fake_train_unit(self, village_troops, selected_unit_keys, waves=4):
+        """4'lü tren: seçili birimlerden stokta ≥waves olan ilk birim anahtarı."""
+        selected_set = set(selected_unit_keys or [])
+        if not selected_set:
+            return None
+        need = max(1, int(waves or 1))
+        vt = village_troops or {}
+        for k, _ in self.SA_UNIT_DEFS:
+            if k not in selected_set:
+                continue
+            if self._sa_troop_count(vt, k) >= need:
+                return k
+        return None
+
+    def _sa_build_fake_train_wave_troops(self, unit_key):
+        """Tek dalga: seçili birimden 1 adet."""
+        if not unit_key:
+            return None
+        troops = {k: 0 for k, _ in self.SA_UNIT_DEFS}
+        if unit_key not in troops:
+            return None
+        troops[unit_key] = 1
         return troops
 
     def _sa_build_fake_troops(
@@ -12389,6 +12677,55 @@ class TribalWarsBot(QMainWindow):
         if hasattr(self, "all_villages_tree"):
             self._update_villages_list(gd)
 
+    def _sa_fake_send_dt_from_input(self, input_dt, mode, travel_delta):
+        """Planlama girdi zamanından gerçek gönderim anı."""
+        if mode == "send":
+            return input_dt
+        return input_dt - travel_delta
+
+    def _sa_fake_pick_spaced_input_dt(
+        self, lo, hi, mode, travel_delta, used_send_times, min_gap_sec
+    ):
+        """Rastgele zaman seç; gönderim anları arasında en az min_gap_sec olsun.
+
+        Returns: (input_dt, send_dt) veya (None, None).
+        """
+        if lo is None or hi is None:
+            return None, None
+        if hi < lo:
+            hi = lo
+        gap = max(1.0, float(min_gap_sec or 15.0))
+        span = (hi - lo).total_seconds()
+        travel_delta = travel_delta or datetime.timedelta(0)
+
+        def _ok(send_dt):
+            for u in used_send_times:
+                if abs((send_dt - u).total_seconds()) < gap:
+                    return False
+            return True
+
+        for _ in range(48):
+            if span <= 0:
+                input_dt = lo
+            else:
+                input_dt = lo + datetime.timedelta(seconds=random.uniform(0.0, span))
+            send_dt = self._sa_fake_send_dt_from_input(input_dt, mode, travel_delta)
+            if _ok(send_dt):
+                return input_dt, send_dt
+
+        # Pencereye sığmadı: son gönderimden sonra boşluk bırak (seri istek olmasın)
+        if used_send_times:
+            send_dt = max(used_send_times) + datetime.timedelta(
+                seconds=gap + random.uniform(0.0, 3.0)
+            )
+        else:
+            send_dt = self._sa_fake_send_dt_from_input(lo, mode, travel_delta)
+        if mode == "send":
+            input_dt = send_dt
+        else:
+            input_dt = send_dt + travel_delta
+        return input_dt, send_dt
+
     def _sa_plan_mass_fakes_with(
         self,
         targets_text,
@@ -12400,15 +12737,24 @@ class TribalWarsBot(QMainWindow):
         base_arrive_end=None,
         allowed_village_ids=None,
         time_mode="arrive",
+        train_mode=False,
     ):
         """Fake kuyruğu: rastgele kaynak–hedef eşleştirme.
 
         time_mode: 'arrive' | 'send'
         base_arrive_end verilirse her satıra [start, end] aralığında rastgele zaman atanır.
+        Gönderim anları arasında en az ~15–20 sn boşluk bırakılır (seri istek olmasın).
         allowed_village_ids: sadece bu köy id'lerinden planla (None = hepsi).
+        train_mode: True ise misyoner gibi 4'lü tren (her dalgada 1 birim).
         """
         parent = _tw_aux_msgbox_parent(msg_parent or self)
         mode = "send" if str(time_mode or "").strip().lower() == "send" else "arrive"
+        train_mode = bool(train_mode)
+        train_waves = 4
+        gap_ms = int(getattr(self, "SA_DISPATCH_WAVE_GAP_MS", 100) or 100)
+        # Tren modunda tek birimlik dalgalar fake limitini karşılayamaz
+        if train_mode:
+            enforce_fake_limit = False
         ba_start = base_arrive
         ba_end = base_arrive_end if base_arrive_end is not None else base_arrive
         if ba_end < ba_start:
@@ -12483,7 +12829,13 @@ class TribalWarsBot(QMainWindow):
                 n_no_coord += 1
                 continue
             stock0 = self._sa_available_troops_for_village_id(vid)
-            if not self._sa_village_has_siege_stock(stock0, selected_unit_keys):
+            if train_mode:
+                if not self._sa_pick_fake_train_unit(
+                    stock0, selected_unit_keys, waves=train_waves
+                ):
+                    n_no_units += 1
+                    continue
+            elif not self._sa_village_has_siege_stock(stock0, selected_unit_keys):
                 n_no_units += 1
                 continue
             pts = self._sa_resolve_village_points(v)
@@ -12507,6 +12859,11 @@ class TribalWarsBot(QMainWindow):
                 if enforce_fake_limit and n_no_pts
                 else ""
             )
+            need_hint = (
+                f"köyde seçili birimden en az {train_waves} adet olsun"
+                if train_mode
+                else "köyde bulunan en az bir birim işaretli olsun"
+            )
             QMessageBox.warning(
                 parent,
                 "Fake planı",
@@ -12515,7 +12872,7 @@ class TribalWarsBot(QMainWindow):
                 f"• Seçili birim stoğu yok: {n_no_units}"
                 f"{extra_pts}\n\n"
                 "Tarayıcıda oyun sayfasını yenileyin; fake birimlerinde "
-                "köyde bulunan en az bir birim işaretli olsun.",
+                f"{need_hint}.",
             )
             return
 
@@ -12526,12 +12883,16 @@ class TribalWarsBot(QMainWindow):
         }
         target_hits = {(tx, ty): 0 for tx, ty in targets}
         used_pairs = set()
+        used_send_times = []
         added = 0
+        added_rows = 0
         skipped = []
         n_late = 0
         max_total = len(targets) * max_per_source
         max_rounds = max_total * max(len(pool), 1) + 16
         earliest_send = now + datetime.timedelta(milliseconds=1)
+        # Komutlar arası min boşluk (gönderim anı) — seri istek olmasın
+        fake_cmd_min_gap_sec = random.uniform(15.0, 20.0)
 
         for _round in range(max_rounds):
             if added >= max_total:
@@ -12553,12 +12914,21 @@ class TribalWarsBot(QMainWindow):
                         continue
                     p["pts"] = ref_pts
                     stock = remaining.get(vid) or {}
-                    troops_map = self._sa_build_fake_troops(
-                        stock,
-                        selected_unit_keys,
-                        enforce_fake_limit,
-                        ref_pts,
-                    )
+                    train_unit = None
+                    if train_mode:
+                        train_unit = self._sa_pick_fake_train_unit(
+                            stock, selected_unit_keys, waves=train_waves
+                        )
+                        if not train_unit:
+                            continue
+                        troops_map = self._sa_build_fake_train_wave_troops(train_unit)
+                    else:
+                        troops_map = self._sa_build_fake_troops(
+                            stock,
+                            selected_unit_keys,
+                            enforce_fake_limit,
+                            ref_pts,
+                        )
                     if not troops_map:
                         continue
                     troop_keys = [
@@ -12591,7 +12961,9 @@ class TribalWarsBot(QMainWindow):
                                 "sy": sy,
                                 "ref_pts": ref_pts,
                                 "troops_map": troops_map,
+                                "train_unit": train_unit,
                                 "stock": stock,
+                                "travel_delta": travel_delta,
                                 "win_lo": send_lo,
                                 "win_hi": send_hi,
                             }
@@ -12621,7 +12993,9 @@ class TribalWarsBot(QMainWindow):
                                 "sy": sy,
                                 "ref_pts": ref_pts,
                                 "troops_map": troops_map,
+                                "train_unit": train_unit,
                                 "stock": stock,
+                                "travel_delta": travel_delta,
                                 "win_lo": lo,
                                 "win_hi": hi,
                             }
@@ -12644,13 +13018,20 @@ class TribalWarsBot(QMainWindow):
                 ref_pts = pick["ref_pts"]
                 lo = pick["win_lo"]
                 hi = pick["win_hi"]
-                span = (hi - lo).total_seconds()
-                if span <= 0:
-                    input_dt = lo
-                else:
-                    input_dt = lo + datetime.timedelta(
-                        seconds=random.uniform(0.0, span)
-                    )
+                travel_delta = pick.get("travel_delta") or datetime.timedelta(0)
+                input_dt, send_dt = self._sa_fake_pick_spaced_input_dt(
+                    lo,
+                    hi,
+                    mode,
+                    travel_delta,
+                    used_send_times,
+                    fake_cmd_min_gap_sec,
+                )
+                if input_dt is None or send_dt is None:
+                    continue
+                if send_dt <= now:
+                    n_late += 1
+                    continue
 
                 if enforce_fake_limit:
                     violate, detail = self._sa_evaluate_fake_violation(
@@ -12668,33 +13049,102 @@ class TribalWarsBot(QMainWindow):
                     self._sa_source_points_cache = int(ref_pts)
                     self._sa_source_points_cache_xy = (int(sx), int(sy))
                 try:
-                    ok, err = self._sa_append_row_from_values(
-                        self._sa_village_src_label(p["v"]),
-                        sx,
-                        sy,
-                        tx,
-                        ty,
-                        dict(troops_map),
-                        True,
-                        mode,
-                        input_dt,
-                        fake_dialog=False,
-                        check_fake_limit=enforce_fake_limit,
-                        duplicate_dialog=False,
-                        msg_parent=parent,
-                    )
+                    src_label = self._sa_village_src_label(p["v"])
+                    if train_mode:
+                        wave_troops = self._sa_build_fake_train_wave_troops(
+                            pick.get("train_unit")
+                        )
+                        if not wave_troops:
+                            continue
+                        batch_items = []
+                        wave_ok = 0
+                        wave_err = None
+                        for w in range(train_waves):
+                            wave_dt = input_dt + datetime.timedelta(
+                                milliseconds=w * gap_ms
+                            )
+                            ok, err = self._sa_append_row_from_values(
+                                src_label,
+                                sx,
+                                sy,
+                                tx,
+                                ty,
+                                dict(wave_troops),
+                                True,
+                                mode,
+                                wave_dt,
+                                fake_dialog=False,
+                                check_fake_limit=False,
+                                duplicate_dialog=False,
+                                msg_parent=parent,
+                                exclude_items=batch_items,
+                            )
+                            if ok:
+                                wave_ok += 1
+                                last_item = self.sa_table.topLevelItem(
+                                    self.sa_table.topLevelItemCount() - 1
+                                )
+                                if last_item is not None:
+                                    batch_items.append(last_item)
+                            else:
+                                wave_err = err
+                                break
+                        ok = wave_ok == train_waves
+                        err = wave_err
+                        if wave_ok > 0 and not ok:
+                            # Kısmi tren: eklenen satırları geri al
+                            for it in reversed(batch_items):
+                                try:
+                                    idx = self.sa_table.indexOfTopLevelItem(it)
+                                    if idx >= 0:
+                                        self.sa_table.takeTopLevelItem(idx)
+                                except Exception:
+                                    pass
+                            ok = False
+                            err = err or "4'lü tren tamamlanamadı"
+                        troops_map = {
+                            k: (train_waves if int(wave_troops.get(k, 0) or 0) > 0 else 0)
+                            for k, _ in self.SA_UNIT_DEFS
+                        }
+                        rows_this = wave_ok if ok else 0
+                    else:
+                        ok, err = self._sa_append_row_from_values(
+                            src_label,
+                            sx,
+                            sy,
+                            tx,
+                            ty,
+                            dict(troops_map),
+                            True,
+                            mode,
+                            input_dt,
+                            fake_dialog=False,
+                            check_fake_limit=enforce_fake_limit,
+                            duplicate_dialog=False,
+                            msg_parent=parent,
+                        )
+                        rows_this = 1 if ok else 0
                 finally:
                     self._sa_source_points_cache = old_cache
                     self._sa_source_points_cache_xy = old_cache_xy
 
                 if ok:
                     added += 1
+                    added_rows += rows_this
                     usage[vid] = usage.get(vid, 0) + 1
                     target_hits[coord] = target_hits.get(coord, 0) + 1
                     used_pairs.add(pick["pair_key"])
                     remaining[vid] = self._sa_subtract_troops_from_stock(
                         stock, troops_map
                     )
+                    # Tren: dalga gönderimleri ~100ms; diğer komutlarla 15–20sn boşluk
+                    if train_mode:
+                        for w in range(train_waves):
+                            used_send_times.append(
+                                send_dt + datetime.timedelta(milliseconds=w * gap_ms)
+                            )
+                    else:
+                        used_send_times.append(send_dt)
                     assigned_round = True
                     break
                 skipped.append(
@@ -12718,11 +13168,22 @@ class TribalWarsBot(QMainWindow):
                 )
 
         self._sa_update_totals()
-        msg = (
-            f"Kuyruğa eklenen fake: {added}\n"
-            f"Zaman modu: {time_word.lower()}\n"
-            f"Kaynak havuzu: {len(pool)} köy (toplam {len(villages)} köy)"
-        )
+        gap_note = f"Komut arası min boşluk: ~{fake_cmd_min_gap_sec:.0f} sn (gönderim)\n"
+        if train_mode:
+            msg = (
+                f"Kuyruğa eklenen tren: {added} ({added_rows} satır, "
+                f"her biri {train_waves}×1 birim)\n"
+                f"{gap_note}"
+                f"Zaman modu: {time_word.lower()}\n"
+                f"Kaynak havuzu: {len(pool)} köy (toplam {len(villages)} köy)"
+            )
+        else:
+            msg = (
+                f"Kuyruğa eklenen fake: {added}\n"
+                f"{gap_note}"
+                f"Zaman modu: {time_word.lower()}\n"
+                f"Kaynak havuzu: {len(pool)} köy (toplam {len(villages)} köy)"
+            )
         if n_late or n_no_template:
             late_hint = (
                 f"\n• {time_word} aralığı çok yakın / geçmiş (sunucu saati): "
@@ -19167,7 +19628,7 @@ class TribalWarsBot(QMainWindow):
         pv_lay.setContentsMargins(0, 0, 0, 0)
         pv_lay.setSpacing(4)
 
-        # Üst: sol = köy seçimi + birimler | sağ = evde tut / seviye / off-def / dağıtım
+        # Üst: sol = köy seçimi | orta = aktif liste | sağ = evde tut / seviye / dağıtım
         pv_top = QHBoxLayout()
         pv_top.setSpacing(8)
 
@@ -19179,17 +19640,52 @@ class TribalWarsBot(QMainWindow):
         pv_vsel = QGroupBox("1. Köyleri seçin")
         pv_vsel_lay = QVBoxLayout(pv_vsel)
         pv_vsel_lay.setContentsMargins(4, 4, 4, 4)
+        self.scav_vsel_all_cb = QCheckBox("Tümünü seç")
+        self.scav_vsel_all_cb.setStyleSheet("font-size: 10px; font-weight: bold;")
+        self.scav_vsel_all_cb.setToolTip("İşaretlenince listedeki tüm köyler seçilir.")
+        self.scav_vsel_all_cb.toggled.connect(self._scav_vsel_toggle_all)
+        pv_vsel_lay.addWidget(self.scav_vsel_all_cb)
         self.scav_vsel_table = QTreeWidget()
         self.scav_vsel_table.setRootIsDecorated(False)
         self.scav_vsel_table.setAlternatingRowColors(True)
         self.scav_vsel_table.setUniformRowHeights(True)
         self.scav_vsel_table.setHeaderLabels(["Köy (koordinat)"])
         self.scav_vsel_table.header().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.scav_vsel_table.setMinimumWidth(220)
-        self.scav_vsel_table.setMaximumHeight(160)
-        pv_vsel_lay.addWidget(self.scav_vsel_table)
-        pv_left_lay.addWidget(pv_vsel)
+        self.scav_vsel_table.setMinimumWidth(180)
+        self.scav_vsel_table.setMinimumHeight(120)
+        self.scav_vsel_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.scav_vsel_table.itemChanged.connect(self._scav_vsel_on_item_changed)
+        pv_vsel_lay.addWidget(self.scav_vsel_table, 1)
+        pv_left_lay.addWidget(pv_vsel, 1)
         pv_top.addWidget(pv_left, 3)
+
+        # Orta: aktif temizlik listesi (köy seçimi ile evde tut arasında)
+        self.scav_pv_active_box = QGroupBox("Aktif temizlik köyleri")
+        pv_active_lay = QVBoxLayout(self.scav_pv_active_box)
+        pv_active_lay.setContentsMargins(4, 4, 4, 4)
+        self.scav_pv_table = QTreeWidget()
+        self.scav_pv_table.setRootIsDecorated(False)
+        self.scav_pv_table.setAlternatingRowColors(True)
+        self.scav_pv_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.scav_pv_table.setHeaderLabels(["Köy", "Birimler", "Durum"])
+        self.scav_pv_table.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.scav_pv_table.header().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.scav_pv_table.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.scav_pv_table.setMinimumWidth(200)
+        self.scav_pv_table.setMinimumHeight(120)
+        self.scav_pv_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        pv_active_lay.addWidget(self.scav_pv_table, 1)
+        pv_btn_row = QHBoxLayout()
+        self.scav_pv_remove_btn = QPushButton("Seçileni kaldır")
+        self.scav_pv_remove_btn.clicked.connect(self._scav_pv_remove_selected)
+        pv_btn_row.addWidget(self.scav_pv_remove_btn)
+        self.scav_pv_clear_btn = QPushButton("Listeyi temizle")
+        self.scav_pv_clear_btn.clicked.connect(self._scav_pv_clear)
+        pv_btn_row.addWidget(self.scav_pv_clear_btn)
+        pv_btn_row.addStretch()
+        pv_active_lay.addLayout(pv_btn_row)
+        self.scav_pv_active_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        pv_top.addWidget(self.scav_pv_active_box, 4)
 
         # Ortak ayarlar (köy köyde sağda; toplu modda tam genişlik — reparent)
         self.scav_shared_opts = QGroupBox("Evde tut / seviye / dağıtım")
@@ -19290,10 +19786,12 @@ class TribalWarsBot(QMainWindow):
 
         self.scav_shared_opts.setMinimumWidth(280)
         self.scav_shared_opts.setMaximumWidth(360)
+        self.scav_shared_opts.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         pv_top.addWidget(self.scav_shared_opts, 2)
-        pv_lay.addLayout(pv_top)
+        pv_lay.addLayout(pv_top, 1)
         self.scav_pv_panel.setVisible(False)
-        opt_layout.addWidget(self.scav_pv_panel)
+        self.scav_pv_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        opt_layout.addWidget(self.scav_pv_panel, 1)
         # Toplu modda shared opts paneli köy panelinin dışında (tam genişlik)
         self._scav_shared_opts_mass_host = QWidget()
         mass_host_lay = QVBoxLayout(self._scav_shared_opts_mass_host)
@@ -19304,7 +19802,7 @@ class TribalWarsBot(QMainWindow):
         opt_scroll.setWidget(opt_inner)
         scav_split.addWidget(opt_scroll)
 
-        # Birim seç + aktif liste: scroll dışında her zaman görünür
+        # Birim seç + Ekle (aktif liste üst satırda, köy ile evde tut arasında)
         self.scav_pv_mid_box = QWidget()
         mid_lay = QVBoxLayout(self.scav_pv_mid_box)
         mid_lay.setContentsMargins(0, 0, 0, 0)
@@ -19334,32 +19832,8 @@ class TribalWarsBot(QMainWindow):
         self.scav_pv_add_btn.clicked.connect(self._scav_pv_add_villages)
         pv_urow.addWidget(self.scav_pv_add_btn)
         mid_lay.addLayout(pv_urow)
-
-        self.scav_pv_active_box = QGroupBox("Aktif temizlik köyleri")
-        pv_active_lay = QVBoxLayout(self.scav_pv_active_box)
-        pv_active_lay.setContentsMargins(4, 4, 4, 4)
-        self.scav_pv_table = QTreeWidget()
-        self.scav_pv_table.setRootIsDecorated(False)
-        self.scav_pv_table.setAlternatingRowColors(True)
-        self.scav_pv_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.scav_pv_table.setHeaderLabels(["Köy", "Birimler", "Durum"])
-        self.scav_pv_table.header().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.scav_pv_table.header().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.scav_pv_table.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.scav_pv_table.setMinimumHeight(80)
-        self.scav_pv_table.setMaximumHeight(150)
-        pv_active_lay.addWidget(self.scav_pv_table)
-        pv_btn_row = QHBoxLayout()
-        self.scav_pv_remove_btn = QPushButton("Seçileni kaldır")
-        self.scav_pv_remove_btn.clicked.connect(self._scav_pv_remove_selected)
-        pv_btn_row.addWidget(self.scav_pv_remove_btn)
-        self.scav_pv_clear_btn = QPushButton("Listeyi temizle")
-        self.scav_pv_clear_btn.clicked.connect(self._scav_pv_clear)
-        pv_btn_row.addWidget(self.scav_pv_clear_btn)
-        pv_btn_row.addStretch()
-        pv_active_lay.addLayout(pv_btn_row)
-        mid_lay.addWidget(self.scav_pv_active_box)
         self.scav_pv_mid_box.setVisible(False)
+        self.scav_pv_mid_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         scav_split.addWidget(self.scav_pv_mid_box)
 
         # Köy durum tablosu
@@ -19379,10 +19853,10 @@ class TribalWarsBot(QMainWindow):
                 self.scav_table.header().setSectionResizeMode(i, QHeaderView.Fixed)
                 self.scav_table.setColumnWidth(i, 76 if i <= 4 else 88)
         scav_split.addWidget(self.scav_table)
-        scav_split.setStretchFactor(0, 0)
+        scav_split.setStretchFactor(0, 3)
         scav_split.setStretchFactor(1, 0)
         scav_split.setStretchFactor(2, 1)
-        scav_split.setSizes([220, 200, 400])
+        scav_split.setSizes([380, 70, 280])
         self.scav_split = scav_split
         layout.addWidget(scav_split, 1)
         self.scav_tab = tab
@@ -19444,8 +19918,24 @@ class TribalWarsBot(QMainWindow):
             opts.setMinimumWidth(280)
             if pv_top is not None and not _in_layout(pv_top, opts):
                 opts.setParent(None)
+                # Sıra: köy seçimi | aktif liste | evde tut
                 pv_top.addWidget(opts, 2)
             opts.show()
+            active = getattr(self, "scav_pv_active_box", None)
+            if active is not None and pv_top is not None and not _in_layout(pv_top, active):
+                active.setParent(None)
+                # Aktifi opts'tan hemen önce tut
+                idx_opts = -1
+                for i in range(pv_top.count()):
+                    if pv_top.itemAt(i).widget() is opts:
+                        idx_opts = i
+                        break
+                if idx_opts >= 0:
+                    pv_top.insertWidget(idx_opts, active, 4)
+                else:
+                    pv_top.addWidget(active, 4)
+            if active is not None:
+                active.show()
         else:
             if pv_top is not None and _in_layout(pv_top, opts):
                 pv_top.removeWidget(opts)
@@ -19471,11 +19961,20 @@ class TribalWarsBot(QMainWindow):
         if hasattr(self, "_scav_shared_opts_mass_host"):
             self._scav_shared_opts_mass_host.setVisible(not village)
         self._scav_place_shared_opts(village)
-        # Köy köyde birim+aktif liste görünsün; durum tablosu alta kalsın
+        # Köy köyde seçim + birim listeleri büyüsün; durum tablosu da yer alsın
         split = getattr(self, "scav_split", None)
-        if split is not None and village:
+        if split is not None:
             try:
-                split.setSizes([220, 200, 400])
+                if village:
+                    split.setStretchFactor(0, 3)
+                    split.setStretchFactor(1, 0)
+                    split.setStretchFactor(2, 1)
+                    split.setSizes([380, 70, 280])
+                else:
+                    split.setStretchFactor(0, 0)
+                    split.setStretchFactor(1, 0)
+                    split.setStretchFactor(2, 1)
+                    split.setSizes([220, 0, 500])
             except Exception:
                 pass
         try:
@@ -19523,6 +20022,49 @@ class TribalWarsBot(QMainWindow):
             coord = f"({v.get('x', '?')}|{v.get('y', '?')})"
             st["row"].setText(0, f"{v.get('name', '?')} {coord}")
         self._scav_vsel_sync_active_highlight()
+        self._scav_vsel_sync_all_checkbox()
+
+    def _scav_vsel_toggle_all(self, checked: bool) -> None:
+        """«Tümünü seç» — listedeki tüm köy kutularını işaretle / kaldır."""
+        if not hasattr(self, "scav_vsel_table"):
+            return
+        state = Qt.Checked if checked else Qt.Unchecked
+        self.scav_vsel_table.blockSignals(True)
+        try:
+            for i in range(self.scav_vsel_table.topLevelItemCount()):
+                it = self.scav_vsel_table.topLevelItem(i)
+                if it:
+                    it.setCheckState(0, state)
+        finally:
+            self.scav_vsel_table.blockSignals(False)
+
+    def _scav_vsel_on_item_changed(self, item, column: int) -> None:
+        if column != 0:
+            return
+        self._scav_vsel_sync_all_checkbox()
+
+    def _scav_vsel_sync_all_checkbox(self) -> None:
+        """Tüm satırlar seçiliyse «Tümünü seç» işaretli kalsın."""
+        cb = getattr(self, "scav_vsel_all_cb", None)
+        lst = getattr(self, "scav_vsel_table", None)
+        if cb is None or lst is None:
+            return
+        n = lst.topLevelItemCount()
+        if n <= 0:
+            cb.blockSignals(True)
+            cb.setChecked(False)
+            cb.blockSignals(False)
+            return
+        all_on = True
+        for i in range(n):
+            it = lst.topLevelItem(i)
+            if not it or it.checkState(0) != Qt.Checked:
+                all_on = False
+                break
+        if cb.isChecked() != all_on:
+            cb.blockSignals(True)
+            cb.setChecked(all_on)
+            cb.blockSignals(False)
 
     def _scav_vsel_sync_active_highlight(self) -> None:
         """Aktif temizlik listesindeki köyleri seçim tablosunda yeşil göster."""
@@ -21204,14 +21746,18 @@ class TribalWarsBot(QMainWindow):
             return False
         return True
 
-    def _gold_army_dispatch_blocks(self):
-        """Ordu Gönder kuyruğu aktifken Altın Para işlemlerini duraklat."""
+    def _army_dispatch_blocks_heavy_work(self):
+        """Ordu gönderimi yakın/aktifken ağır iş (toplu scrape vb.) yapılmasın.
+
+        Altın Para ile aynı pencere: GOLD_DISPATCH_BLOCK_MS (~9 sn) + aktif durumlar.
+        Returns: (blocked: bool, reason: str, retry_ms: int|None)
+        """
         if not getattr(self, "enable_sending_cb", None) or not self.enable_sending_cb.isChecked():
-            return False, ""
+            return False, "", None
         if not self._server_time_synced or not self._server_time_text:
-            return False, ""
+            return False, "", None
         if not hasattr(self, "sa_table"):
-            return False, ""
+            return False, "", None
 
         active_states = frozenset(
             {"caching", "cached", "confirming", "confirmed", "sending"}
@@ -21226,8 +21772,14 @@ class TribalWarsBot(QMainWindow):
             state = item.data(0, Qt.UserRole)
             if state in active_states:
                 src = (item.text(0) or "—")[:40]
-                return True, f"ordu gönderimi devam ediyor ({state}) — {src}"
+                return (
+                    True,
+                    f"ordu gönderimi devam ediyor ({state}) — {src}",
+                    max(1500, int(block_ms // 2)),
+                )
 
+        nearest_rem_ms = None
+        nearest_reason = ""
         for i in range(self.sa_table.topLevelItemCount()):
             item = self.sa_table.topLevelItem(i)
             if not item:
@@ -21255,11 +21807,21 @@ class TribalWarsBot(QMainWindow):
             src = (item.text(0) or "—")[:40]
             if 0 < diff_ms <= block_ms:
                 rem = max(1, int(diff_ms / 1000))
-                return True, f"ordu gönderimi ~{rem}sn sonra — {src}"
-            if diff_ms <= 0:
-                return True, f"ordu gönderim zamanı — {src}"
+                reason = f"ordu gönderimi ~{rem}sn sonra — {src}"
+                if nearest_rem_ms is None or diff_ms < nearest_rem_ms:
+                    nearest_rem_ms = int(diff_ms)
+                    nearest_reason = reason
+            elif diff_ms <= 0:
+                return True, f"ordu gönderim zamanı — {src}", max(1500, int(block_ms // 2))
 
-        return False, ""
+        if nearest_rem_ms is not None:
+            return True, nearest_reason, int(nearest_rem_ms) + 1000
+        return False, "", None
+
+    def _gold_army_dispatch_blocks(self):
+        """Ordu Gönder kuyruğu aktifken Altın Para işlemlerini duraklat."""
+        blocked, reason, _retry = self._army_dispatch_blocks_heavy_work()
+        return blocked, reason
 
     def _gold_tick(self):
         import time
@@ -26846,6 +27408,79 @@ class TribalWarsBot(QMainWindow):
         self._units_overview_scrape_timer = t
         t.start(max(200, int(delay_ms)))
 
+    def _apply_data_loading_style(self) -> None:
+        """Status bar yeşil progress stilini temaya göre ayarla."""
+        bar = getattr(self, "_data_loading_bar", None)
+        lbl = getattr(self, "_data_loading_label", None)
+        if bar is None:
+            return
+        dark = bool(getattr(self, "_dark_mode", False))
+        chunk = "#2ecc71" if not dark else "#27ae60"
+        track = "#2a2a2a" if dark else "#e8f5e9"
+        text = "#2ecc71" if not dark else "#7dcea0"
+        bar.setStyleSheet(
+            f"QProgressBar {{"
+            f" border: 1px solid {chunk}; border-radius: 3px; background: {track};"
+            f" max-height: 14px; }}"
+            f"QProgressBar::chunk {{"
+            f" background-color: {chunk}; }}"
+        )
+        if lbl is not None:
+            lbl.setStyleSheet(f"color: {text}; font-size: 11px; padding-right: 4px;")
+
+    def _set_data_loading(self, loading: bool, msg: str = "") -> None:
+        """Köy/birlik verisi okunurken status bar yeşil progress göster."""
+        depth = int(getattr(self, "_data_loading_depth", 0) or 0)
+        if loading:
+            depth += 1
+            self._data_loading_depth = depth
+            if msg and hasattr(self, "_data_loading_label"):
+                self._data_loading_label.setText(msg)
+            elif hasattr(self, "_data_loading_label") and not self._data_loading_label.text():
+                self._data_loading_label.setText("Veri okunuyor…")
+        else:
+            depth = max(0, depth - 1)
+            self._data_loading_depth = depth
+        show = depth > 0
+        if hasattr(self, "_data_loading_label"):
+            self._data_loading_label.setVisible(show)
+            if not show:
+                self._data_loading_label.setText("")
+        if hasattr(self, "_data_loading_bar"):
+            self._data_loading_bar.setVisible(show)
+
+    def _request_troops_bulk_safe(self, *, defer_ms: int = 0) -> None:
+        """Kaynak değişimi vb.: gönderime yakınsa ertele, değilse toplu birlik oku."""
+        if defer_ms and defer_ms > 0:
+            t = getattr(self, "_deferred_troops_bulk_timer", None)
+            if t is not None:
+                try:
+                    t.stop()
+                except Exception:
+                    pass
+            t = QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(lambda: self._request_troops_bulk_safe(defer_ms=0))
+            self._deferred_troops_bulk_timer = t
+            t.start(int(defer_ms))
+            return
+
+        blocked, reason, retry_ms = self._army_dispatch_blocks_heavy_work()
+        if blocked:
+            wait = int(retry_ms or 2000)
+            # Tek erteleme zamanlayıcısı — spam yok
+            t = getattr(self, "_deferred_troops_bulk_timer", None)
+            if t is not None and t.isActive():
+                return
+            self._add_log(
+                "VERİ",
+                "info",
+                f"Birlik okuma ertelendi ({reason}); ~{max(1, wait // 1000)}sn sonra.",
+            )
+            self._request_troops_bulk_safe(defer_ms=wait)
+            return
+        self._scrape_troops_bulk()
+
     def _scrape_troops_only(self) -> None:
         """Hızlı birlik güncelleme — gruplar/puan/combined XHR yok."""
         if not self.is_running or not getattr(self, "browser", None):
@@ -26853,11 +27488,27 @@ class TribalWarsBot(QMainWindow):
         u = self.browser.url().toString()
         if "game.php" not in u and "/overview" not in u:
             return
+        blocked, _reason, _retry = self._army_dispatch_blocks_heavy_work()
+        if blocked:
+            return
         self._scrape_game_data(force_troops_refresh=True, troops_only=True)
 
     def _scrape_troops_bulk(self) -> None:
         """Tüm köy birliklerini hızlı modda oku (Birlikler DOM veya az XHR)."""
         if not self.is_running or not getattr(self, "browser", None):
+            return
+        blocked, reason, retry_ms = self._army_dispatch_blocks_heavy_work()
+        if blocked:
+            wait = int(retry_ms or 2000)
+            t = getattr(self, "_deferred_troops_bulk_timer", None)
+            if t is not None and t.isActive():
+                return
+            self._add_log(
+                "VERİ",
+                "info",
+                f"Birlik okuma ertelendi ({reason}); ~{max(1, wait // 1000)}sn sonra.",
+            )
+            self._request_troops_bulk_safe(defer_ms=wait)
             return
         now = time.time()
         debounce = float(getattr(self, "_troops_scrape_debounce_sec", 3.0) or 3.0)
@@ -26876,6 +27527,7 @@ class TribalWarsBot(QMainWindow):
             + (" (DOM)…" if on_units else " (XHR)…"),
         )
         self._last_troops_scrape_at = now
+        self._sa_update_troops_age_label()
         self._scrape_game_data(force_troops_refresh=True, troops_only=True)
 
     def _schedule_village_change_troops_refresh(self) -> None:
@@ -27327,6 +27979,10 @@ class TribalWarsBot(QMainWindow):
 
     def _scrape_game_data(self, *, force_troops_refresh: bool = False, troops_only: bool = False):
         """game_data JS değişkeninden ve DOM'dan tüm verileri çek."""
+        if not getattr(self, "browser", None) or not self.browser.page():
+            return
+        load_msg = "Birlikler okunuyor…" if troops_only else "Köy verileri yükleniyor…"
+        self._set_data_loading(True, load_msg)
         force_troops_js = "true" if force_troops_refresh else "false"
         troops_only_js = "true" if troops_only else "false"
         scrape_js = """
@@ -28629,90 +29285,104 @@ class TribalWarsBot(QMainWindow):
         """
 
         def on_scrape_result(result):
-            if not result:
-                return
             try:
-                data = json.loads(str(result))
-            except:
-                self._add_log("VERİ", "warn", f"Veri parse edilemedi")
-                return
-
-            if data.get("status") == "NO_GAME_DATA":
-                self._add_log("VERİ", "warn", "game_data bulunamadı. Oyun sayfasında değilsiniz.")
-                return
-
-            is_troops_only = data.get("scrape_mode") == "troops_only" or troops_only
-            prev_gd = self._game_data or {}
-            if is_troops_only and prev_gd:
-                self._merge_troops_only_villages(data, prev_gd)
-                for k in (
-                    "village_groups", "features", "world_speed", "unit_speed",
-                    "world_display", "fake_limit", "buildings",
-                ):
-                    if k not in data or data.get(k) in (None, "", [], {}):
-                        if prev_gd.get(k) not in (None, "", [], {}):
-                            data[k] = prev_gd[k]
-
-            self._merge_all_villages_troops_with_previous(data)
-
-            gv_id = (data.get("village") or {}).get("id")
-            if gv_id is not None:
+                if not result:
+                    return
                 try:
-                    self._last_scraped_village_id = int(gv_id)
-                    active_troops = data.get("troops") or {}
-                    self._last_active_troops_fp = json.dumps(active_troops, sort_keys=True)
-                    self._last_active_troops_vid = int(gv_id)
-                except (TypeError, ValueError):
-                    pass
+                    data = json.loads(str(result))
+                except Exception:
+                    self._add_log("VERİ", "warn", "Veri parse edilemedi")
+                    return
 
-            # Veriyi kaydet (önceki tam atama ayarlardan gelen hızları siliyordu)
-            self._game_data = data
-            self._apply_trusted_speeds_to_game_data()
-            self._apply_world_context(data)
+                if data.get("status") == "NO_GAME_DATA":
+                    self._add_log("VERİ", "warn", "game_data bulunamadı. Oyun sayfasında değilsiniz.")
+                    return
 
-            # Birim ikonlarını başlat / güncelle
-            image_base = data.get("image_base", "")
-            if image_base:
-                troop_icon_mgr.set_image_base(image_base, self._add_log)
-                self._add_log("İKON", "info", f"image_base: {image_base}")
+                is_troops_only = data.get("scrape_mode") == "troops_only" or troops_only
+                prev_gd = self._game_data or {}
+                if is_troops_only and prev_gd:
+                    self._merge_troops_only_villages(data, prev_gd)
+                    for k in (
+                        "village_groups", "features", "world_speed", "unit_speed",
+                        "world_display", "fake_limit", "buildings",
+                    ):
+                        if k not in data or data.get(k) in (None, "", [], {}):
+                            if prev_gd.get(k) not in (None, "", [], {}):
+                                data[k] = prev_gd[k]
 
-            # UI güncelle
-            self._update_world_display(data)
-            self._update_player_info(data)
-            self._update_resources(data)
-            self._update_buildings(data)
-            self._update_troops(data)
-            self._update_troop_available()
-            self._update_village_combo(data)
-            self._update_villages_list(data)
-            self._update_status()
+                self._merge_all_villages_troops_with_previous(data)
 
-            player = data.get("player", {})
-            village = data.get("village", {})
-            all_v = data.get("all_villages", [])
-            vgroups = data.get("village_groups") or []
-            n_with_groups = sum(1 for v in all_v if v.get("group_names"))
-            n_with_troops = data.get("troops_villages_with_stock", 0)
-            mode_tag = " [hızlı birlik]" if is_troops_only else ""
-            self._add_log("VERİ", "success",
-                f"Veri güncellendi{mode_tag}: {village.get('name', '?')} ({village.get('coord', '?')}) | "
-                f"Puan: {village.get('points', 0)} | Köyler: {len(all_v)} | "
-                f"Askerli köy: {n_with_troops} | "
-                f"Gruplar: {len(vgroups)} | Köy+grup: {n_with_groups} | "
-                f"Dünya: {data.get('world', '?')}")
-            self._refresh_support_plan_groups()
-            self._refresh_scav_groups()
-            if hasattr(self, "scav_vsel_table"):
-                self._scav_refresh_vsel()
+                gv_id = (data.get("village") or {}).get("id")
+                if gv_id is not None:
+                    try:
+                        self._last_scraped_village_id = int(gv_id)
+                        active_troops = data.get("troops") or {}
+                        self._last_active_troops_fp = json.dumps(active_troops, sort_keys=True)
+                        self._last_active_troops_vid = int(gv_id)
+                    except (TypeError, ValueError):
+                        pass
 
-            QTimer.singleShot(200, self._poll_bot_protection)
+                # Veriyi kaydet (önceki tam atama ayarlardan gelen hızları siliyordu)
+                self._game_data = data
+                self._apply_trusted_speeds_to_game_data()
+                self._apply_world_context(data)
 
-            if not getattr(self, '_world_settings_fetched', False):
-                self._fetch_world_settings()
-            elif not getattr(self, '_unit_speeds_fetched', False):
-                self._fetch_unit_speeds()
+                # Birim ikonlarını başlat / güncelle
+                image_base = data.get("image_base", "")
+                if image_base:
+                    troop_icon_mgr.set_image_base(image_base, self._add_log)
+                    self._add_log("İKON", "info", f"image_base: {image_base}")
 
-        self.browser.page().runJavaScript(scrape_js, on_scrape_result)
+                # UI güncelle
+                self._update_world_display(data)
+                self._update_player_info(data)
+                self._update_resources(data)
+                self._update_buildings(data)
+                self._update_troops(data)
+                self._update_troop_available()
+                self._update_village_combo(data, troops_only=is_troops_only)
+                self._update_villages_list(data)
+                self._update_status()
+                self._sa_update_troops_age_label()
+
+                village = data.get("village", {})
+                all_v = data.get("all_villages", [])
+                vgroups = data.get("village_groups") or []
+                n_with_groups = sum(1 for v in all_v if v.get("group_names"))
+                n_with_troops = data.get("troops_villages_with_stock", 0)
+                mode_tag = " [hızlı birlik]" if is_troops_only else ""
+                self._add_log("VERİ", "success",
+                    f"Veri güncellendi{mode_tag}: {village.get('name', '?')} ({village.get('coord', '?')}) | "
+                    f"Puan: {village.get('points', 0)} | Köyler: {len(all_v)} | "
+                    f"Askerli köy: {n_with_troops} | "
+                    f"Gruplar: {len(vgroups)} | Köy+grup: {n_with_groups} | "
+                    f"Dünya: {data.get('world', '?')}")
+                self._refresh_support_plan_groups()
+                self._refresh_fake_plan_groups()
+                dlg = getattr(self, "_army_aux_dialog", None)
+                if dlg is not None and hasattr(dlg, "_fake_refresh_source_villages"):
+                    try:
+                        dlg._fake_refresh_source_villages()
+                    except Exception:
+                        pass
+                self._refresh_scav_groups()
+                if hasattr(self, "scav_vsel_table"):
+                    self._scav_refresh_vsel()
+
+                QTimer.singleShot(200, self._poll_bot_protection)
+
+                if not getattr(self, '_world_settings_fetched', False):
+                    self._fetch_world_settings()
+                elif not getattr(self, '_unit_speeds_fetched', False):
+                    self._fetch_unit_speeds()
+            finally:
+                self._set_data_loading(False)
+
+        try:
+            self.browser.page().runJavaScript(scrape_js, on_scrape_result)
+        except Exception:
+            self._set_data_loading(False)
+            raise
 
     def _apply_trusted_speeds_to_game_data(self):
         """Ayarlar sayfasından kesin alınan hızları scrape sonrası _game_data ve WorldContext üzerine yaz."""
@@ -29266,7 +29936,7 @@ class TribalWarsBot(QMainWindow):
                 item.setForeground(1, QColor("#228822"))
             self.troops_tree.addTopLevelItem(item)
 
-    def _update_village_combo(self, data):
+    def _update_village_combo(self, data, *, troops_only: bool = False):
         """Üst paneldeki köy seçiciyi güncelle."""
         all_villages = data.get("all_villages", [])
         current_id = data.get("village", {}).get("id", 0)
@@ -29299,29 +29969,58 @@ class TribalWarsBot(QMainWindow):
 
         # Ordu Gönder sekmesindeki kaynak köy seçiciyi güncelle
         if hasattr(self, 'sa_source_combo'):
-            self.sa_source_combo.blockSignals(True)
-            self.sa_source_combo.clear()
+            prev_sa_vid = self.sa_source_combo.currentData()
+            skip_sa_rebuild = False
+            if troops_only and ordered_villages:
+                new_ids = {
+                    str(v.get("id"))
+                    for v in ordered_villages
+                    if v.get("id") is not None and str(v.get("id")).strip() != ""
+                }
+                old_ids = set()
+                for i in range(self.sa_source_combo.count()):
+                    d = self.sa_source_combo.itemData(i)
+                    if d is not None and str(d).strip() != "":
+                        old_ids.add(str(d))
+                if new_ids and new_ids == old_ids:
+                    skip_sa_rebuild = True
 
-            if not all_villages:
-                v = data.get("village", {})
-                if v:
-                    coord = v.get('coord', f"{v.get('x','?')}|{v.get('y','?')}")
-                    self.sa_source_combo.addItem(
-                        f"{v.get('name', '?')} ({coord})",
-                        v.get("id", 0)
-                    )
+            if skip_sa_rebuild:
+                # Aynı köy listesi — seçimi ve formu bozma; yalnız stok etiketleri
+                self._sa_on_source_changed(self.sa_source_combo.currentIndex())
             else:
-                sa_selected_idx = 0
-                for i, v in enumerate(ordered_villages):
-                    coord = f"({v.get('x', '?')}|{v.get('y', '?')})"
-                    label = f"{v.get('name', '?')} {coord}"
-                    self.sa_source_combo.addItem(label, v.get("id", 0))
-                    if v.get("id") == current_id or v.get("selected"):
-                        sa_selected_idx = i
-                self.sa_source_combo.setCurrentIndex(sa_selected_idx)
+                self.sa_source_combo.blockSignals(True)
+                self.sa_source_combo.clear()
 
-            self.sa_source_combo.blockSignals(False)
-            self._sa_on_source_changed(self.sa_source_combo.currentIndex())
+                if not all_villages:
+                    v = data.get("village", {})
+                    if v:
+                        coord = v.get('coord', f"{v.get('x','?')}|{v.get('y','?')}")
+                        self.sa_source_combo.addItem(
+                            f"{v.get('name', '?')} ({coord})",
+                            v.get("id", 0)
+                        )
+                else:
+                    sa_selected_idx = 0
+                    restored = False
+                    for i, v in enumerate(ordered_villages):
+                        coord = f"({v.get('x', '?')}|{v.get('y', '?')})"
+                        label = f"{v.get('name', '?')} {coord}"
+                        self.sa_source_combo.addItem(label, v.get("id", 0))
+                        if prev_sa_vid is not None and self._sa_same_village_id(
+                            v.get("id"), prev_sa_vid
+                        ):
+                            sa_selected_idx = i
+                            restored = True
+                    if not restored:
+                        for i, v in enumerate(ordered_villages):
+                            if v.get("id") == current_id or v.get("selected"):
+                                sa_selected_idx = i
+                                break
+                    self.sa_source_combo.setCurrentIndex(sa_selected_idx)
+
+                self.sa_source_combo.blockSignals(False)
+                self._sa_on_source_changed(self.sa_source_combo.currentIndex())
 
         # Bina Kuyruğu sekmesindeki köy seçiciyi güncelle
         if hasattr(self, 'bq_village_combo'):
@@ -29339,12 +30038,21 @@ class TribalWarsBot(QMainWindow):
                         f"{v.get('name', '?')} ({coord})", v.get("id", 0))
             else:
                 bq_idx = 0
+                restored_bq = False
                 for i, v in enumerate(ordered_villages):
                     coord = f"({v.get('x', '?')}|{v.get('y', '?')})"
                     label = f"{v.get('name', '?')} {coord}"
                     self.bq_village_combo.addItem(label, v.get("id", 0))
-                    if v.get("id") == current_id or v.get("selected"):
+                    if prev_bq_vid is not None and self._sa_same_village_id(
+                        v.get("id"), prev_bq_vid
+                    ):
                         bq_idx = i
+                        restored_bq = True
+                if not restored_bq:
+                    for i, v in enumerate(ordered_villages):
+                        if v.get("id") == current_id or v.get("selected"):
+                            bq_idx = i
+                            break
                 self.bq_village_combo.setCurrentIndex(bq_idx)
 
             self.bq_village_combo.blockSignals(False)
@@ -29784,16 +30492,21 @@ class TribalWarsBot(QMainWindow):
         """50ms'de bir, saf Python ile sunucu saatini label'a yazar (JS çağrısı yok)."""
         if not self._server_time_synced or self._server_time_anchor_dt is None or self._server_time_anchor_perf is None:
             self._show_local_time()
-            return
-        try:
-            elapsed = time.perf_counter() - self._server_time_anchor_perf
-            dt = self._server_time_anchor_dt + datetime.timedelta(seconds=elapsed)
-            ms = int((elapsed * 1000) % 1000)
-            text = dt.strftime("%d/%m/%Y %H:%M:%S") + f".{ms:03d}"
-            self.sync_label.setText(f"Sunucu Saati: {text}")
-            self.sync_label.setStyleSheet("color: #228822; font-weight: bold; font-size: 10px;")
-        except Exception:
-            self._show_local_time()
+        else:
+            try:
+                elapsed = time.perf_counter() - self._server_time_anchor_perf
+                dt = self._server_time_anchor_dt + datetime.timedelta(seconds=elapsed)
+                ms = int((elapsed * 1000) % 1000)
+                text = dt.strftime("%d/%m/%Y %H:%M:%S") + f".{ms:03d}"
+                self.sync_label.setText(f"Sunucu Saati: {text}")
+                self.sync_label.setStyleSheet("color: #228822; font-weight: bold; font-size: 10px;")
+            except Exception:
+                self._show_local_time()
+        # Birlik yaşı etiketini ~1 sn'de bir tazele
+        tick = int(getattr(self, "_sa_troops_age_tick", 0) or 0) + 1
+        self._sa_troops_age_tick = tick
+        if tick % 20 == 0 and hasattr(self, "sa_troops_age_label"):
+            self._sa_update_troops_age_label()
 
     def _fetch_server_time(self, force=False):
         """Sayfadaki sunucu saatini Timing + DOM ile örnekler.
