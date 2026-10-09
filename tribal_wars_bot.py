@@ -133,6 +133,11 @@ def _tw_add_pyqt_dll_paths():
                 f"chromium_flags={os.environ.get('QTWEBENGINE_CHROMIUM_FLAGS', '')[:160]}"
             )
             os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+        elif not os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS"):
+            # Script (python) modu: WebGL kapali olmasin (hCaptcha)
+            os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
+                "--ignore-gpu-blocklist --enable-webgl --enable-accelerated-2d-canvas"
+            )
     except Exception as ex:
         _tw_boot_log(f"dll_paths_warn: {ex}")
 
@@ -218,11 +223,200 @@ from license_client import (  # noqa: E402
 # ─────────────────────────────────────────────
 
 # EXE'nin guncel oldugunu dogrulamak icin her onemli degisiklikte artirin.
-APP_VERSION = "1.4.18"
+APP_VERSION = "1.4.19"
 
 # Otomatik guncelleme — kullaniciya GitHub adresi gosterilmez; yalnizca bu URL okunur.
 UPDATE_MANIFEST_URL = "https://safayolcuu.github.io/tw-bot/bot-update.json"
 UPDATE_USER_AGENT = f"TribalWarsBot/{APP_VERSION}"
+
+# Gömülü WebEngine ≈ Chromium 83; modern hCaptcha çoğu PC'de çözülemiyor.
+# Chrome/Edge'de çöz → CDP ile çerezleri QWebEngine'e aktar.
+TW_CHROME_DEBUG_PORT = 9333
+TW_CHROME_COOKIE_HOST_MARKERS = (
+    "klanlar.",
+    "tribalwars.",
+    "die-staemme.",
+    "staemme.",
+    "hcaptcha.",
+    "tribalwarsnet.",
+)
+
+
+def _tw_local_app_data() -> Path:
+    local = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or ""
+    if local:
+        return Path(local)
+    return Path.home() / "AppData" / "Local"
+
+
+def _tw_find_chrome_or_edge() -> str:
+    """Chrome veya Edge exe yolu (yoksa boş)."""
+    candidates = [
+        Path(os.environ.get("PROGRAMFILES", r"C:\Program Files"))
+        / "Google"
+        / "Chrome"
+        / "Application"
+        / "chrome.exe",
+        Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"))
+        / "Google"
+        / "Chrome"
+        / "Application"
+        / "chrome.exe",
+        _tw_local_app_data() / "Google" / "Chrome" / "Application" / "chrome.exe",
+        Path(os.environ.get("PROGRAMFILES", r"C:\Program Files"))
+        / "Microsoft"
+        / "Edge"
+        / "Application"
+        / "msedge.exe",
+        Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"))
+        / "Microsoft"
+        / "Edge"
+        / "Application"
+        / "msedge.exe",
+    ]
+    for p in candidates:
+        try:
+            if p.is_file():
+                return str(p)
+        except OSError:
+            continue
+    return ""
+
+
+def _tw_ws_cdp_call(ws_url: str, method: str, params=None, timeout: float = 20.0) -> dict:
+    """Tek CDP komutu (ek paket yok — saf socket WebSocket)."""
+    import base64
+    import socket
+    import struct
+    from urllib.parse import urlparse
+
+    u = urlparse(ws_url)
+    host = u.hostname or "127.0.0.1"
+    port = int(u.port or (443 if u.scheme == "wss" else 80))
+    path = u.path or "/"
+    if u.query:
+        path = f"{path}?{u.query}"
+    key = base64.b64encode(os.urandom(16)).decode("ascii")
+    req = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host}:{port}\r\n"
+        f"Upgrade: websocket\r\n"
+        f"Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        f"Sec-WebSocket-Version: 13\r\n"
+        f"\r\n"
+    )
+    sock = socket.create_connection((host, port), timeout=timeout)
+    try:
+        sock.settimeout(timeout)
+        sock.sendall(req.encode("ascii"))
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("CDP WebSocket handshake kesildi")
+            buf += chunk
+            if len(buf) > 65536:
+                raise RuntimeError("CDP handshake aşırı uzun")
+        header, rest = buf.split(b"\r\n\r\n", 1)
+        if b"101" not in header.split(b"\r\n", 1)[0]:
+            raise RuntimeError(f"CDP WS upgrade başarısız: {header[:80]!r}")
+
+        def _send_text(text: str) -> None:
+            raw = text.encode("utf-8")
+            mask = os.urandom(4)
+            hdr = bytearray([0x81])
+            n = len(raw)
+            if n < 126:
+                hdr.append(0x80 | n)
+            elif n < 65536:
+                hdr.append(0x80 | 126)
+                hdr.extend(struct.pack("!H", n))
+            else:
+                hdr.append(0x80 | 127)
+                hdr.extend(struct.pack("!Q", n))
+            hdr.extend(mask)
+            sock.sendall(bytes(hdr) + bytes(b ^ mask[i % 4] for i, b in enumerate(raw)))
+
+        buf2 = bytearray(rest)
+        deadline = time.time() + timeout
+
+        def _read(n: int) -> bytes:
+            while len(buf2) < n:
+                if time.time() > deadline:
+                    raise TimeoutError("CDP cevap zaman aşımı")
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise RuntimeError("CDP WS kapandı")
+                buf2.extend(chunk)
+            out = bytes(buf2[:n])
+            del buf2[:n]
+            return out
+
+        msg_id = 1
+        body = {"id": msg_id, "method": method}
+        if params is not None:
+            body["params"] = params
+        _send_text(json.dumps(body))
+
+        while True:
+            if time.time() > deadline:
+                raise TimeoutError("CDP cevap zaman aşımı")
+            b0, b1 = _read(2)
+            opcode = b0 & 0x0F
+            masked = bool(b1 & 0x80)
+            ln = b1 & 0x7F
+            if ln == 126:
+                ln = struct.unpack("!H", _read(2))[0]
+            elif ln == 127:
+                ln = struct.unpack("!Q", _read(8))[0]
+            mask_key = _read(4) if masked else b""
+            payload = _read(ln)
+            if masked:
+                payload = bytes(payload[i] ^ mask_key[i % 4] for i in range(len(payload)))
+            if opcode in (0x9, 0xA):
+                continue
+            if opcode == 0x8:
+                raise RuntimeError("CDP WS close")
+            if opcode != 0x1:
+                continue
+            resp = json.loads(payload.decode("utf-8"))
+            if resp.get("id") == msg_id:
+                if "error" in resp:
+                    raise RuntimeError(str(resp["error"]))
+                return resp.get("result") or {}
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def _tw_chrome_cdp_get_all_cookies(port: int = TW_CHROME_DEBUG_PORT) -> list:
+    """Açık Chrome/Edge debug oturumundan tüm çerezleri al."""
+    ver_url = f"http://127.0.0.1:{int(port)}/json/version"
+    with urllib.request.urlopen(ver_url, timeout=5) as resp:
+        ver = json.loads(resp.read().decode("utf-8", errors="replace"))
+    ws = (ver.get("webSocketDebuggerUrl") or "").strip()
+    if not ws:
+        with urllib.request.urlopen(f"http://127.0.0.1:{int(port)}/json/list", timeout=5) as resp:
+            targets = json.loads(resp.read().decode("utf-8", errors="replace"))
+        for t in targets or []:
+            if t.get("type") == "page" and t.get("webSocketDebuggerUrl"):
+                ws = t["webSocketDebuggerUrl"]
+                break
+    if not ws:
+        raise RuntimeError("Chrome debug WebSocket bulunamadı — önce «Chrome'da aç» deyin.")
+    result = _tw_ws_cdp_call(ws, "Network.getAllCookies")
+    cookies = result.get("cookies") or []
+    if not cookies:
+        try:
+            result = _tw_ws_cdp_call(ws, "Storage.getCookies")
+            cookies = result.get("cookies") or []
+        except Exception:
+            pass
+    return list(cookies or [])
+
 
 SERVERS = [
     ("klanlar.org", "https://www.klanlar.org"),
@@ -1515,7 +1709,14 @@ class StealthBrowser(QWebEngineView):
         )
         self.profile.setHttpUserAgent(ua)
         self.profile.setHttpAcceptLanguage("tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7")
-        self.profile.setPersistentCookiesPolicy(QWebEngineProfile.AllowPersistentCookies)
+        try:
+            self.profile.setPersistentCookiesPolicy(
+                QWebEngineProfile.ForcePersistentCookies
+            )
+        except Exception:
+            self.profile.setPersistentCookiesPolicy(
+                QWebEngineProfile.AllowPersistentCookies
+            )
 
         # Önbellek: EXE yanında (OneDrive/Masaüstü) Chromium sık çöker → LocalAppData
         try:
@@ -7338,6 +7539,8 @@ class TribalWarsBot(QMainWindow):
         except Exception:
             pass
         try:
+            if hasattr(self, "botprot_banner_wrap"):
+                self.botprot_banner_wrap.setVisible(True)
             if hasattr(self, "botprot_banner"):
                 self.botprot_banner.setStyleSheet(
                     "color: #fff; font-weight: bold; font-size: 12px; padding: 6px 8px;"
@@ -7345,6 +7548,202 @@ class TribalWarsBot(QMainWindow):
                 )
         except Exception:
             pass
+
+    def _chrome_captcha_target_url(self) -> str:
+        """Chrome'a açılacak adres (bot tarayıcısı veya seçili sunucu)."""
+        try:
+            if self.browser:
+                u = (self.browser.url().toString() or "").strip()
+                if u and u.startswith("http"):
+                    return u
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "server_combo") and self.server_combo is not None:
+                data = self.server_combo.currentData()
+                if data:
+                    return str(data)
+        except Exception:
+            pass
+        return "https://www.klanlar.org"
+
+    def _chrome_captcha_open(self) -> None:
+        """Captcha için gerçek Chrome/Edge aç (remote debugging)."""
+        exe = _tw_find_chrome_or_edge()
+        if not exe:
+            QMessageBox.warning(
+                self,
+                "Chrome / Edge yok",
+                "Google Chrome veya Microsoft Edge bulunamadı.\n"
+                "Kurulu tarayıcı ile captcha'yı çözüp çerez aktarımı yapılabilir.",
+            )
+            return
+        url = self._chrome_captcha_target_url()
+        profile = _tw_local_app_data() / "TribalWarsBot" / "chrome_login_profile"
+        try:
+            profile.mkdir(parents=True, exist_ok=True)
+        except OSError as ex:
+            QMessageBox.warning(self, "Profil", f"Chrome profil klasörü oluşturulamadı:\n{ex}")
+            return
+        port = TW_CHROME_DEBUG_PORT
+        # Zaten debug oturumu açıksa yeni sekme dene
+        already = False
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1.5) as resp:
+                resp.read()
+            already = True
+        except Exception:
+            already = False
+        if already:
+            try:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/json/new?{quote(url, safe='')}",
+                    method="PUT",
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    resp.read()
+                self._add_log("GÜVENLİK", "info", f"Chrome'da yeni sekme açıldı: {url}")
+            except Exception:
+                # PUT desteklenmezse sadece kullanıcıya mevcut pencereyi kullanmasını söyle
+                self._add_log(
+                    "GÜVENLİK",
+                    "info",
+                    "Chrome zaten açık — captcha'yı o pencerede çözün, sonra «Çerezleri aktar».",
+                )
+            QMessageBox.information(
+                self,
+                "Chrome",
+                "1) Chrome/Edge penceresinde captcha'yı çözün ve oyuna girin.\n"
+                "2) Sonra botta «Çerezleri aktar»a basın.",
+            )
+            return
+        try:
+            import subprocess
+
+            subprocess.Popen(
+                [
+                    exe,
+                    f"--remote-debugging-port={port}",
+                    f"--user-data-dir={profile}",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-features=TranslateUI",
+                    url,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as ex:
+            QMessageBox.warning(self, "Chrome", f"Tarayıcı açılamadı:\n{ex}")
+            return
+        self._add_log("GÜVENLİK", "info", f"Chrome/Edge açıldı (debug :{port}): {url}")
+        QMessageBox.information(
+            self,
+            "Chrome'da captcha",
+            "Gömülü tarayıcıdaki Chromium çok eski; hCaptcha genelde orada çözülmez.\n\n"
+            "1) Açılan Chrome/Edge'de captcha'yı çözün ve dünyaya girin.\n"
+            "2) Bot penceresine dönüp «Çerezleri aktar»a basın.\n"
+            "3) Oturum gömülü tarayıcıya kopyalanır.",
+        )
+
+    def _chrome_captcha_import_cookies(self) -> None:
+        """Chrome debug oturumundan çerezleri QWebEngine profiline yaz."""
+        from PyQt5.QtNetwork import QNetworkCookie
+        from PyQt5.QtCore import QDateTime
+
+        try:
+            cookies = _tw_chrome_cdp_get_all_cookies(TW_CHROME_DEBUG_PORT)
+        except Exception as ex:
+            QMessageBox.warning(
+                self,
+                "Çerez aktarımı",
+                "Chrome debug oturumuna bağlanılamadı.\n\n"
+                "Önce «Chrome'da aç» ile tarayıcıyı bu bottan açın, "
+                "captcha'yı çözün, sonra tekrar deneyin.\n\n"
+                f"Detay: {ex}",
+            )
+            return
+
+        def _keep(domain: str) -> bool:
+            d = (domain or "").lower().lstrip(".")
+            return any(m.rstrip(".") in d or d.endswith(m.rstrip(".")) for m in TW_CHROME_COOKIE_HOST_MARKERS) or any(
+                m in d for m in TW_CHROME_COOKIE_HOST_MARKERS
+            )
+
+        kept = [c for c in cookies if _keep(str(c.get("domain") or ""))]
+        if not kept:
+            QMessageBox.warning(
+                self,
+                "Çerez aktarımı",
+                f"Chrome'dan {len(cookies)} çerez okundu ama oyun/hCaptcha alanı yok.\n"
+                "Önce Chrome'da siteye giriş yapıp captcha'yı geçin.",
+            )
+            return
+
+        profile = getattr(self, "_tw_browser_profile", None)
+        if profile is None and self.browser is not None:
+            profile = getattr(self.browser, "profile", None)
+        if profile is None:
+            QMessageBox.warning(self, "Çerez aktarımı", "Gömülü tarayıcı profili yok.")
+            return
+        store = profile.cookieStore()
+        n_ok = 0
+        for c in kept:
+            try:
+                name = str(c.get("name") or "")
+                value = str(c.get("value") or "")
+                if not name:
+                    continue
+                qc = QNetworkCookie(name.encode("utf-8"), value.encode("utf-8"))
+                domain = str(c.get("domain") or "")
+                path = str(c.get("path") or "/")
+                if domain:
+                    qc.setDomain(domain)
+                qc.setPath(path or "/")
+                if c.get("secure"):
+                    qc.setSecure(True)
+                if c.get("httpOnly"):
+                    qc.setHttpOnly(True)
+                exp = c.get("expires")
+                if exp is not None:
+                    try:
+                        exp_f = float(exp)
+                        if exp_f > 0:
+                            qc.setExpirationDate(QDateTime.fromSecsSinceEpoch(int(exp_f)))
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+                host = domain.lstrip(".") if domain else "www.klanlar.org"
+                origin = QUrl(f"https://{host}{path or '/'}")
+                store.setCookie(qc, origin)
+                n_ok += 1
+            except Exception:
+                continue
+
+        self._add_log(
+            "GÜVENLİK",
+            "success",
+            f"Chrome'dan {n_ok} çerez aktarıldı (toplam okunan: {len(cookies)}, eşleşen: {len(kept)}).",
+        )
+        # Doğrulama bayrağını temizle + sayfayı yenile
+        try:
+            self._set_human_verification_state(False, [])
+        except Exception:
+            pass
+        if self._login_state == "awaiting_captcha":
+            self._login_state = "world_select"
+        try:
+            target = self._chrome_captcha_target_url()
+            if self.browser and target:
+                self.browser.setUrl(QUrl(target))
+        except Exception:
+            pass
+        QTimer.singleShot(1500, self._check_world_selection)
+        QMessageBox.information(
+            self,
+            "Çerez aktarıldı",
+            f"{n_ok} çerez gömülü tarayıcıya yazıldı.\n"
+            "Sayfa yenileniyor — dünya seçimi / oyun açılmalı.",
+        )
 
     def _on_settings_telegram_test(self):
         """Kayıtlı token/chat ile test (kaydetmeden de widget değerleri kullanılır)."""
@@ -7841,13 +8240,39 @@ class TribalWarsBot(QMainWindow):
         self.sync_label.setStyleSheet("color: #555555; font-size: 10px;")
         layout.addWidget(self.sync_label)
 
+        self.botprot_banner_wrap = QWidget()
+        self.botprot_banner_wrap.setVisible(False)
+        _bp_v = QVBoxLayout(self.botprot_banner_wrap)
+        _bp_v.setContentsMargins(0, 0, 0, 0)
+        _bp_v.setSpacing(4)
         self.botprot_banner = QLabel("")
-        self.botprot_banner.setVisible(False)
+        self.botprot_banner.setWordWrap(True)
         self.botprot_banner.setStyleSheet(
-            "color: #cc5500; font-weight: bold; font-size: 10px; padding: 2px 6px;"
-            "background: #fff3cd; border: 1px solid #e0c080; border-radius: 3px;"
+            "color: #fff; font-weight: bold; font-size: 12px; padding: 6px 8px;"
+            "background: #c0392b; border: 2px solid #922b21; border-radius: 4px;"
         )
-        layout.addWidget(self.botprot_banner)
+        _bp_v.addWidget(self.botprot_banner)
+        _bp_row = QHBoxLayout()
+        _bp_row.setContentsMargins(0, 0, 0, 0)
+        _bp_row.setSpacing(6)
+        self.botprot_chrome_open_btn = QPushButton("Chrome'da aç")
+        self.botprot_chrome_open_btn.setCursor(Qt.PointingHandCursor)
+        self.botprot_chrome_open_btn.setToolTip(
+            "Captcha gömülü tarayıcıda çözülemiyorsa (Chromium 83): "
+            "sayfayı gerçek Chrome/Edge'de açar."
+        )
+        self.botprot_chrome_open_btn.clicked.connect(self._chrome_captcha_open)
+        self.botprot_chrome_import_btn = QPushButton("Çerezleri aktar")
+        self.botprot_chrome_import_btn.setCursor(Qt.PointingHandCursor)
+        self.botprot_chrome_import_btn.setToolTip(
+            "Chrome'da captcha/giriş bittikten sonra oturum çerezlerini bota aktarır."
+        )
+        self.botprot_chrome_import_btn.clicked.connect(self._chrome_captcha_import_cookies)
+        _bp_row.addWidget(self.botprot_chrome_open_btn)
+        _bp_row.addWidget(self.botprot_chrome_import_btn)
+        _bp_row.addStretch(1)
+        _bp_v.addLayout(_bp_row)
+        layout.addWidget(self.botprot_banner_wrap)
 
         parent_layout.addWidget(panel)
 
@@ -35750,9 +36175,8 @@ class TribalWarsBot(QMainWindow):
                 "GİRİŞ",
                 "warn",
                 "hCaptcha / doğrulama görünür — otomatik giriş durdu. "
-                "Tarayıcıda ELLE çöz; Start'a tekrar basma. Çözünce dünya seçimi kendiliğinden gelir "
-                "veya giriş butonuna bir kez elle tıkla. "
-                "(Sayfa yenilenmeyecek / otomatik tıklama yok.)",
+                "Gömülü tarayıcıda çözülemiyorsa üstteki «Chrome'da aç» → captcha'yı Chrome'da çöz "
+                "→ «Çerezleri aktar». Start'a tekrar basma.",
             )
             self._set_human_verification_state(True, ["giriş hCaptcha"], hidden=False)
             self._botprot_mark_manual_solve("giriş captcha")
@@ -37147,21 +37571,21 @@ class TribalWarsBot(QMainWindow):
                 hint = " (gizli olabilir)" if hidden else ""
                 detail = ", ".join(parts[:3]) if parts else "doğrulama"
                 self.botprot_banner.setText(
-                    f"⚠ BOT KORUMASI{hint}: {detail} — tarayıcıda tamamlayın!"
+                    f"⚠ BOT KORUMASI{hint}: {detail} — "
+                    f"gömülü tarayıcıda çözülemiyorsa «Chrome'da aç» → çöz → «Çerezleri aktar»!"
                 )
                 self.botprot_banner.setStyleSheet(
                     "color: #fff; font-weight: bold; font-size: 12px; padding: 6px 8px;"
                     "background: #c0392b; border: 2px solid #922b21; border-radius: 4px;"
                 )
-                self.botprot_banner.setVisible(True)
+            if hasattr(self, "botprot_banner_wrap"):
+                self.botprot_banner_wrap.setVisible(True)
         else:
             self.status_indicator.setToolTip("")
-            if hasattr(self, "botprot_banner"):
+            if hasattr(self, "botprot_banner_wrap"):
+                self.botprot_banner_wrap.setVisible(False)
+            elif hasattr(self, "botprot_banner"):
                 self.botprot_banner.setVisible(False)
-                self.botprot_banner.setStyleSheet(
-                    "color: #cc5500; font-weight: bold; font-size: 10px; padding: 2px 6px;"
-                    "background: #fff3cd; border: 1px solid #e0c080; border-radius: 3px;"
-                )
             if self.is_running:
                 self.status_indicator.setText("● AKTİF")
                 self.status_indicator.setStyleSheet(
