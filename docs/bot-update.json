@@ -1,5 +1,5 @@
 {
-  "version": "1.4.17",
-  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.17/TribalWarsBot-1.4.17.zip",
-  "changelog_tr": "hCaptcha elle çözülebilir: WebGL/canvas açıldı; giriş captcha’sında otomatik tıklama/yenileme yok."
+  "version": "1.4.18",
+  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.18/TribalWarsBot-1.4.18.zip",
+  "changelog_tr": "hCaptcha: EXE Chromium bayraklarında --disable-webgl kaldırıldı; SwiftShader software WebGL açıldı (asıl kök neden)."
 }

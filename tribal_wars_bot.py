@@ -47,6 +47,28 @@ def _tw_native_msg(title: str, text: str) -> None:
         pass
 
 
+def _tw_default_chromium_flags() -> str:
+    """
+    Frozen EXE Chromium bayraklari.
+    Eski varsayilan --disable-webgl/--disable-3d-apis, QWebEngineSettings.WebGLEnabled
+    True olsa bile hCaptcha'yi bozuyordu. Varsayilan: SwiftShader software WebGL.
+    TWB_DISABLE_GPU=1 → eski tamamen GPU/WebGL kapali (cokme onleme; captcha calismaz).
+    """
+    if os.environ.get("TWB_DISABLE_GPU") == "1":
+        return (
+            "--disable-gpu --disable-gpu-compositing --no-sandbox "
+            "--disable-software-rasterizer --disable-webgl --disable-3d-apis "
+            "--disable-features=VizDisplayCompositor,WebRtcHideLocalIpsWithMdns "
+            "--disable-dev-shm-usage --in-process-gpu"
+        )
+    return (
+        "--no-sandbox --disable-dev-shm-usage "
+        "--ignore-gpu-blocklist --enable-webgl --enable-accelerated-2d-canvas "
+        "--use-gl=swiftshader "
+        "--disable-features=WebRtcHideLocalIpsWithMdns"
+    )
+
+
 def _tw_add_pyqt_dll_paths():
     """Windows: Qt DLL + frozen WebEngine yollari (import oncesi)."""
     if sys.platform != "win32":
@@ -104,14 +126,12 @@ def _tw_add_pyqt_dll_paths():
             loc = qt5 / "translations" / "qtwebengine_locales"
             if loc.is_dir():
                 os.environ.setdefault("QTWEBENGINE_LOCALES_PATH", str(loc))
-            # Dagitim build: GPU/WebGL/sandbox — bazi PC'lerde navigate aninda sessiz cokme
+            # hCaptcha: software WebGL (SwiftShader). Eski --disable-webgl kaldirildi.
             if not os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS"):
-                os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
-                    "--disable-gpu --disable-gpu-compositing --no-sandbox "
-                    "--disable-software-rasterizer --disable-webgl --disable-3d-apis "
-                    "--disable-features=VizDisplayCompositor,WebRtcHideLocalIpsWithMdns "
-                    "--disable-dev-shm-usage --in-process-gpu"
-                )
+                os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = _tw_default_chromium_flags()
+            _tw_boot_log(
+                f"chromium_flags={os.environ.get('QTWEBENGINE_CHROMIUM_FLAGS', '')[:160]}"
+            )
             os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
     except Exception as ex:
         _tw_boot_log(f"dll_paths_warn: {ex}")
@@ -198,7 +218,7 @@ from license_client import (  # noqa: E402
 # ─────────────────────────────────────────────
 
 # EXE'nin guncel oldugunu dogrulamak icin her onemli degisiklikte artirin.
-APP_VERSION = "1.4.17"
+APP_VERSION = "1.4.18"
 
 # Otomatik guncelleme — kullaniciya GitHub adresi gosterilmez; yalnizca bu URL okunur.
 UPDATE_MANIFEST_URL = "https://safayolcuu.github.io/tw-bot/bot-update.json"
@@ -798,7 +818,13 @@ def tw_apply_saved_proxy_environment() -> None:
     else:
         server = f"http://{host}:{port}"
 
-    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = f"--proxy-server={server}"
+    # Proxy flag'ini mevcut WebGL/sandbox bayraklarinin ustune ekle (silme)
+    cur = (os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS") or "").strip()
+    if not cur:
+        cur = _tw_default_chromium_flags()
+    parts = [p for p in cur.split() if p and not p.startswith("--proxy-server")]
+    parts.append(f"--proxy-server={server}")
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join(parts)
 
     if ptype in ("http", "https"):
         proxy_url = f"http://{auth}{host}:{port}"
@@ -37374,8 +37400,8 @@ if __name__ == "__main__":
         _tw_boot_log(f"faulthandler skip: {_fh_ex}")
 
     try:
-        # GPU hizlandirma: yalnizca gelistirme (script) modunda; EXE'de Chromium cokerse kapanmayi onler
-        if not getattr(sys, "frozen", False) or os.environ.get("TWB_ENABLE_GPU") == "1":
+        # WebGL/canvas: hCaptcha icin. TWB_DISABLE_GPU=1 ise ekleme (cokme onleme).
+        if os.environ.get("TWB_DISABLE_GPU") != "1":
             for _flag in [
                 "--enable-gpu-rasterization",
                 "--enable-accelerated-2d-canvas",
