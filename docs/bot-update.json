@@ -1,5 +1,5 @@
 {
-  "version": "1.4.16",
-  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.16/TribalWarsBot-1.4.16.zip",
-  "changelog_tr": "Dünya ayarları: scavenging/Tapınak/Gözetleme/varış ±ms; Temizlik sekmesi kapalı dünyalarda kilit; depo denge Oto ~4s otomatik gönderim; gönderimde Failed to fetch sahte hata düzeltmesi; fake plan eksik hedef doldurma."
+  "version": "1.4.17",
+  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.17/TribalWarsBot-1.4.17.zip",
+  "changelog_tr": "hCaptcha elle çözülebilir: WebGL/canvas açıldı; giriş captcha’sında otomatik tıklama/yenileme yok."
 }

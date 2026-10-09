@@ -198,7 +198,7 @@ from license_client import (  # noqa: E402
 # ─────────────────────────────────────────────
 
 # EXE'nin guncel oldugunu dogrulamak icin her onemli degisiklikte artirin.
-APP_VERSION = "1.4.16"
+APP_VERSION = "1.4.17"
 
 # Otomatik guncelleme — kullaniciya GitHub adresi gosterilmez; yalnizca bu URL okunur.
 UPDATE_MANIFEST_URL = "https://safayolcuu.github.io/tw-bot/bot-update.json"
@@ -1518,12 +1518,14 @@ class StealthBrowser(QWebEngineView):
             settings.setAttribute(QWebEngineSettings.ErrorPageEnabled, True)
         except Exception:
             pass
+        # hCaptcha görsel/challenge WebGL + 2D canvas ister; kapalıysa elle çözülemez.
+        # (Eski False ayarı crash azaltıyordu ama giriş captcha'sını bozuyordu.)
         try:
-            settings.setAttribute(QWebEngineSettings.WebGLEnabled, False)
+            settings.setAttribute(QWebEngineSettings.WebGLEnabled, True)
         except Exception:
             pass
         try:
-            settings.setAttribute(QWebEngineSettings.Accelerated2dCanvasEnabled, False)
+            settings.setAttribute(QWebEngineSettings.Accelerated2dCanvasEnabled, True)
         except Exception:
             pass
 
@@ -1531,6 +1533,18 @@ class StealthBrowser(QWebEngineView):
         try:
             self.profile.setHttpCacheType(QWebEngineProfile.DiskHttpCache)
             self.profile.setHttpCacheMaximumSize(50 * 1024 * 1024)  # 50 MB
+        except Exception:
+            pass
+
+    def _tw_ensure_captcha_webgl(self) -> None:
+        """Captcha görünürken WebGL/canvas açık olsun (profil paylaşılıyor)."""
+        try:
+            prof = getattr(self, "profile", None)
+            if prof is None:
+                return
+            settings = prof.settings()
+            settings.setAttribute(QWebEngineSettings.WebGLEnabled, True)
+            settings.setAttribute(QWebEngineSettings.Accelerated2dCanvasEnabled, True)
         except Exception:
             pass
 
@@ -35697,6 +35711,13 @@ class TribalWarsBot(QMainWindow):
         """Girişte görünür captcha: otomatik form submit'i durdur, elle çözülmesini bekle."""
         if self._login_state == "in_game":
             return
+        # Captcha puzzle için WebGL/canvas şart
+        try:
+            browser = getattr(self, "browser", None)
+            if browser is not None and hasattr(browser, "_tw_ensure_captcha_webgl"):
+                browser._tw_ensure_captcha_webgl()
+        except Exception:
+            pass
         if self._login_state != "awaiting_captcha":
             self._login_state = "awaiting_captcha"
             self._add_log(
@@ -35704,9 +35725,15 @@ class TribalWarsBot(QMainWindow):
                 "warn",
                 "hCaptcha / doğrulama görünür — otomatik giriş durdu. "
                 "Tarayıcıda ELLE çöz; Start'a tekrar basma. Çözünce dünya seçimi kendiliğinden gelir "
-                "veya giriş butonuna bir kez elle tıkla.",
+                "veya giriş butonuna bir kez elle tıkla. "
+                "(Sayfa yenilenmeyecek / otomatik tıklama yok.)",
             )
             self._set_human_verification_state(True, ["giriş hCaptcha"], hidden=False)
+            self._botprot_mark_manual_solve("giriş captcha")
+            # Reveal/soft-reload zincirini kapat
+            self._botprot_reload_deferred = False
+            self._botprot_reload_deferred_at = 0.0
+            self._botprot_reveal_attempts = 99
 
     def _poll_login_captcha_and_continue(self):
         """Giriş akışında captcha var mı bak; varsa bekle, yoksa world select'e devam."""
@@ -36393,8 +36420,35 @@ class TribalWarsBot(QMainWindow):
                     return True
         return False
 
+    def _botprot_is_login_captcha_flow(self) -> bool:
+        """Giriş / portal captcha — reveal/reload/otomatik tıklama yasak."""
+        st = str(getattr(self, "_login_state", "") or "")
+        if st == "awaiting_captcha":
+            return True
+        if st in ("navigating", "waiting_world", "world_select"):
+            try:
+                url = ""
+                if self.browser:
+                    url = (self.browser.url().toString() or "").lower()
+                if any(
+                    x in url
+                    for x in (
+                        "/page/auth",
+                        "/page/login",
+                        "login.php",
+                        "hcaptcha",
+                        "botprotection",
+                    )
+                ):
+                    return True
+            except Exception:
+                pass
+        return False
+
     def _botprot_leave_for_manual_solve(self) -> bool:
         """True: kullanıcı elle çözüyor — otomatik reload/reveal yok."""
+        if self._botprot_is_login_captcha_flow():
+            return True
         if not getattr(self, "_human_verification_required", False):
             return False
         if getattr(self, "_botprot_manual_solve", False):
@@ -36449,6 +36503,16 @@ class TribalWarsBot(QMainWindow):
         if not self.browser:
             if callable(on_result):
                 on_result(False)
+            return
+        # Giriş sayfasında rastgele «doğrulama» tıklaması / navigasyon captcha'yı bozar
+        if self._botprot_is_login_captcha_flow():
+            self._add_log(
+                "GÜVENLİK",
+                "info",
+                "JS reveal atlandı — giriş captcha (otomatik tıklama yok).",
+            )
+            if callable(on_result):
+                on_result(True)  # "yeterli" say — soft-reload'a düşmesin
             return
         why = f" ({reason})" if reason else ""
         js = r"""
@@ -36680,6 +36744,16 @@ class TribalWarsBot(QMainWindow):
 
     def _botprot_reveal_captcha(self, reason: str = "") -> None:
         """Önce JS ile aç; olmazsa tek soft-reload. Oturumda en fazla 1 deneme."""
+        if self._botprot_is_login_captcha_flow():
+            self._add_log(
+                "GÜVENLİK",
+                "info",
+                "Reveal atlandı — giriş captcha’sı elle çözülmeli"
+                + (f" ({reason})" if reason else "")
+                + ".",
+            )
+            self._botprot_mark_manual_solve("giriş captcha reveal yok")
+            return
         if self._botprot_leave_for_manual_solve():
             self._add_log(
                 "GÜVENLİK",
@@ -37097,11 +37171,17 @@ class TribalWarsBot(QMainWindow):
                 else:
                     msg += " hCaptcha’yı tarayıcıda elle çözebilirsiniz."
                     self._botprot_mark_manual_solve("görünür tespit")
+                    try:
+                        br = getattr(self, "browser", None)
+                        if br is not None and hasattr(br, "_tw_ensure_captcha_webgl"):
+                            br._tw_ensure_captcha_webgl()
+                    except Exception:
+                        pass
                 self._add_log("GÜVENLİK", "warn", msg)
                 self._botprot_alert_user_focus()
                 self._notify_telegram_security(parts)
-                # Görünmez: yalnızca bir kez açmayı dene
-                if hidden:
+                # Görünmez: yalnızca bir kez açmayı dene (giriş captcha hariç)
+                if hidden and not self._botprot_is_login_captcha_flow():
                     QTimer.singleShot(
                         400,
                         lambda: self._botprot_reveal_captcha(reason="doğrulama ilk tespit"),
@@ -37110,6 +37190,12 @@ class TribalWarsBot(QMainWindow):
             elif not hidden:
                 # Sonradan görünür oldu → elle çözüme kilitle
                 self._botprot_mark_manual_solve("görünür oldu")
+                try:
+                    br = getattr(self, "browser", None)
+                    if br is not None and hasattr(br, "_tw_ensure_captcha_webgl"):
+                        br._tw_ensure_captcha_webgl()
+                except Exception:
+                    pass
         else:
             if self._human_verification_required:
                 self._human_verification_required = False
