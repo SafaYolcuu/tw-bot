@@ -1,5 +1,5 @@
 {
-  "version": "1.4.15",
-  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.15/TribalWarsBot-1.4.15.zip",
-  "changelog_tr": "Açılış crash düzeltmesi: _sa_refresh_time_mode_button_styles metod tanımı geri yüklendi.\nv1.4.14 fake/ordu/temizlik/depo değişiklikleri dahil."
+  "version": "1.4.16",
+  "download_url": "https://github.com/SafaYolcuu/tw-bot/releases/download/v1.4.16/TribalWarsBot-1.4.16.zip",
+  "changelog_tr": "Dünya ayarları: scavenging/Tapınak/Gözetleme/varış ±ms; Temizlik sekmesi kapalı dünyalarda kilit; depo denge Oto ~4s otomatik gönderim; gönderimde Failed to fetch sahte hata düzeltmesi; fake plan eksik hedef doldurma."
 }
